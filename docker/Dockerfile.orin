@@ -27,9 +27,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-pip libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 \
       && rm -rf /var/lib/apt/lists/*
-# JetPack 5.1.1 の default Python は 3.8。template deps を入れる。
+# JetPack 5.1.1 の default Python は 3.8。まず pip を上げてから template deps。
+# pyzmq 27+ は cp38 aarch64 wheel が無く source build が numpy.get_include で失敗するため、
+# Orin(Py3.8)では pyzmq<27(cp38 wheel あり)に固定する(requirements.txt は無改変)。
 COPY requirements.txt ./
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+ && python3 -m pip install --no-cache-dir -r requirements.txt "pyzmq<27"
 
 COPY . ./
 
