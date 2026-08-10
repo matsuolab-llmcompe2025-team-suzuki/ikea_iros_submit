@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+#
+# arm64 build-mechanics smoke — NGC 認証なしで arm64 ビルド経路を検証する開発ツール。
+# ⚠️ これは提出 image ではない（public base、CUDA 無し）。提出は docker/Dockerfile.{thor,orin}。
+#
+# 目的: x86 host から buildx + QEMU で arm64 image をビルドし、コンテナ内で
+#       conformance が PASS することを、運営 base (nvcr.io、要 NGC login) 無しで確認する。
+#
+# 使い方 (context = repo root):
+#   docker run --privileged --rm tonistiigi/binfmt --install arm64   # QEMU arm64 登録
+#   docker buildx create --name armbuilder --driver docker-container --bootstrap
+#   docker buildx build --builder armbuilder --platform linux/arm64 \
+#     -f docker/Dockerfile.smoke-arm64 -t ramen-smoke:arm64 --load .
+#   docker run --rm --platform linux/arm64 ramen-smoke:arm64   # → conformance PASS
+
+FROM python:3.11-slim
+WORKDIR /app
+# opencv-python (cameras.py の cv2) が要求する native lib
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . ./
+CMD ["python3", "-u", "conformance.py", "--lane", "decoupled"]

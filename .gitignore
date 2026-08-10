@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Teams put model weights here; they must never reach the repo
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+checkpoints/
+weights/
+
+# Local runs
+*.log
+conformance_report*.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

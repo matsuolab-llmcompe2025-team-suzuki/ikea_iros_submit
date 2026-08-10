@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Policy CLIENT container — runs on the Jetson Orin NX onboard the G1.
+#   sm_87 (Ampere) / JetPack 5.1.1 / L4T R35.3.1 / CUDA 11.4 / aarch64 / 16 GB unified
+#
+#   ⚠️ 運営 2026-08 訂正: Orin は **JetPack 5.1.1**（以前の資料の 6.x は誤り）。
+#      base tag は device の L4T に **完全一致**が必須（CUDA/driver userspace は
+#      runtime に host から mount されるので、tag 違いは実機で落ちる）。
+#   base: nvcr.io/nvidia/l4t-jetpack:r35.3.1  （Python 3.8 default、必要なら内部で更新可）
+#   client は推論しないので軽量な nvcr.io/nvidia/l4t-base:r35.3.1 でも可。
+#
+#   ⚠️ **linux/arm64 (aarch64)** でビルド（buildx --platform linux/arm64）。
+#   ⚠️ nvcr.io は NGC login 必須（docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>）。
+#
+# Build (context = repo root):
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.orin \
+#     -t <registry>/ramen-orin:<tag> --push .
+
+ARG BASE=nvcr.io/nvidia/l4t-jetpack:r35.3.1
+# 軽量代替（client は推論しない）: ARG BASE=nvcr.io/nvidia/l4t-base:r35.3.1
+FROM ${BASE}
+
+WORKDIR /app
+
+# JetPack 5.1.1 の default Python は 3.8。template deps を入れる。
+COPY requirements.txt ./
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
+
+COPY . ./
+
+# boundary の 3 endpoint (cameras:5555 / state:5557 / actions:5556) は Orin 上。
+# client は Thor(192.168.100.1) の server へ obs を送り、返った action を publish。
+CMD ["python3", "-u", "components/client.py", \
+     "--lane", "decoupled", \
+     "--thor", "192.168.100.1", "--orin", "192.168.100.2"]

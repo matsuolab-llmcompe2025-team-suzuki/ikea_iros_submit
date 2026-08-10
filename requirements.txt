@@ -1,0 +1,10 @@
+# Dependencies for the template itself. Your model's dependencies are yours —
+# install them alongside these, in your own container.
+#
+# websockets >= 13 for the sync server API used by components/transport.py.
+# If you replace the Thor<->Orin transport, websockets is no longer needed.
+numpy
+msgpack
+pyzmq
+opencv-python
+websockets>=13
