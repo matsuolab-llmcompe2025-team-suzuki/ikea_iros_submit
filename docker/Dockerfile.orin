@@ -22,6 +22,11 @@ FROM ${BASE}
 
 WORKDIR /app
 
+# client の boundary/cameras.py は cv2 (opencv-python) で JPEG decode する。
+# minimal base だと libGL/libxcb 等の native lib が無く cv2 import が失敗するので入れる。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 \
+      && rm -rf /var/lib/apt/lists/*
 # JetPack 5.1.1 の default Python は 3.8。template deps を入れる。
 COPY requirements.txt ./
 RUN python3 -m pip install --no-cache-dir -r requirements.txt

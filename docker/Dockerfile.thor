@@ -22,8 +22,15 @@ FROM ${BASE}
 WORKDIR /app
 
 # --- template deps のみ (onboarding: hold-still Policy) ---
+# cuda:*-ubuntu24.04 base は pip 未同梱 + Ubuntu 24.04 は PEP 668 (externally-managed)
+# なので、python3-pip を入れ --break-system-packages で system へ install する。
+# (RAMEN-Ori 段階で venv 化してもよいが、hold-still onboarding はこれで十分)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip \
+      libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 \
+      && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # >>> RAMEN-Ori (#115) の model deps はここに追加 (torch は sm_110/CUDA13 build) <<<
 #     素の pip torch は dGPU wheel で sm_110 非対応。Thor install path を使う。
