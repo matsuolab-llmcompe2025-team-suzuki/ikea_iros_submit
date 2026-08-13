@@ -220,12 +220,12 @@ signal until you have seen live data from the competition robot.
 | **Role** | policy server — your model | policy client — your control loop |
 | **Container** | yours | yours |
 | **Address** | `192.168.100.1` | `192.168.100.2` |
-| **OS** | JetPack 7, aarch64 | JetPack 6.x, aarch64 |
+| **OS** | JetPack 7, aarch64 | JetPack 5.1.1 (L4T R35.3.1), aarch64 |
 | **CPU** | Arm Neoverse-V3AE, 14 cores, 2.6 GHz | Arm Cortex-A78AE, 8 cores / 8 threads, 2.0 GHz |
 | **Cache** | 1 MB L2 per core + 16 MB shared L3 | 2 MB L2 + 4 MB L3 |
 | **GPU** | Blackwell, 2560 CUDA cores, 5th-gen tensor cores, **sm_110** | Ampere, 1024 CUDA cores, 32 tensor cores, 918 MHz, **sm_87** |
-| **CUDA** | 13.0 | JetPack 6.x default |
-| **Python** | 3.12 | JetPack 6.x default |
+| **CUDA** | 13.0 | 11.4 |
+| **Python** | 3.12 | 3.8 default |
 | **Memory** | **128 GB unified** LPDDR5X, 256-bit, 273 GB/s | **16 GB unified** (shared CPU + GPU) |
 | **Storage** | NVMe over PCIe | 2 TB |
 | **Power** | 40–130 W | — |
