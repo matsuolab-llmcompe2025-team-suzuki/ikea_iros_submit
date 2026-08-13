@@ -1,5 +1,15 @@
 # IKEA IROS Assembly Challenge Submission Template — Unitree G1 Policy Showcase
 
+> ## Team RAMEN submission
+>
+> - **Lane:** `decoupled` ((T,25) task-space)
+> - **Images** (linux/arm64, GHCR、digest 指定):
+>   - Thor (server): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:a32494cd2c8fd23b49cc1f4209f7c49e1d4645acd90092ce8b8028a352e3170a`
+>   - Orin (client): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin@sha256:8ad1fe45343756d85d3409f3c3af8d1a0cf4b5a64a6350efe8ac3ec1046fb938`
+> - **Base images:** Thor `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`、Orin `nvcr.io/nvidia/l4t-jetpack:r35.3.1`
+> - **Status (onboarding):** `boundary/` unmodified、`conformance.py --lane decoupled` PASS、別コンテナ e2e (server+client+mock) で action 疎通確認済。現状 Policy は hold-still (RAMEN-Ori は後続で差し替え)。
+> - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml` を参照。
+
 You submit **two containers**: a policy server for the Jetson AGX Thor and a
 policy client for the Jetson Orin NX onboard the G1. What runs inside them is
 entirely yours — framework, model, architecture, whether you use a VLA at all.
