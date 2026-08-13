@@ -28,6 +28,14 @@ import numpy as np
 from websockets.sync.client import connect as _ws_connect
 from websockets.sync.server import serve as _ws_serve
 
+import websockets as _websockets
+
+# websockets の sync API が ping_interval/ping_timeout を受けるのは 14+。実 Orin は
+# Python 3.8 = websockets 13.x が上限で、13.x の sync connect()/serve() は未知 kwarg を
+# socket.create_connection に転送して TypeError で落ちる (client 即死)。version で切替。
+_WS_MAJOR = int(_websockets.__version__.split(".")[0])
+_KEEPALIVE = {"ping_interval": None, "ping_timeout": None} if _WS_MAJOR >= 14 else {}
+
 __all__ = ["PolicyLink", "serve_policy"]
 
 _ND = "~nd"   # marker key for an encoded ndarray
@@ -78,7 +86,7 @@ class PolicyLink:
             try:
                 self._socket = _ws_connect(
                     url, compression=None, max_size=None,
-                    ping_interval=None, ping_timeout=None,
+                    **_KEEPALIVE,
                 )
                 break
             except OSError as exc:      # server not up yet — normal at startup
@@ -154,7 +162,7 @@ def serve_policy(policy, host: str = "0.0.0.0", port: int = 8765):
     with _ws_serve(
         handler, host, port,
         compression=None, max_size=None,
-        ping_interval=None, ping_timeout=None,
+        **_KEEPALIVE,
     ) as server:
         print(f"[serve] policy server listening on ws://{host}:{port}")
         server.serve_forever()
