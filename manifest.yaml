@@ -12,14 +12,14 @@ platform: linux/arm64
 images:
   thor:                       # policy server / sm_110 Blackwell / JetPack 7.2 / CUDA 13
     repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:onboarding"
-    digest: "sha256:90cb145fc11dfe302a03e6b41d909558d603af0eb75d0c722aef8826a4c022dd"
+    digest: "sha256:a32494cd2c8fd23b49cc1f4209f7c49e1d4645acd90092ce8b8028a352e3170a"
     base_image: "nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04"   # 標準 NGC CUDA (l4t ではない)
     entrypoint:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
   orin:                       # policy client / sm_87 Ampere / JetPack 5.1.1 / CUDA 11.4
     repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
-    digest: "sha256:2fc4185d754239c1ab2b445e1bb29fc18186a4bed8a985c3e826791c3be78e1f"
+    digest: "sha256:8ad1fe45343756d85d3409f3c3af8d1a0cf4b5a64a6350efe8ac3ec1046fb938"
     base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"  # device の L4T R35.3.1 に完全一致必須
     entrypoint:
       ["python3", "-u", "components/client.py",
