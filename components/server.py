@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""THE FILE YOU REPLACE — your policy, running on the Jetson AGX Thor.
+"""THE FILE WE REPLACE — our policy, running on the Jetson AGX Thor.
 
     Thor  192.168.100.1   JetPack 7 · CUDA 13.0 · Python 3.12 · sm_110
     Orin  192.168.100.2   runs components/client.py
 
 This reference emits a hold-still action so the whole pipeline runs before
-your model exists. Swap the body of :meth:`act` for real inference and
+our model exists. Swap the body of :meth:`act` for real inference and
 adjust :attr:`metadata` to match. Nothing else in the repo needs to change.
 
     # on the Thor
@@ -20,8 +20,8 @@ Lane picks the action space:
 
 THOR SETUP, THE PART THAT BITES: a plain `uv sync` installs the dGPU torch
 build (sm_80/90/100/120) and every kernel launch dies with "no kernel image
-available" on Thor's sm_110. Use the Thor install path for your framework.
-If you are on Isaac-GR00T that means scripts/deployment/thor/install_deps.sh
+available" on Thor's sm_110. Use the Thor install path for our framework.
+If we are on Isaac-GR00T that means scripts/deployment/thor/install_deps.sh
 followed by `source scripts/activate_thor.sh`, and `git lfs install &&
 git lfs pull` or the checkpoints stay as pointer files.
 """
@@ -51,7 +51,7 @@ class Policy:
     """
 
     ACTION_CHUNK = 16     # rows returned per inference
-    OBS_CHUNK = 1         # frames of history you want per observation
+    OBS_CHUNK = 1         # frames of history we want per observation
 
     def __init__(self, lane: str, delay_ms: float = 0.0):
         if lane not in LANES:
@@ -59,7 +59,7 @@ class Policy:
         self.lane = lane
         self._delay_s = delay_ms / 1000.0
         self._steps = 0
-        # >>> load your model here <<<
+        # >>> load our model here <<<
         # self.model = MyVLA.from_pretrained(...).to("cuda").eval()
 
     @property
@@ -73,8 +73,8 @@ class Policy:
             "lane": self.lane,
             "action_chunk_size": self.ACTION_CHUNK,
             "obs_chunk_size": self.OBS_CHUNK,
-            # Declare only what you actually consume; the client will not
-            # spend time encoding images you ignore.
+            # Declare only what we actually consume; the client will not
+            # spend time encoding images we ignore.
             "camera_keys": ["ego_view"],
             "wants_state": True,
             "wants_prompt": True,
@@ -84,7 +84,7 @@ class Policy:
         """One inference step.
 
         ``obs`` arrives from client.py as:
-            images   {key: (480, 640, 3) uint8 RGB}   only your camera_keys
+            images   {key: (480, 640, 3) uint8 RGB}   only our camera_keys
             body_q   (29,) float32   canonical G1 joints, radians
             base_quat(4,)  float32   wxyz
             prompt   str             the task instruction
@@ -95,7 +95,7 @@ class Policy:
         if self._delay_s:
             time.sleep(self._delay_s)   # stand-in for real inference time
 
-        # >>> your inference goes here <<<
+        # >>> our inference goes here <<<
         # images = obs["images"]["ego_view"]      # (480, 640, 3) uint8 RGB
         # state  = obs["body_q"]                  # (29,) float32
         # chunk  = self.model.infer(images, state, obs["prompt"])
@@ -117,7 +117,7 @@ class Policy:
     def reset(self) -> dict:
         """Called once at the start of every attempt. Drop episode state."""
         self._steps = 0
-        # >>> clear your action history / KV cache / observation buffer <<<
+        # >>> clear our action history / KV cache / observation buffer <<<
         return {"ok": True}
 
 
@@ -125,10 +125,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lane", choices=LANES,
                         default=os.environ.get("PEVAL_LANE", "sonic"),
-                        help="Action space. Must match your manifest.")
+                        help="Action space. Must match our manifest.")
     parser.add_argument("--delay-ms", type=float, default=0.0,
-                        help="Fake inference time. Use it to see how your client "
-                             "behaves at realistic latency before your model exists.")
+                        help="Fake inference time. Use it to see how our client "
+                             "behaves at realistic latency before our model exists.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

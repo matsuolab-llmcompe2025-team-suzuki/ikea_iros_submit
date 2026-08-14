@@ -64,7 +64,11 @@ ikea_iros_submit/
 │   ├── mock_orin.py       fake cameras + fake state
 │   └── mock_wbc.py        fake controller; validates what we publish
 ├── conformance.py       run this before we ship
-└── requirements.txt
+├── requirements.txt
+├── docker/              RAMEN — Dockerfile.thor / Dockerfile.orin (+ Dockerfile.smoke-arm64)
+├── manifest.yaml        RAMEN — lane / image digests / base / entrypoints / port
+├── INSTRUCTIONS.md      RAMEN — build & run commands for the organizer
+└── VENDOR_NOTES.md      RAMEN — provenance & our divergences from upstream
 ```
 
 Realistically we edit **`components/server.py`** and little else.
@@ -236,7 +240,7 @@ signal until we have seen live data from the competition robot.
 | **Cache** | 1 MB L2 per core + 16 MB shared L3 | 2 MB L2 + 4 MB L3 |
 | **GPU** | Blackwell, 2560 CUDA cores, 5th-gen tensor cores, **sm_110** | Ampere, 1024 CUDA cores, 32 tensor cores, 918 MHz, **sm_87** |
 | **CUDA** | 13.0 | 11.4 |
-| **Python** | 3.12 | 3.8 default (image default only — we install a newer one in our container if needed) |
+| **Python** | 3.12 | 3.8 (image default; we ship on 3.8, a newer one can be installed in-container if needed) |
 | **Memory** | **128 GB unified** LPDDR5X, 256-bit, 273 GB/s | **16 GB unified** (shared CPU + GPU) |
 | **Storage** | NVMe over PCIe | 2 TB |
 | **Power** | 40–130 W | — |
