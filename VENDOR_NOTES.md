@@ -12,6 +12,21 @@
 - 編集するのは `components/`（特に `server.py` の `Policy`）と、追加した
   `docker/` `manifest.yaml` `INSTRUCTIONS.md` のみ。
 
+## upstream 追従 / 意図的な乖離（2026-08、再同期時 要注意）
+- upstream 最新 = **`2ae4eeb`**（vendored 元 `7a4f071` から 2 commit 先）:
+  - `9f770d2` stereo ego_view 追加（`boundary/cameras.py` の CAMERA_KEYS、README camera 表、`mock_orin.py --stereo-ego`）
+  - `2ae4eeb` README の JetPack 訂正 + Base images 節 + NGC note
+- **採用**: jetpack 訂正（docs）は **README へ手で反映済**（ハード表 Thor R39.2 / Orin R35.3.1、Base images、NGC）。
+- **非採用**: stereo（`9f770d2`）。我々は **mono `ego_view` のみ** = `boundary/cameras.py`・`mocks/mock_orin.py` は
+  **`7a4f071` のまま**、README camera 表も mono。stereo 採用は #115 のモデル判断（採用時は boundary 同期 +
+  image 再ビルド/再 push = digest 変更が発生）。
+- ⚠️ **`README.md` は first-person（RAMEN 視点）へ全面書き換え済**（upstream は second-person）。
+  **plain re-vendor で README を上書きしないこと**。再同期は upstream 差分を cherry-pick する。
+- ⚠️ **`components/transport.py` は自作パッチあり**（websockets の ping kwargs を `_WS_MAJOR>=14` で version-guard。
+  実 Orin = Python3.8 = websockets 13.1 で client 即死するのを回避、cross-container e2e で確認）。
+  **plain re-vendor で上書きしないこと**。
+- `components/server.py` は `7a4f071` のまま（`2ae4eeb` は stereo コメント追記のみ = 非採用）。
+
 ## 現状（onboarding）
 - `python3 conformance.py --lane decoupled` = **PASS**（hold-still Policy、40 accepted / 0 rejected、default env の numpy/msgpack/pyzmq/opencv/websockets で実行可）。
 - lane = **decoupled**（RAMEN-Ori は非 GR00T-SONIC → (T,25) task-space）。
