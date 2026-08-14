@@ -1,4 +1,4 @@
-# IKEA IROS Assembly Challenge Submission Template — Unitree G1 Policy Showcase
+# Team RAMEN — IKEA IROS Assembly Challenge Submission (Unitree G1)
 
 > ## Team RAMEN submission
 >
@@ -10,9 +10,9 @@
 > - **Status (onboarding):** `boundary/` unmodified、`conformance.py --lane decoupled` PASS、別コンテナ e2e (server+client+mock) で action 疎通確認済。現状 Policy は hold-still (RAMEN-Ori は後続で差し替え)。
 > - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml` を参照。
 
-You submit **two containers**: a policy server for the Jetson AGX Thor and a
+RAMEN submits **two containers**: a policy server for the Jetson AGX Thor and a
 policy client for the Jetson Orin NX onboard the G1. What runs inside them is
-entirely yours — framework, model, architecture, whether you use a VLA at all.
+entirely ours — framework, model, architecture, whether we use a VLA at all.
 
 The organizer owns three endpoints on the Orin and an independent e-stop.
 Those, and nothing else, are the contract.
@@ -27,24 +27,24 @@ JETSON AGX THOR                          JETSON ORIN NX (onboard the G1)
 ┌──────────────────────┐                 ┌────────────────────────────────┐
 │ components/server.py │                 │ components/client.py           │
 │                      │◄── ethernet ───►│                                │
-│   your model         │  your transport │   boundary.CameraStream  :5555 │◄─ cameras
+│   our model          │  our transport  │   boundary.CameraStream  :5555 │◄─ cameras
 │                      │                 │   boundary.StateStream   :5557 │◄─ state
 └──────────────────────┘                 │   boundary.ActionSink    :5556 │──► WBC
-        YOURS                            └────────────────────────────────┘
-                                              YOURS          ORGANIZER'S
+        OURS                             └────────────────────────────────┘
+                                              OURS           ORGANIZER'S
 ```
 
 | Endpoint | Direction | Port | Format |
 |---|---|---|---|
-| Cameras | you subscribe | `:5555` | msgpack `{"timestamps": {...}, "images": {key: jpeg}}` |
-| State | you subscribe | `:5557` | topic `g1_debug` + msgpack `{body_q, base_quat, ...}` |
-| Actions | **you bind**, the controller dials in | `:5556` | lane-dependent — see §4 |
+| Cameras | we subscribe | `:5555` | msgpack `{"timestamps": {...}, "images": {key: jpeg}}` |
+| State | we subscribe | `:5557` | topic `g1_debug` + msgpack `{body_q, base_quat, ...}` |
+| Actions | **we bind**, the controller dials in | `:5556` | lane-dependent — see §4 |
 
-**You bind `:5556`.** That is backwards from habit and catches everyone once.
-The controller is the long-lived process; your client comes and goes.
+**We bind `:5556`.** That is backwards from habit and catches everyone once.
+The controller is the long-lived process; our client comes and goes.
 
-Use `boundary/` as shipped. Do not edit it — a local change passes your tests
-and fails on the robot.
+We use `boundary/` as shipped and do not edit it — a local change passes our
+tests and fails on the robot.
 
 ---
 
@@ -56,35 +56,35 @@ ikea_iros_submit/
 │   ├── cameras.py         SUB  :5555
 │   ├── states.py          SUB  :5557
 │   └── actions.py         BIND :5556   ← the only lane-aware module
-├── components/          YOURS — this is what you edit
+├── components/          OURS — this is what we edit
 │   ├── server.py          runs on the Thor. Replace Policy.act().
 │   ├── client.py          runs on the Orin. Adapt the loop.
-│   └── transport.py       Thor↔Orin link. Replace it if you like.
+│   └── transport.py       Thor↔Orin link. Ours to change.
 ├── mocks/               develop with no robot
 │   ├── mock_orin.py       fake cameras + fake state
-│   └── mock_wbc.py        fake controller; validates what you publish
-├── conformance.py       run this before you ship
+│   └── mock_wbc.py        fake controller; validates what we publish
+├── conformance.py       run this before we ship
 └── requirements.txt
 ```
 
-Realistically you will edit **`components/server.py`** and little else.
+Realistically we edit **`components/server.py`** and little else.
 
 | Path | Owner | What it does |
 |---|---|---|
-| **`boundary/`** | organizer | The contract. Three endpoints, nothing else. Editing anything here makes your tests pass and the robot fail. |
+| **`boundary/`** | organizer | The contract. Three endpoints, nothing else. Editing anything here makes our tests pass and the robot fail. |
 | `boundary/__init__.py` | organizer | Re-exports `CameraStream`, `StateStream`, `ActionSink`. Import from here, not from the submodules. |
-| `boundary/cameras.py` | organizer | Subscribes `:5555`, decodes JPEG, flips BGR→RGB, hands you `(480,640,3)` uint8. Newest frame wins — a slow policy skips frames instead of falling behind. |
+| `boundary/cameras.py` | organizer | Subscribes `:5555`, decodes JPEG, flips BGR→RGB, hands us `(480,640,3)` uint8. Newest frame wins — a slow policy skips frames instead of falling behind. |
 | `boundary/states.py` | organizer | Subscribes `:5557` topic `g1_debug`, validates the schema, returns `RobotState` with `body_q (29,)` and `base_quat (4,)`. Same on both lanes. |
-| `boundary/actions.py` | organizer | **Binds** `:5556` and publishes your actions. The only lane-aware file: `SonicSink` frames latents for the deploy, `DecoupledSink` sends `(T,25)` chunks. Validates every action and raises `ActionError` rather than publish a malformed one. |
-| **`components/`** | **you** | Your submission. Both files ship as working references — replace as much as you like. |
-| `components/server.py` | **you** | **The file you replace.** Runs on the Thor. Load your model in `__init__`, put inference in `Policy.act()`, keep `metadata`/`act`/`reset`. Ships a hold-still policy so the pipeline runs before your model exists. `--delay-ms` fakes inference time. |
-| `components/client.py` | **you** | Runs on the Orin. Reads both endpoints, calls the Thor, publishes actions. Already pipelined: next inference starts while the current chunk plays, and rows made stale by latency are skipped. Warns when your chunk is too short for your latency. |
-| `components/transport.py` | **you** | The Thor↔Orin link — WebSocket + msgpack with a numpy hook. Entirely inside your submission; the organizer never speaks it. Swap it for gRPC or anything else. |
-| **`mocks/`** | organizer | Fake robot, so you can develop with no hardware. |
+| `boundary/actions.py` | organizer | **Binds** `:5556` and publishes our actions. The only lane-aware file: `SonicSink` frames latents for the deploy, `DecoupledSink` sends `(T,25)` chunks. Validates every action and raises `ActionError` rather than publish a malformed one. |
+| **`components/`** | **RAMEN** | Our submission. Both files ship as working references — we replace as much as we like. |
+| `components/server.py` | **RAMEN** | **The file we replace.** Runs on the Thor. We load our model in `__init__`, put inference in `Policy.act()`, keep `metadata`/`act`/`reset`. Ships a hold-still policy so the pipeline runs before our model exists. `--delay-ms` fakes inference time. |
+| `components/client.py` | **RAMEN** | Runs on the Orin. Reads both endpoints, calls the Thor, publishes actions. Already pipelined: next inference starts while the current chunk plays, and rows made stale by latency are skipped. Warns when our chunk is too short for our latency. |
+| `components/transport.py` | **RAMEN** | The Thor↔Orin link — WebSocket + msgpack with a numpy hook. Entirely inside our submission; the organizer never speaks it. Ours to change (we version-guard the websockets keepalive kwargs so it runs on the Orin's Python 3.8). |
+| **`mocks/`** | organizer | Fake robot, so we can develop with no hardware. |
 | `mocks/mock_orin.py` | organizer | Stands in for the Orin: publishes synthetic cameras on `:5555` and state on `:5557` in the exact real formats. Defaults to a Dex1-1 rig (no hand state). |
-| `mocks/mock_wbc.py` | organizer | Stands in for the whole-body controller: dials into `:5556`, decodes what you publish, prints `ACTION REJECTED` with a reason. If this is happy, the real controller will parse you. |
-| **`conformance.py`** | organizer | Runs all four processes and gives one PASS/FAIL. Run it before every submission and before every bench session. |
-| `requirements.txt` | organizer | Template deps only — numpy, msgpack, pyzmq, opencv-python, websockets. Your model's deps are yours. |
+| `mocks/mock_wbc.py` | organizer | Stands in for the whole-body controller: dials into `:5556`, decodes what we publish, prints `ACTION REJECTED` with a reason. If this is happy, the real controller will parse us. |
+| **`conformance.py`** | organizer | Runs all four processes and gives one PASS/FAIL. We run it before every submission and before every bench session. |
+| `requirements.txt` | organizer | Template deps only — numpy, msgpack, pyzmq, opencv-python, websockets. Our model's deps are ours. |
 | `.gitignore` | — | Keeps `__pycache__` and model weights out of git. |
 
 ---
@@ -94,39 +94,40 @@ Realistically you will edit **`components/server.py`** and little else.
 ```bash
 pip install -r requirements.txt
 
-# Prove the unmodified template passes, so you know what a pass looks like.
-python conformance.py --lane sonic
+# Prove the unmodified template passes, so we know what a pass looks like.
+python conformance.py --lane decoupled
 ```
 
 Then develop against the mocks, in four terminals:
 
 ```bash
-python mocks/mock_orin.py                              # fake cameras + state
-python components/server.py --lane sonic --port 8765   # your model
-python components/client.py --lane sonic --thor 127.0.0.1 --orin 127.0.0.1
-python mocks/mock_wbc.py --lane sonic                  # validates your actions
+python mocks/mock_orin.py                                   # fake cameras + state
+python components/server.py --lane decoupled --port 8765   # our model
+python components/client.py --lane decoupled --thor 127.0.0.1 --orin 127.0.0.1
+python mocks/mock_wbc.py --lane decoupled                  # validates our actions
 ```
 
 `mock_orin.py` publishes a Dex1-1 rig by default — **no hand state**, matching
-the real robot. `--with-hands` simulates a Dex3 rig if you need it.
+the real robot. `--with-hands` simulates a Dex3 rig if we need it.
 
 ---
 
 ## 4 · Lanes
 
-Your lane follows from your model. It is a declaration, not a preference.
+Our lane follows from our model. It is a declaration, not a preference — RAMEN
+is on **`decoupled`**.
 
-| Your model | Lane | Action format |
+| Model | Lane | Action format |
 |---|---|---|
 | GR00T N1.7 + `UNITREE_G1_SONIC` | `sonic` | `motion_token (T,64)` + `left/right_hand_joints (T,7)` |
 | Pi 0.5, GR00T N1.6, MolmoAct2, non-VLA methods | `decoupled` | `actions (T,25)` |
 
-Only GR00T N1.7 with the SONIC embodiment emits a 64-dim motion token. If
-yours does not, you are on `decoupled`.
+Only GR00T N1.7 with the SONIC embodiment emits a 64-dim motion token. RAMEN's
+policy does not, so we are on `decoupled`.
 
-Declare the lane in your manifest. The bench brings up a **different
-controller** for each, so a wrong declaration is caught before you get robot
-time — not during your slot.
+We declare the lane in our manifest. The bench brings up a **different
+controller** for each, so a wrong declaration is caught before we get robot
+time — not during our slot.
 
 ### `sonic`
 
@@ -135,10 +136,10 @@ Rows stream to the controller at 50 Hz. `boundary` rejects any chunk with
 A latent inside the bound can still be nonsense; nothing outside the paired
 decoder can tell.
 
-### `decoupled`
+### `decoupled` (RAMEN)
 
 One `(T,25)` chunk per message. The organizer runs inverse kinematics and
-drives the controller, so you need neither pinocchio nor ROS 2 in your
+drives the controller, so we need neither pinocchio nor ROS 2 in our
 container. Fixed row layout:
 
 | Columns | Meaning |
@@ -155,7 +156,7 @@ container. Fixed row layout:
 
 Quaternions must be unit length and **`w`-first**. `boundary` checks the norm,
 but a `(x,y,z,w)`-ordered quaternion is still unit length and passes — so
-nothing catches wrong ordering for you. Verify it by hand; on the robot it
+nothing catches wrong ordering for us. We verify it by hand; on the robot it
 shows up as a rotated end-effector, not an error message.
 
 ---
@@ -170,9 +171,9 @@ shows up as a rotated end-effector, not an error message.
 | `left_wrist` | `(480,640,3)` uint8 RGB | RealSense D405 — may be absent |
 | `right_wrist` | `(480,640,3)` uint8 RGB | RealSense D405 — may be absent |
 
-JPEGs are BGR on the wire; `boundary/cameras.py` flips to RGB for you. The
+JPEGs are BGR on the wire; `boundary/cameras.py` flips to RGB for us. The
 server does not publish until `ego_view` is live, and drops individual wrist
-keys when those cameras fail. Survive a missing wrist key.
+keys when those cameras fail. We survive a missing wrist key.
 
 ### State (`:5557`)
 
@@ -184,13 +185,13 @@ keys when those cameras fail. Survive a missing wrist key.
 | `right_hand_q` | `(7,)` float32 | usually absent |
 
 One schema for both lanes, whichever controller the organizer is running —
-so your client never needs ROS 2.
+so our client never needs ROS 2.
 
 `body_q` follows Unitree's canonical G1 29-DoF ordering (`G1JointIndex`).
-Slice it however your model was trained — no subset or reordering is imposed.
+We slice it however our model was trained — no subset or reordering is imposed.
 
-Angles are **radians**. Limits are the mechanical ranges, listed so you can
-sanity-check your own outputs; the controller enforces them, not `boundary`.
+Angles are **radians**. Limits are the mechanical ranges, listed so we can
+sanity-check our own outputs; the controller enforces them, not `boundary`.
 
 | # | Joint | Limit (rad) | | # | Joint | Limit (rad) |
 |---|---|---|---|---|---|---|
@@ -218,8 +219,8 @@ both `ANKLE_PITCH`/`ANKLE_ROLL` and `ANKLE_B`/`ANKLE_A` depending on whether
 the controller is in PR or AB mode. Same slots, different convention.
 
 **Waist roll and pitch (`13`, `14`) can be mechanically locked** on some G1
-builds, leaving yaw-only control. Do not assume those two carry meaningful
-signal until you have seen live data from the competition robot.
+builds, leaving yaw-only control. We do not assume those two carry meaningful
+signal until we have seen live data from the competition robot.
 
 ---
 
@@ -227,15 +228,15 @@ signal until you have seen live data from the competition robot.
 
 | | Jetson AGX Thor | Jetson Orin NX |
 |---|---|---|
-| **Role** | policy server — your model | policy client — your control loop |
-| **Container** | yours | yours |
+| **Role** | policy server — our model | policy client — our control loop |
+| **Container** | ours | ours |
 | **Address** | `192.168.100.1` | `192.168.100.2` |
-| **OS** | JetPack 7, aarch64 | JetPack 5.1.1 (L4T R35.3.1), aarch64 |
+| **OS** | JetPack 7.2, L4T R39.2, aarch64 | JetPack 5.1.1, L4T R35.3.1, aarch64 |
 | **CPU** | Arm Neoverse-V3AE, 14 cores, 2.6 GHz | Arm Cortex-A78AE, 8 cores / 8 threads, 2.0 GHz |
 | **Cache** | 1 MB L2 per core + 16 MB shared L3 | 2 MB L2 + 4 MB L3 |
 | **GPU** | Blackwell, 2560 CUDA cores, 5th-gen tensor cores, **sm_110** | Ampere, 1024 CUDA cores, 32 tensor cores, 918 MHz, **sm_87** |
 | **CUDA** | 13.0 | 11.4 |
-| **Python** | 3.12 | 3.8 default |
+| **Python** | 3.12 | 3.8 default (image default only — we install a newer one in our container if needed) |
 | **Memory** | **128 GB unified** LPDDR5X, 256-bit, 273 GB/s | **16 GB unified** (shared CPU + GPU) |
 | **Storage** | NVMe over PCIe | 2 TB |
 | **Power** | 40–130 W | — |
@@ -243,19 +244,37 @@ signal until you have seen live data from the competition robot.
 
 **Both machines use unified memory** — CPU and GPU share one physical pool. On
 the Thor that is a luxury (128 GB, no host-to-device copy). On the Orin it is a
-constraint: **16 GB total, not 16 CPU + 16 GPU.** Keep the client light — it
-moves images and actions, it does not infer. Your model belongs on the Thor.
+constraint: **16 GB total, not 16 CPU + 16 GPU.** We keep the client light — it
+moves images and actions, it does not infer. Our model belongs on the Thor.
 
 **The two GPUs are different architectures.** Thor is Blackwell `sm_110`, Orin
-NX is Ampere `sm_87`. A wheel built for one will not load on the other, so
-build your two containers separately.
+NX is Ampere `sm_87`. A wheel built for one will not load on the other, so we
+build our two containers separately.
 
 NVIDIA quotes **2070 TFLOPS (FP4, sparse)** for the Thor. That is a ceiling for
-a quantized sparse workload, not throughput you will see from an unquantized
-checkpoint — size your model against the 128 GB and your own measured latency.
+a quantized sparse workload, not throughput we will see from an unquantized
+checkpoint — we size our model against the 128 GB and our own measured latency.
 
 Robot: **Unitree G1 EDU**, 29 body DoF, **Dex1-1** two-finger grippers (not
 Dex3). Cameras: 1× head + 2× RealSense D405, all 480×640×3.
+
+**Base images** — the Thor and Orin are on different JetPack lines and GPU
+architectures, so we build two separate images; one will not run on both.
+
+- **Thor** (policy server): `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`.
+  JetPack 7 uses unified Arm CUDA, so this is the standard NGC CUDA image, not
+  an `l4t-*` tag. `nvcr.io/nvidia/pytorch:25.08-py3` also works as a framework
+  base.
+- **Orin** (policy client): `nvcr.io/nvidia/l4t-jetpack:r35.3.1`. This tag must
+  match the device's L4T exactly — the CUDA and driver userspace are mounted
+  from the host at runtime, so a different tag fails on the robot. Since the
+  client does no inference, `nvcr.io/nvidia/l4t-base:r35.3.1` is a lighter
+  alternative.
+
+If we get a **401** pulling from `nvcr.io`: those images need an NGC login even
+though they're public. Create a free account at ngc.nvidia.com, generate an API
+key, then `docker login nvcr.io` with username `$oauthtoken` and the API key as
+the password.
 
 ---
 
@@ -263,15 +282,15 @@ Dex3). Cameras: 1× head + 2× RealSense D405, all 480×640×3.
 
 - `boundary/` validates every action before publishing and refuses malformed
   ones. That is a floor, not a safety system.
-- Submissions are **video pre-screened**: show your policy working in
-  simulation or on your own G1 before it runs on ours.
+- Submissions are **video pre-screened**: we show our policy working in
+  simulation or on our own G1 before it runs on the organizer's.
 
 ---
 
 ## 8 · Submitting
 
-1. `python conformance.py --lane <your lane>` passes against the **current**
+1. `python conformance.py --lane decoupled` passes against the **current**
    template.
 2. Policy server (Thor) and policy client (Orin).
-3. A manifest declaring your lane, your entrypoints, and your ports.
-4. Your pre-screen video.
+3. A manifest declaring our lane, our entrypoints, and our ports.
+4. Our pre-screen video.
