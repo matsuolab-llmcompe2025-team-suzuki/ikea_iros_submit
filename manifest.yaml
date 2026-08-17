@@ -19,7 +19,7 @@ images:
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
   orin:                       # policy client / sm_87 Ampere / JetPack 5.1.1 / CUDA 11.4
     repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
-    digest: "sha256:8ad1fe45343756d85d3409f3c3af8d1a0cf4b5a64a6350efe8ac3ec1046fb938"
+    digest: "sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4"
     base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"  # device の L4T R35.3.1 に完全一致必須
     entrypoint:
       ["python3", "-u", "components/client.py",
