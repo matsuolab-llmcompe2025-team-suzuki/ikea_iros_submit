@@ -138,7 +138,13 @@ class Inference:
             self._pending = None
 
     def close(self):
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        # cancel_futures は Python 3.9+ で追加。Orin (JetPack 5.1.1) の default Python は
+        # 3.8 で未対応 → shutdown が TypeError で exit path を crash させる (運営 onboarding
+        # Finding 3、upstream template の bug)。version guard で回避。
+        if sys.version_info >= (3, 9):
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._pool.shutdown(wait=False)
 
 
 _warned_short_chunk = False

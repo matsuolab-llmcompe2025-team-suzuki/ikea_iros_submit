@@ -38,6 +38,7 @@ Thor `192.168.100.1` / Orin `192.168.100.2`、両者は ethernet 直結。
 ```bash
 # on the Thor (policy server)
 docker run --rm --runtime nvidia --network host \
+  -e NVIDIA_DISABLE_REQUIRE=1 \
   -e HF_TOKEN=<token-if-gated> \
   <registry>/ramen-thor@sha256:<digest>
 # → components/server.py --lane decoupled --host 0.0.0.0 --port 8765
@@ -49,6 +50,7 @@ docker run --rm --runtime nvidia --network host \
 ```
 - `--network host`: boundary の ZeroMQ 3 endpoint（cameras:5555 / state:5557 / actions:5556、Orin 上）と Thor↔Orin WebSocket:8765 のため。
 - `--runtime nvidia`: GPU アクセス。Orin は CUDA/driver userspace が host mount。
+- **`-e NVIDIA_DISABLE_REQUIRE=1`(Thor のみ、必須)**: base の `cuda:13.0.0-devel-ubuntu24.04` は driver-compat gate を焼き込んでおり、運営 Thor(driver 595.78)では `--runtime nvidia` だけだと GPU が全く渡らない(`nvidia-smi` が container 内で失敗)。このフラグで解消(運営 onboarding Finding 1 で確認済)。無いと RAMEN-Ori が CPU-only load or crash する。
 
 ## 提出時に添えるもの（運営チェックリスト、2026-08 訂正）
 1. Git repo link（無改変 `boundary/` + 各コンテナの Dockerfile）

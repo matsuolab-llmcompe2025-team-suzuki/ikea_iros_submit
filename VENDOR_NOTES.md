@@ -25,6 +25,9 @@
 - ⚠️ **`components/transport.py` は自作パッチあり**（websockets の ping kwargs を `_WS_MAJOR>=14` で version-guard。
   実 Orin = Python3.8 = websockets 13.1 で client 即死するのを回避、cross-container e2e で確認）。
   **plain re-vendor で上書きしないこと**。
+- ⚠️ **`components/client.py` は自作パッチあり**（`close()` の `ThreadPoolExecutor.shutdown(cancel_futures=True)` を
+  `sys.version_info>=(3,9)` で version-guard。`cancel_futures` は Python3.9+ で、Orin=Python3.8 では exit path が
+  TypeError で crash する upstream template bug。運営 onboarding **Finding 3** で実発火確認）。**plain re-vendor で上書きしないこと**。
 - `components/server.py` は `7a4f071` のまま（`2ae4eeb` は stereo コメント追記のみ = 非採用）。
 
 ## 現状（onboarding）
@@ -50,3 +53,9 @@
 - **action-space adapter**: RAMEN-Ori 19D upper-body joint → boundary (T,25) task-space
   （arm14→FK→EE pose / waist3→torso rpy / hand2→4 / navigate・base は 0 埋め、歩行は別 source）。
   design doc `docs/model/ramen_ori_vla_design.md` §8.6 に未反映。
+  - ⚠️ **`scipy` を Thor image の deps に焼き込む**（FK step が要求。運営 onboarding **Finding 5**:
+    OOJU/CuriosAI が dev host patch のみで clean run の import time に container fail した事例あり）。
+    RAMEN-Ori 搭載時に `docker/Dockerfile.thor` の model deps へ `scipy` を追加すること。
+- **運営 onboarding = PASS**（2026-08、`ikea_iros_submit@6a46c3d`、contract+plumbing 認証、two-box 0 reject）。
+  残 gate: (1) `-e NVIDIA_DISABLE_REQUIRE=1`（Finding 1、対応済 INSTRUCTIONS/下記）、(2) GHCR access（Finding 2、public 化で解消）、
+  (3) RAMEN-Ori 実搭載（real checkpoint、weighted stage 未検証）。Orin base r35.3.1 は初回正解で credit（Finding 4）。
