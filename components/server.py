@@ -121,6 +121,26 @@ class Policy:
         return {"ok": True}
 
 
+def _build_policy(lane: str, delay_ms: float):
+    """RAMEN_POLICY env で policy 実装を選ぶ。
+
+    未設定 / "stub"        → 参照 hold-still Policy (conformance の既定、挙動不変)。
+    "groot_pick" (decoupled) → GrootPickTaskspacePolicy (段階1 PoC、案C = pick 単体)。
+                              backend は既定 HoldPoseBackend (現在姿勢保持、GPU 不要)。
+    """
+    choice = os.environ.get("RAMEN_POLICY", "stub").strip().lower()
+    if choice in ("", "stub", "reference"):
+        return Policy(lane, delay_ms)
+    if choice == "groot_pick":
+        if lane != "decoupled":
+            raise SystemExit("RAMEN_POLICY=groot_pick requires --lane decoupled")
+        from components.ramen.policy import GrootPickTaskspacePolicy
+
+        print("[server] using GrootPickTaskspacePolicy (decoupled, HoldPoseBackend)")
+        return GrootPickTaskspacePolicy(lane=lane)
+    raise SystemExit(f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lane", choices=LANES,
@@ -134,7 +154,7 @@ def main():
     args = parser.parse_args()
 
     print(f"[server] lane={args.lane} delay={args.delay_ms:.0f}ms")
-    serve_policy(Policy(args.lane, args.delay_ms), host=args.host, port=args.port)
+    serve_policy(_build_policy(args.lane, args.delay_ms), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
