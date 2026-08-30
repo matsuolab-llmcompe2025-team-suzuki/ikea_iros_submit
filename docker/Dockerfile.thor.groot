@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1
+#
+# Policy SERVER container — GR00T-pick track (Team RAMEN)。
+#   Jetson AGX Thor: sm_110 (Blackwell) / JetPack 7.x / CUDA 13 / aarch64 / 128 GB unified
+#
+# RAMEN-Ori 用 Dockerfile.thor とは別 image。GR00T pick を decoupled lane で動かす。
+# server.py は RAMEN_POLICY=groot_pick_real で GrootPickTaskspacePolicy を選び、
+# GrootPickWorker が components/ramen/vendor の worker script を同一 env の python で
+# spawn する (RAMEN_WORKER_PYTHON=python3)。
+#
+#   ⚠️ image は linux/arm64 (aarch64) build。x86 host から:
+#      docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor.groot \
+#        -t <registry>/ramen-thor-groot:<tag> --push .
+#   ⚠️ nvcr.io は NGC login 必須:
+#      docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>
+#
+# torch sm_110 の入手 (調査 2026-08-30):
+#   - base = nvcr.io/nvidia/pytorch:25.08-py3 は arm64 variant が Grace-Blackwell 向け
+#     torch (CUDA13) を同梱。lerobot[groot]==0.6.0 の torch 制約 (>=2.7,<2.12) を満たすので
+#     `pip install lerobot[groot]` は NGC torch を差し替えない (満たす dep を pip は再取得しない)。
+#   - repo に Thor 専用 torch install script は無い (server.py docstring の Isaac-GR00T
+#     install path は upstream 参照)。標準 NGC pytorch base を採る。
+#   - inference は lerobot[groot] のみで足りる (dataset/training 不要 = torchcodec aarch64 回避)。
+#
+# ⚠️ 未検証 (要 Thor 実機 or arm64/Blackwell): 本 image は sm_110 GPU が無いと GR00T 推論を
+#    実行検証できない (QEMU は build 可・GPU 実行不可)。build 段階で lerobot[groot] の CUDA
+#    拡張 (flash-attn 等) が sm_110 向けに compile 通るかが残リスク。実 Thor で
+#    `RAMEN_POLICY=groot_pick_real python3 components/server.py` の ready + conformance を確認する。
+
+ARG BASE=nvcr.io/nvidia/pytorch:25.08-py3
+FROM ${BASE}
+
+WORKDIR /app
+
+# opencv (headless) 用の最小 system lib (NGC base に無い場合の保険)。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgl1 libglib2.0-0 \
+      && rm -rf /var/lib/apt/lists/*
+
+# --- deps ---
+# 1) submission template deps (numpy/msgpack/pyzmq/opencv/websockets)。
+# 2) GR00T inference: lerobot[groot]==0.6.0 (NGC torch を保持: >=2.7,<2.12 を満たす)。
+#    numpy は worker と揃える (2.2.6)。
+COPY requirements.txt ./
+RUN python3 -m pip install --no-cache-dir -r requirements.txt \
+    && python3 -m pip install --no-cache-dir "numpy==2.2.6" "lerobot[groot]==0.6.0" \
+    && python3 - <<'PY'
+import torch
+print("[build] torch", torch.__version__, "cuda", torch.version.cuda)
+# NGC torch を lerobot が差し替えていないことの sanity (>=2.7,<2.12)。
+maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
+PY
+
+# --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
+COPY . ./
+
+# GR00T pick を選択。worker は同一 env の python3 を使う。
+ENV RAMEN_POLICY=groot_pick_real \
+    RAMEN_WORKER_PYTHON=python3 \
+    PEVAL_LANE=decoupled
+
+# weights (ver2-lora, private Team-RAMEN) は image に焼かず runtime に HF から取得。
+#   docker run 時に -e HF_TOKEN=<token> を渡す (private repo pull に必須)。
+#   manifest.yaml の weights_uri と整合。
+
+CMD ["python3", "-u", "components/server.py", \
+     "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]

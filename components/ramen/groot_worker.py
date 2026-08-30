@@ -64,12 +64,17 @@ class GrootPickWorker:
         revision: str = MODEL_REVISION,
         task: str = TASK_TEXT,
     ):
+        import shutil
+
         worker_python = worker_python or os.environ.get("RAMEN_WORKER_PYTHON")
+        if worker_python and not Path(worker_python).is_file():
+            # PATH 上の名前 (container の "python3" 等) も許容する。
+            worker_python = shutil.which(worker_python) or worker_python
         if not worker_python or not Path(worker_python).is_file():
             raise RuntimeError(
-                "GR00T worker venv python not found. Set RAMEN_WORKER_PYTHON to the "
-                "lerobot[groot] Py3.12 interpreter (dev: iros repo の "
-                "model/subtask_policy_training/.venv/bin/python)."
+                "GR00T worker python not found. Set RAMEN_WORKER_PYTHON to the "
+                "lerobot[groot] interpreter (dev: iros repo の "
+                "model/subtask_policy_training/.venv/bin/python; Thor container: python3)."
             )
         if not _WORKER_SCRIPT.is_file():
             raise FileNotFoundError(f"vendored worker script missing: {_WORKER_SCRIPT}")

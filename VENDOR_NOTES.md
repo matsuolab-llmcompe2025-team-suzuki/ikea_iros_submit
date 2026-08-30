@@ -72,7 +72,14 @@
 - `components/ramen/vendor/`: worker inference の最小 closure（`groot_pick_leg_contract` /
   `worker_protocol` / `real_groot_n17_worker.py`）を package path 保存で vendor。desktop policy
   stack 非依存。
-- **残（container build）**: worker venv = **`RAMEN_WORKER_PYTHON`**（lerobot[groot] + torch **sm_110**
-  の Py3.12 env）を Thor image 内に構築する必要（`Dockerfile.thor` L35 の model deps、torch sm_110 が
-  本丸）。verify: 実 GPU smoke で obs→raw38D→(T,25) 契約 PASS・EE pose 幾何妥当（pelvis frame）。
-  ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。
+- **container build**: `docker/Dockerfile.thor.groot`（RAMEN-Ori 用と別 image）。
+  - base = `nvcr.io/nvidia/pytorch:25.08-py3`（arm64 variant が Grace-Blackwell 向け torch/CUDA13 同梱）。
+    torch **sm_110** の現実解（repo に Thor install script 無し、標準 NGC pytorch を採る）。
+  - `pip install lerobot[groot]==0.6.0`（torch 制約 >=2.7,<2.12 = NGC torch を保持）+ numpy 2.2.6 +
+    submission reqs。inference は `[groot]` のみで足りる（dataset/training 不要 = torchcodec aarch64 回避）。
+  - `ENV RAMEN_POLICY=groot_pick_real RAMEN_WORKER_PYTHON=python3`（同一 env で worker spawn）。
+  - weights（ver2-lora, private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
+  - build: `docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor.groot --push .`
+  - ⚠️ **未検証**（sm_110 GPU 必要）: QEMU は build のみ・GPU 実行不可。build 時に lerobot[groot] の
+    CUDA 拡張（flash-attn 等）が sm_110 で compile 通るかが残リスク。実 Thor で ready+conformance 確認。
+- ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。
