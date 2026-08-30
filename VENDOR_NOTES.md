@@ -59,3 +59,20 @@
 - **運営 onboarding = PASS**（2026-08、`ikea_iros_submit@6a46c3d`、contract+plumbing 認証、two-box 0 reject）。
   残 gate: (1) `-e NVIDIA_DISABLE_REQUIRE=1`（Finding 1、対応済 INSTRUCTIONS/下記）、(2) GHCR access（Finding 2、public 化で解消）、
   (3) RAMEN-Ori 実搭載（real checkpoint、weighted stage 未検証）。Orin base r35.3.1 は初回正解で credit（Finding 4）。
+
+## GR00T-pick 提出トラック（2026-08-30、`components/ramen/`）
+明日の運営評価向けに、RAMEN-Ori とは別に **GR00T pick 単体**を decoupled lane へ載せる track。
+- `components/ramen/policy.py`: `GrootPickTaskspacePolicy`（`RAMEN_POLICY=groot_pick_real` で
+  server.py が選択）。backend = `GrootWorkerBackend`（`groot_worker.GrootPickWorker` で
+  vendored worker を spawn、raw 38D → adapter で (T,25)）。`HoldPoseBackend` は GPU 無し fallback。
+- `components/ramen/{taskspace_adapter,g1_urdf_fk}.py`: iros_2026_ramen から vendor した
+  **pure-numpy** FK + adapter（arm14→FK→EE / hand2→4 / waist3→torso_rpy は param / navigate・base=0）。
+  ⚠️ **この FK 経路は scipy 不要**（Shepperd matrix→quat、euler 非経由）= Finding 5 の scipy 罠は
+  **GR00T-pick track には非該当**（scipy を焼く必要なし。RAMEN-Ori track のみ別途要判断）。
+- `components/ramen/vendor/`: worker inference の最小 closure（`groot_pick_leg_contract` /
+  `worker_protocol` / `real_groot_n17_worker.py`）を package path 保存で vendor。desktop policy
+  stack 非依存。
+- **残（container build）**: worker venv = **`RAMEN_WORKER_PYTHON`**（lerobot[groot] + torch **sm_110**
+  の Py3.12 env）を Thor image 内に構築する必要（`Dockerfile.thor` L35 の model deps、torch sm_110 が
+  本丸）。verify: 実 GPU smoke で obs→raw38D→(T,25) 契約 PASS・EE pose 幾何妥当（pelvis frame）。
+  ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。

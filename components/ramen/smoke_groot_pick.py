@@ -1,8 +1,8 @@
 """実 GR00T pick 推論 → (T,25) smoke (GPU 必要)。
 
-iros_2026_ramen の runtime env から実行する想定:
+worker venv (lerobot[groot]) を持つ環境から実行する想定:
     cd /datadrive2/iros_2026_ramen && \
-    RAMEN_DESKTOP_REPO=/datadrive2/iros_2026_ramen \
+    RAMEN_WORKER_PYTHON=/datadrive2/iros_2026_ramen/model/subtask_policy_training/.venv/bin/python \
     pixi run -e runtime python /datadrive2/ikea_iros_submit/components/ramen/smoke_groot_pick.py
 
 mock obs (zeros 画像 + 妥当な body_q) で GrootWorkerBackend を1回 forward し、
@@ -49,7 +49,7 @@ def main() -> int:
     TASKSPACE_SLICES = _TASKSPACE_SLICES
     print("[smoke] building GrootWorkerBackend (loads real pick worker) ...")
     t0 = time.monotonic()
-    backend = GrootWorkerBackend(variant="groot_pick_legs_v2")
+    backend = GrootWorkerBackend()
     policy = GrootPickTaskspacePolicy(lane="decoupled", backend=backend)
     print(f"[smoke] backend ready in {time.monotonic() - t0:.1f}s")
 
@@ -84,7 +84,7 @@ def main() -> int:
     print(f"[smoke] hands range = [{hands.min():.3f}, {hands.max():.3f}]")
 
     policy.reset()
-    backend._policy.close() if hasattr(backend._policy, "close") else None
+    backend.close()
     print("[smoke] OK")
     return 0
 

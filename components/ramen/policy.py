@@ -74,120 +74,58 @@ class HoldPoseBackend(InferenceBackend):
 
 
 class GrootWorkerBackend(InferenceBackend):
-    """実 GR00T pick 推論 backend (iros_2026_ramen の Gr00tPolicyPickLegs worker)。
+    """実 GR00T pick 推論 backend (self-contained、直接 worker protocol)。
 
-    boundary obs → desktop Observation を組み、pick worker で推論し、返る 19D
-    executable (waist3 + arms14 + hands2) から body29 を再構成して (T, 38) を返す。
-    body29 の legs12 は obs.body_q 由来 (FK は waist+arm のみ使い legs 未使用)。
+    vendored worker (`components/ramen/vendor` + `GrootPickWorker`) を使い、boundary
+    obs → 38D state + 4 cam → **raw 38D** action chunk を得て返す (adapter が直接 (T,25) 化)。
+    desktop policy stack (base / config_loader / Observation) には依存しない。
 
-    NOTE: desktop inference path を lazy import する (submission repo の unit test /
-    conformance は本 backend を import しない = HoldPose 既定)。実 Thor container では
-    desktop path を vendor/install する必要があり、それは build スコープ。dev/bench では
-    RAMEN_DESKTOP_REPO (既定 /datadrive2/iros_2026_ramen) を sys.path に足す。
+    camera: boundary は RGB (ego_view + left/right_wrist)。worker/model は BGR 期待なので
+    RGB→BGR に戻し、head 単一 ego_view を cam_0/cam_1 両方へ、wrist 欠落は zero-image。
+    worker venv は env `RAMEN_WORKER_PYTHON` (実 Thor container では image 内 venv)。
     """
-
-    # 19D executable layout (Gr00tPolicyPickLegs.predict の concat 順)。
-    _WAIST = slice(0, 3)
-    _ARMS = slice(3, 17)
-    _HANDS = slice(17, 19)
 
     def __init__(
         self,
-        variant: str = "groot_pick_legs_v2",
-        desktop_repo: str | None = None,
         dex1_open_fraction: tuple[float, float] = (1.0, 1.0),
         task: str = "pick table leg",
+        worker_python: str | None = None,
     ):
-        import os
-        import sys
+        from .groot_worker import GrootPickWorker
 
-        repo = desktop_repo or os.environ.get(
-            "RAMEN_DESKTOP_REPO", "/datadrive2/iros_2026_ramen"
-        )
-        if repo not in sys.path:
-            sys.path.insert(0, repo)
-        from inference.desktop.lower_policy.policies.base import (  # noqa: E402
-            CameraKey,
-            Observation,
-        )
-        from inference.desktop.lower_policy.policies.config_loader import (  # noqa: E402
-            load_policy_variant,
-            resolve_policy_class,
-        )
-        from inference.desktop.upper_policy.groot_pick_leg_contract import (  # noqa: E402
-            compose_model_state,
-        )
-
-        self._Observation = Observation
-        self._CameraKey = CameraKey
-        self._compose_state = compose_model_state
-        self._task = task
         self._dex1_open = np.clip(np.asarray(dex1_open_fraction, np.float32), 0.0, 1.0)
+        self._worker = GrootPickWorker(worker_python=worker_python, task=task)
 
-        cfg_path = os.path.join(
-            repo, "inference/desktop/lower_policy/configs/policy_config.yaml"
-        )
-        entry = load_policy_variant(cfg_path, variant)
-        cls = resolve_policy_class(entry.policy_type)
-        self._policy = cls.from_ckpt(entry.policy_config)
+    @staticmethod
+    def _bgr(images: dict, key: str) -> np.ndarray:
+        img = images.get(key)
+        if img is None:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        return np.ascontiguousarray(np.asarray(img, dtype=np.uint8)[:, :, ::-1])
 
-    def _observation(self, obs: dict):
+    def infer(self, obs: dict, horizon: int) -> np.ndarray:
         body_q = np.asarray(obs["body_q"], dtype=np.float32)
         if body_q.shape != (_BODY_DIM,):
             raise ValueError(f"obs.body_q must be (29,), got {body_q.shape}")
-        state38 = self._compose_state(body_q, self._dex1_open)
+        state38 = self._worker.build_state(body_q, self._dex1_open)
+
         images = obs.get("images", {})
-
-        def _bgr(key: str) -> np.ndarray:
-            img = images.get(key)
-            if img is None:
-                return np.zeros((480, 640, 3), dtype=np.uint8)
-            return np.ascontiguousarray(np.asarray(img, dtype=np.uint8)[:, :, ::-1])
-
-        ego = _bgr("ego_view")   # head は単一 ego_view を cam_0/cam_1 両方へ
-        frames = {
-            self._CameraKey.HEAD_LEFT: ego,
-            self._CameraKey.HEAD_RIGHT: ego,
-            self._CameraKey.WRIST_LEFT: _bgr("left_wrist"),
-            self._CameraKey.WRIST_RIGHT: _bgr("right_wrist"),
+        ego = self._bgr(images, "ego_view")   # head 単一 ego_view を cam_0/cam_1 両方へ
+        frames_bgr = {
+            "head_left": ego,
+            "head_right": ego,
+            "left_wrist": self._bgr(images, "left_wrist"),
+            "right_wrist": self._bgr(images, "right_wrist"),
         }
-        return self._Observation(
-            frames_bgr=frames,
-            frames_bgr_prev=None,
-            state=state38,
-            skill_id=None,
-            language=obs.get("prompt") or self._task,
-            obb_detections=None,
-            timestamp_ns=0,
-        ), body_q
+        chunk38 = self._worker.predict(state38, frames_bgr)   # (T_model, 38) raw
 
-    def infer(self, obs: dict, horizon: int) -> np.ndarray:
-        observation, body_q = self._observation(obs)
-        action19 = np.asarray(
-            self._policy.predict(observation).action_chunk, dtype=np.float64
-        )
-        if action19.ndim != 2 or action19.shape[1] != 19:
-            raise ValueError(f"expected pick 19D chunk, got {action19.shape}")
-
-        legs12 = body_q[:12].astype(np.float64)
-        rows = []
-        for row in action19:
-            body29 = np.concatenate([legs12, row[self._WAIST], row[self._ARMS]])
-            rows.append(
-                np.concatenate([_ROOT_PROXY_XYZ_WXYZ, body29, row[self._HANDS]])
-            )
-        chunk38 = np.stack(rows)   # (T_model, 38)
-
-        # horizon に合わせる (足りなければ最終 row を保持、多ければ truncate)。
         if chunk38.shape[0] >= horizon:
             return chunk38[:horizon]
         pad = np.tile(chunk38[-1:], (horizon - chunk38.shape[0], 1))
         return np.concatenate([chunk38, pad])
 
-    def reset(self) -> None:
-        reset = getattr(self._policy, "reset", None)
-        if callable(reset):
-            reset()
+    def close(self) -> None:
+        self._worker.close()
 
 
 class GrootPickTaskspacePolicy:
