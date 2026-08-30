@@ -131,14 +131,22 @@ def _build_policy(lane: str, delay_ms: float):
     choice = os.environ.get("RAMEN_POLICY", "stub").strip().lower()
     if choice in ("", "stub", "reference"):
         return Policy(lane, delay_ms)
-    if choice == "groot_pick":
+    if choice in ("groot_pick", "groot_pick_real"):
         if lane != "decoupled":
-            raise SystemExit("RAMEN_POLICY=groot_pick requires --lane decoupled")
+            raise SystemExit(f"RAMEN_POLICY={choice} requires --lane decoupled")
         from components.ramen.policy import GrootPickTaskspacePolicy
 
-        print("[server] using GrootPickTaskspacePolicy (decoupled, HoldPoseBackend)")
-        return GrootPickTaskspacePolicy(lane=lane)
-    raise SystemExit(f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick")
+        backend = None
+        if choice == "groot_pick_real":
+            from components.ramen.policy import GrootWorkerBackend
+
+            print("[server] loading real GR00T pick worker (may take ~1 min)")
+            backend = GrootWorkerBackend()
+        print(f"[server] using GrootPickTaskspacePolicy (decoupled, {choice})")
+        return GrootPickTaskspacePolicy(lane=lane, backend=backend)
+    raise SystemExit(
+        f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick / groot_pick_real"
+    )
 
 
 def main():
