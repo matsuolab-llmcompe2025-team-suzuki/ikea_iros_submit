@@ -5,7 +5,7 @@ lane の `(T,25)` task-space に載せて** 運営評価に出すための実装
 
 - 実装: `components/ramen/`
 - 提出 manifest: `manifest.groot.yaml`
-- image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch`
+- image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch-np2`
 - 技術詳細 / 判断ログ: `VENDOR_NOTES.md` §「GR00T-pick 提出トラック」「53D skills」ほか
 
 ---
@@ -30,7 +30,7 @@ docker run --rm --runtime nvidia --network host \
   -e NVIDIA_DISABLE_REQUIRE=1 \
   -e RAMEN_POLICY=groot_orchestrator \
   -e HF_TOKEN=<Team-RAMEN HF read token> \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch-np2
 ```
 - `NVIDIA_DISABLE_REQUIRE=1` は Thor で GPU passthrough に必須 (onboarding Finding 1)。
 - weights (GR00T / YOLO) は image に焼かず **runtime に HF から取得** → `HF_TOKEN` 必須。
@@ -120,7 +120,7 @@ docker buildx build --builder armbuilder --platform linux/arm64 \
   --push .
 ```
 
-- base = `nvcr.io/nvidia/pytorch:25.08-py3` (arm64 = Grace-Blackwell torch sm_110 / CUDA13)。
+- base = `nvcr.io/nvidia/pytorch:25.12-py3` (numpy 2.x ABI torch sm_110 / CUDA13。25.08 は numpy 1.x ABI で from_numpy が壊れるため不可)。
 - image 内訳: image main = lerobot 0.6.0 + ultralytics + pyyaml、`/opt/venv-groot53` = lerobot 0.6.1。
 - 新規 package を作らず **既存 `ikea-thor` の tag** に push (運営に伝達済の名前を維持、
   `:onboarding` tag は温存)。push 後 digest を `manifest.groot.yaml` に反映。

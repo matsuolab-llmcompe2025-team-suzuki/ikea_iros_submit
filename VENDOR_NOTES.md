@@ -35,7 +35,7 @@
 - lane = **decoupled**（RAMEN-Ori は非 GR00T-SONIC → (T,25) task-space）。
 
 ## Base image（運営 2026-08 訂正で確定）
-- Thor(server): `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`（標準 NGC CUDA、l4t ではない / JetPack 7.2 / CUDA 13 / sm_110）。代替 `nvcr.io/nvidia/pytorch:25.08-py3`。
+- Thor(server): `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`（標準 NGC CUDA、l4t ではない / JetPack 7.2 / CUDA 13 / sm_110）。代替 pytorch base は **`25.12-py3`**（⚠️ `25.08-py3` は torch が numpy 1.x ABI で lerobot 必須の numpy 2.x と衝突、from_numpy 全推論クラッシュ = GR00T track で実発火。§「GR00T-pick 提出トラック」参照）。
 - Orin(client): `nvcr.io/nvidia/l4t-jetpack:r35.3.1`（**JetPack 5.1.1**、6.x は誤り / CUDA 11.4 / sm_87 / Python3.8）。軽量代替 `l4t-base:r35.3.1`。
 - 両 image **linux/arm64** build。nvcr.io は NGC login 必須。private registry へ push しアクセス付与。
 
@@ -73,7 +73,8 @@
   `worker_protocol` / `real_groot_n17_worker.py`）を package path 保存で vendor。desktop policy
   stack 非依存。
 - **container build**: `docker/Dockerfile.thor.groot`（RAMEN-Ori 用と別 image）。
-  - base = `nvcr.io/nvidia/pytorch:25.08-py3`（arm64 variant が Grace-Blackwell 向け torch/CUDA13 同梱）。
+  - base = `nvcr.io/nvidia/pytorch:25.12-py3`（numpy 2.x ABI torch。25.08 は torch が numpy 1.x ABI で、
+    lerobot 必須の numpy 2.x を入れると from_numpy が全推論クラッシュ = IAC eval 指摘。25.12 で解消、QEMU 検証済）。
     torch **sm_110** の現実解（repo に Thor install script 無し、標準 NGC pytorch を採る）。
   - `pip install lerobot[groot]==0.6.0`（torch 制約 >=2.7,<2.12 = NGC torch を保持）+ numpy 2.2.6 +
     submission reqs。inference は `[groot]` のみで足りる（dataset/training 不要 = torchcodec aarch64 回避）。
@@ -81,12 +82,14 @@
   - weights（ver2-lora, private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
   - build: `docker buildx build --builder armbuilder --platform linux/arm64 \
     -f docker/Dockerfile.thor.groot -t <registry>/ramen-thor-groot:<tag> --push .`
-  - ✅ **arm64 build 検証済（2026-08-31、QEMU+buildx、push 無し validate）**:
-    NGC arm64 base pull OK、`pip install lerobot[groot]==0.6.0` DONE、
-    `[build] torch 2.8.0a0+nv25.08 cuda 13.0 | numpy 2.2.6 | lerobot 0.6.0 | cv2/hf_hub import OK`。
-    恐れた CUDA 拡張 compile 失敗は無し。numpy は最後に 2.2.6 固定（worker 一致）。
-    pip の conflict 警告は NGC base 同梱 RAPIDS/numba/cupy/scipy の版ズレのみ = GR00T pick は
-    未 import で無害。
+  - ⚠️ **旧 25.08 build 検証ログ（無効化、2026-08-31）**: 当初 `nvcr.io/nvidia/pytorch:25.08-py3`
+    で `[build] torch 2.8.0a0+nv25.08 cuda 13.0 | numpy 2.2.6 | lerobot 0.6.0` まで build は
+    緑で通っていたが、**この torch は numpy 1.x ABI で、numpy 2.x を入れると実推論の
+    from_numpy/.numpy() が全クラッシュする（IAC eval 指摘、build では出ず weight load 時のみ発現）**。
+    → base を **25.12（numpy 2.x ABI torch）** に変更し、build 内 assert に
+    `torch.from_numpy(np.zeros(3)).numpy()` の bridge 検証を追加して二度と緑で通さないようにした。
+    ⚠️ **要リビルド**: 25.12 での arm64 build+push はまだ実施していない（新 tag で push し
+    digest を差し替える。build 機構＝QEMU+buildx は検証済、CUDA 拡張 compile 失敗も無かった）。
   - ⚠️ **実行は未検証**（sm_110 GPU 必要、x86/QEMU では GPU 実行不可）: 実 Thor で
     `RAMEN_POLICY=groot_pick_real python3 components/server.py` の worker ready + conformance +
     (T,25) 出力を確認する。weights は `-e HF_TOKEN=...` で runtime 取得。

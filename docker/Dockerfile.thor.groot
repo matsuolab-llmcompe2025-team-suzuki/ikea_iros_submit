@@ -14,9 +14,10 @@
 #   ⚠️ nvcr.io は NGC login 必須:
 #      docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>
 #
-# torch sm_110 の入手 (調査 2026-08-30):
-#   - base = nvcr.io/nvidia/pytorch:25.08-py3 は arm64 variant が Grace-Blackwell 向け
-#     torch (CUDA13) を同梱。lerobot[groot]==0.6.0 の torch 制約 (>=2.7,<2.12) を満たすので
+# torch sm_110 の入手 (調査 2026-08-30、numpy ABI で 2026-08-31 更新):
+#   - base = nvcr.io/nvidia/pytorch:25.12-py3 は arm64 variant が Grace-Blackwell 向け
+#     torch (CUDA13) を同梱し、かつ numpy 2.x ABI (25.08 は numpy 1.x ABI = 下記の理由で不可)。
+#     lerobot[groot]==0.6.0 の torch 制約 (>=2.7,<2.12) を満たすので
 #     `pip install lerobot[groot]` は NGC torch を差し替えない (満たす dep を pip は再取得しない)。
 #   - repo に Thor 専用 torch install script は無い (server.py docstring の Isaac-GR00T
 #     install path は upstream 参照)。標準 NGC pytorch base を採る。
@@ -27,7 +28,13 @@
 #    拡張 (flash-attn 等) が sm_110 向けに compile 通るかが残リスク。実 Thor で
 #    `RAMEN_POLICY=groot_pick_real python3 components/server.py` の ready + conformance を確認する。
 
-ARG BASE=nvcr.io/nvidia/pytorch:25.08-py3
+# ⚠️ base は numpy 2.x ABI の torch であること。lerobot 0.6.x は numpy>=2.0,<2.3 を要求する
+# ため、pip が必ず numpy 2.x を入れる。pytorch:25.08 は torch が numpy 1.x ABI compile で、
+# numpy 2.x を入れると torch.from_numpy()/.numpy() が "Numpy is not available" で全推論クラッシュ
+# する (IAC eval 指摘、実 weight load 時のみ発現)。25.12 は numpy 2.1.0 同梱 + torch 2.10 が
+# numpy 2.x ABI なので bridge OK (QEMU 検証済: numpy 2.2.6 でも from_numpy 成功)。下の build 中
+# assert が bridge を毎回検証する。
+ARG BASE=nvcr.io/nvidia/pytorch:25.12-py3
 FROM ${BASE}
 
 WORKDIR /app
@@ -49,12 +56,16 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt \
     && python3 -m pip install --no-cache-dir "lerobot[groot]==0.6.0" \
     && python3 -m pip install --no-cache-dir "numpy==2.2.6" \
     && python3 - <<'PY'
-import torch, numpy, huggingface_hub, cv2
+import torch, numpy, numpy as np, huggingface_hub, cv2
 print("[build] torch", torch.__version__, "cuda", torch.version.cuda,
       "| numpy", numpy.__version__, "| hf_hub", huggingface_hub.__version__)
 maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
 assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
 assert numpy.__version__ == "2.2.6", numpy.__version__      # worker と一致
+# torch<->numpy ABI bridge を build 時に検証 (numpy 1.x ABI torch + numpy 2.x を弾く)。
+# これが緑で通れば実推論の from_numpy/.numpy() がクラッシュしない。
+_arr = torch.from_numpy(np.zeros(3, dtype=np.float32)); _ = _arr.numpy()
+print("[build] torch<->numpy bridge OK")
 import lerobot  # groot inference path が import 可能なこと
 print("[build] lerobot", lerobot.__version__)
 PY
@@ -72,10 +83,13 @@ RUN python3 -m venv --system-site-packages /opt/venv-groot53 \
     && /opt/venv-groot53/bin/pip install --no-cache-dir \
         "lerobot[groot]==0.6.1" "numpy==2.2.6" accelerate safetensors \
     && /opt/venv-groot53/bin/python - <<'PY'
-import lerobot, torch, numpy, accelerate, safetensors
+import lerobot, torch, numpy, numpy as np, accelerate, safetensors
 print("[build] groot53 venv: lerobot", lerobot.__version__, "torch", torch.__version__,
       "numpy", numpy.__version__)
 assert lerobot.__version__ == "0.6.1", lerobot.__version__
+# 53D venv も base torch を継承するので同じ bridge 検証をする。
+_arr = torch.from_numpy(np.zeros(3, dtype=np.float32)); _ = _arr.numpy()
+print("[build] groot53 venv: torch<->numpy bridge OK")
 PY
 
 # --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
