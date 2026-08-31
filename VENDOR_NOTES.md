@@ -79,7 +79,15 @@
     submission reqs。inference は `[groot]` のみで足りる（dataset/training 不要 = torchcodec aarch64 回避）。
   - `ENV RAMEN_POLICY=groot_pick_real RAMEN_WORKER_PYTHON=python3`（同一 env で worker spawn）。
   - weights（ver2-lora, private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
-  - build: `docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor.groot --push .`
-  - ⚠️ **未検証**（sm_110 GPU 必要）: QEMU は build のみ・GPU 実行不可。build 時に lerobot[groot] の
-    CUDA 拡張（flash-attn 等）が sm_110 で compile 通るかが残リスク。実 Thor で ready+conformance 確認。
+  - build: `docker buildx build --builder armbuilder --platform linux/arm64 \
+    -f docker/Dockerfile.thor.groot -t <registry>/ramen-thor-groot:<tag> --push .`
+  - ✅ **arm64 build 検証済（2026-08-31、QEMU+buildx、push 無し validate）**:
+    NGC arm64 base pull OK、`pip install lerobot[groot]==0.6.0` DONE、
+    `[build] torch 2.8.0a0+nv25.08 cuda 13.0 | numpy 2.2.6 | lerobot 0.6.0 | cv2/hf_hub import OK`。
+    恐れた CUDA 拡張 compile 失敗は無し。numpy は最後に 2.2.6 固定（worker 一致）。
+    pip の conflict 警告は NGC base 同梱 RAPIDS/numba/cupy/scipy の版ズレのみ = GR00T pick は
+    未 import で無害。
+  - ⚠️ **実行は未検証**（sm_110 GPU 必要、x86/QEMU では GPU 実行不可）: 実 Thor で
+    `RAMEN_POLICY=groot_pick_real python3 components/server.py` の worker ready + conformance +
+    (T,25) 出力を確認する。weights は `-e HF_TOKEN=...` で runtime 取得。
 - ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。

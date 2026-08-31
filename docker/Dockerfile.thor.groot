@@ -42,14 +42,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2) GR00T inference: lerobot[groot]==0.6.0 (NGC torch を保持: >=2.7,<2.12 を満たす)。
 #    numpy は worker と揃える (2.2.6)。
 COPY requirements.txt ./
+# lerobot[groot] を先に入れ、numpy==2.2.6 (worker 検証済 = model/subtask_policy_training)
+# を **最後に固定**する。NGC base 同梱の RAPIDS/numba/cupy/scipy が numpy 版を巻き戻す/
+# 衝突警告を出すが、GR00T pick inference はそれらを import しないので無害。
 RUN python3 -m pip install --no-cache-dir -r requirements.txt \
-    && python3 -m pip install --no-cache-dir "numpy==2.2.6" "lerobot[groot]==0.6.0" \
+    && python3 -m pip install --no-cache-dir "lerobot[groot]==0.6.0" \
+    && python3 -m pip install --no-cache-dir "numpy==2.2.6" \
     && python3 - <<'PY'
-import torch
-print("[build] torch", torch.__version__, "cuda", torch.version.cuda)
-# NGC torch を lerobot が差し替えていないことの sanity (>=2.7,<2.12)。
+import torch, numpy, huggingface_hub, cv2
+print("[build] torch", torch.__version__, "cuda", torch.version.cuda,
+      "| numpy", numpy.__version__, "| hf_hub", huggingface_hub.__version__)
 maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
 assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
+assert numpy.__version__ == "2.2.6", numpy.__version__      # worker と一致
+import lerobot  # groot inference path が import 可能なこと
+print("[build] lerobot", lerobot.__version__)
 PY
 
 # --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
