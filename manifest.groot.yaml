@@ -11,17 +11,19 @@ lane: decoupled
 platform: linux/arm64
 
 images:
-  thor:                       # policy server / GR00T 全5 skill (pick + 53D 4本)
+  thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、onboarding tag は温存)。
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-all"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch"
     # image index digest (arm64 host で arm64 manifest に解決)。
-    digest: "sha256:65ffd2621c58722e18f8747a328adb67ee695b448c5847afedb639f7eaf09041"
+    digest: "sha256:75c78795accdd1337fb3832bc3913d00b530a3d34a1cef4e99315cba4c9be606"
     base_image: "nvcr.io/nvidia/pytorch:25.08-py3"   # arm64 = Grace-Blackwell torch/CUDA13 同梱
-    # image ENV 既定は pick (RAMEN_POLICY=groot_pick_real, worker=python3=lerobot0.6.0)。
-    # 53D skill に切替えるには run 時に env を渡す:
-    #   -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>
-    #   (skill = groot_rotate_leg_200k / groot_insert_leg_200k / groot_overlay /
-    #    groot_flip_table_n17_2_baseline。53D worker は /opt/venv-groot53=lerobot0.6.1)。
+    # image ENV 既定は pick 単体 (RAMEN_POLICY=groot_pick_real)。run 時 env で切替:
+    #   - full orchestrator (推奨、perception[YOLO]+dwell で skill 自動遷移=「一通り全部」):
+    #       -e RAMEN_POLICY=groot_orchestrator -e HF_TOKEN=<token>
+    #   - 53D 単体: -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>
+    #       (groot_rotate_leg_200k / groot_insert_leg_200k / groot_overlay /
+    #        groot_flip_table_n17_2_baseline)
+    # 2 lerobot env 内蔵 (pick=0.6.0 image main / 53D=0.6.1 /opt/venv-groot53)、YOLO=ultralytics。
     entrypoint:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
