@@ -1,0 +1,39 @@
+# IKEA IROS submission manifest — GR00T-pick track (Issue #128 deploy)
+#
+# RAMEN-Ori 用 manifest.yaml とは別 track。GR00T pick 単体を decoupled lane で動かす。
+# 提出時にどちらを canonical manifest.yaml にするかは team 判断 (現状は feature branch で並存)。
+#
+# ⚠️ thor image は private (新規 GHCR package)。運営アカウントに read 権限付与が必要
+#    (既存 ikea-thor/ikea-orin と同じ手続き = onboarding Finding 2)。
+# ⚠️ 実 Thor での実行 (server ready + conformance + (T,25)) は未検証。arm64 build のみ検証済。
+
+lane: decoupled
+platform: linux/arm64
+
+images:
+  thor:                       # policy server / GR00T pick
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor-groot:20260831-groot-pick"
+    # image index digest (arm64 host で arm64 manifest に解決)。
+    # arm64 platform manifest 単体 = sha256:678dd78501b9601dbc2b5bd73575a4545554fa21f3cfa60886a52b4ddf711586
+    digest: "sha256:f574beaf30c9dd9eed487ad1c03a3839cd3f726b7048f85d31a70570aaed11b5"
+    base_image: "nvcr.io/nvidia/pytorch:25.08-py3"   # arm64 = Grace-Blackwell torch/CUDA13 同梱
+    # image は RAMEN_POLICY=groot_pick_real / RAMEN_WORKER_PYTHON=python3 を ENV 済。
+    entrypoint:
+      ["python3", "-u", "components/server.py",
+       "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
+  orin:                       # policy client (model 非依存の relay、RAMEN-Ori track と共通)
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
+    digest: "sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4"
+    base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"
+    entrypoint:
+      ["python3", "-u", "components/client.py",
+       "--lane", "decoupled", "--thor", "192.168.100.1", "--orin", "192.168.100.2"]
+
+thor_orin_port: 8765
+
+# GR00T pick weights (ver2-lora, private Team-RAMEN)。image に焼かず runtime に HF 取得。
+#   docker run 時に -e HF_TOKEN=<token> を渡すこと (private repo pull に必須)。
+weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1"
+
+# Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。
+peak_gpu_memory_thor_gb: "TBD"   # 実機測定待ち (128 GB unified)
