@@ -71,9 +71,11 @@ class OrchestratorDriver:
         from inference.desktop.perception.stream import DetectionStream
         from inference.desktop.perception.yolo_obb import YoloObbPerception
 
-        weight = yolo_weight or os.environ.get(
-            "RAMEN_YOLO_WEIGHT",
-            "/datadrive2/iros_2026_ramen/outputs/yolo_obb/weights/m_lowaug_v4_flat.pt",
+        weight = self._resolve_yolo_weight(
+            yolo_weight or os.environ.get(
+                "RAMEN_YOLO_WEIGHT",
+                "/datadrive2/iros_2026_ramen/outputs/yolo_obb/weights/m_lowaug_v4_flat.pt",
+            )
         )
         cfg_path = os.path.join(
             _VENDOR_DESKTOP, "inference/desktop/lower_policy/configs/policy_config.yaml"
@@ -129,6 +131,30 @@ class OrchestratorDriver:
             wrist_right_source=self._wrist_r,
             head_perception_view="left",   # boundary は単一 head を packed で複製
         )
+
+    @staticmethod
+    def _resolve_yolo_weight(ref: str) -> str:
+        """local .pt path ならそのまま。HF repo[@rev] なら .pt を snapshot_download。
+
+        container では RAMEN_YOLO_WEIGHT に HF ref を渡す:
+        Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@<rev>。
+        """
+        if os.path.isfile(ref):
+            return ref
+        if "/" not in ref:
+            return ref   # そのまま (存在しなければ後段で error)
+        from huggingface_hub import snapshot_download
+
+        repo_id, revision = ref, None
+        if "@" in ref:
+            repo_id, revision = ref.rsplit("@", 1)
+        snap = Path(snapshot_download(
+            repo_id=repo_id, revision=revision, allow_patterns=("*.pt",)
+        ))
+        pts = sorted(snap.glob("*.pt"))
+        if not pts:
+            raise FileNotFoundError(f"no .pt in YOLO repo {repo_id}")
+        return str(pts[0])
 
     def act(self, obs: dict) -> dict:
         self._t += 1

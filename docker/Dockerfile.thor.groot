@@ -59,8 +59,9 @@ import lerobot  # groot inference path が import 可能なこと
 print("[build] lerobot", lerobot.__version__)
 PY
 
-# parent (boundary server) が 53D の vendored config_loader を読むのに pyyaml が要る。
-RUN python3 -m pip install --no-cache-dir "pyyaml"
+# parent (boundary server) が 53D の vendored config_loader を読むのに pyyaml、
+# full orchestrator の perception に ultralytics (YOLO-OBB、NGC torch を保持) が要る。
+RUN python3 -m pip install --no-cache-dir "pyyaml" "ultralytics"
 
 # --- 53D skills 用 lerobot 0.6.1 env (pick=0.6.0 とは checkpoint 形式が違うため別 venv) ---
 # base torch(sm_110)を --system-site-packages で継承し、lerobot 0.6.1 + accelerate +
@@ -83,9 +84,12 @@ COPY . ./
 # 既定は pick (RAMEN_POLICY=groot_pick_real, worker=同 env python3=lerobot0.6.0)。
 # 53D skill に切替える時は run 時に -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>。
 # 53D worker は別 env python (RAMEN_WORKER_PYTHON_53D=0.6.1 venv) を使う。
+# full orchestrator (RAMEN_POLICY=groot_orchestrator) 用の YOLO weight は HF から runtime 取得
+# (要 HF_TOKEN)。single-skill 直指定は RAMEN_POLICY=groot_pick_real / groot_53d_real+RAMEN_VARIANT。
 ENV RAMEN_POLICY=groot_pick_real \
     RAMEN_WORKER_PYTHON=python3 \
     RAMEN_WORKER_PYTHON_53D=/opt/venv-groot53/bin/python \
+    RAMEN_YOLO_WEIGHT=Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@8221d0aef45d63666537c1f030810fb9b56dd1ed \
     PEVAL_LANE=decoupled
 
 # weights (ver2-lora, private Team-RAMEN) は image に焼かず runtime に HF から取得。

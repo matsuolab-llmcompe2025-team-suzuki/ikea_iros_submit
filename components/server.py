@@ -159,9 +159,16 @@ def _build_policy(lane: str, delay_ms: float):
             backend = Groot53Backend(variant=variant)
         print(f"[server] using GrootPickTaskspacePolicy (decoupled, {choice})")
         return GrootPickTaskspacePolicy(lane=lane, backend=backend)
+    if choice == "groot_orchestrator":
+        if lane != "decoupled":
+            raise SystemExit("RAMEN_POLICY=groot_orchestrator requires --lane decoupled")
+        from components.ramen.policy import OrchestratorTaskspacePolicy
+
+        print("[server] using OrchestratorTaskspacePolicy (full orchestrator, YOLO+5 skill)")
+        return OrchestratorTaskspacePolicy(lane=lane)
     raise SystemExit(
         f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick / "
-        "groot_pick_real / groot_53d_real"
+        "groot_pick_real / groot_53d_real / groot_orchestrator"
     )
 
 

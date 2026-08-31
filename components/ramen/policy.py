@@ -406,3 +406,44 @@ class MultiSkillTaskspacePolicy:
             close = getattr(backend, "close", None)
             if callable(close):
                 close()
+
+
+class OrchestratorTaskspacePolicy:
+    """full orchestrator を boundary Policy 契約に包む (RAMEN_POLICY=groot_orchestrator)。
+
+    原さんの orchestrator を OrchestratorDriver 経由で act(obs) 毎に 1 tick 駆動し、
+    perception(YOLO)+dwell+is_complete の skill 遷移をそのまま使って (T,25) を返す。
+    orchestrator は per-tick 1 step なので action_chunk_size=1 (organizer が補間)。
+    """
+
+    ACTION_CHUNK = 1
+    OBS_CHUNK = 1
+
+    def __init__(self, lane: str = "decoupled", **kwargs):
+        if lane != "decoupled":
+            raise ValueError(f"orchestrator policy is decoupled-only, got {lane!r}")
+        from .orchestrator_driver import OrchestratorDriver
+
+        self.lane = lane
+        self._driver = OrchestratorDriver(**kwargs)
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "lane": self.lane,
+            "action_chunk_size": self.ACTION_CHUNK,
+            "obs_chunk_size": self.OBS_CHUNK,
+            "camera_keys": ["ego_view", "left_wrist", "right_wrist"],
+            "wants_state": True,
+            "wants_prompt": True,
+        }
+
+    def act(self, obs: dict) -> dict:
+        return {"actions": self._driver.act(obs)["actions"]}
+
+    def reset(self) -> dict:
+        self._driver.reset()
+        return {"ok": True}
+
+    def close(self) -> None:
+        self._driver.close()
