@@ -9,6 +9,10 @@
 > - **Base images:** Thor `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`、Orin `nvcr.io/nvidia/l4t-jetpack:r35.3.1`
 > - **Status (onboarding):** `boundary/` unmodified、`conformance.py --lane decoupled` PASS、別コンテナ e2e (server+client+mock) で action 疎通確認済。現状 Policy は hold-still (RAMEN-Ori は後続で差し替え)。
 > - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml` を参照。
+> - **GR00T トラック (別提出):** 上記 RAMEN-Ori とは別に、GR00T 系 policy を decoupled
+>   `(T,25)` に載せた実装がある (pick / 53D 4本 / full orchestrator[YOLO+自動遷移])。
+>   image `ikea-thor:20260831-groot-orch`、manifest `manifest.groot.yaml`、手順は
+>   **[`GROOT_DEPLOY.md`](./GROOT_DEPLOY.md)** を参照。
 
 RAMEN submits **two containers**: a policy server for the Jetson AGX Thor and a
 policy client for the Jetson Orin NX onboard the G1. What runs inside them is
