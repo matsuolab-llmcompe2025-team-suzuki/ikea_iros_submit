@@ -1,0 +1,30 @@
+# Detection cleanup config (YOLO 偽検出後処理)。
+# 詳細ロジックは inference/desktop/perception/cleaner.py docstring 参照。
+#
+# perception layer の後処理 config なので、skill_planner (thresholds.yaml) と別枠。
+
+# ---- Step 1: class-wise max count enforcement + persistence check ----
+max_count:
+  workspace: 1
+  table_top: 1
+  hand_right: 1
+  hand_left: 1
+  leg: 4
+  leg_tip: 4
+  hole: 4
+
+# case A (max 超え): 前 frame cleaned dets と IoU 閾値
+over_max_continue_iou: 0.9
+# case B (max 内): 前 or 次 frame との類似判定 IoU 閾値
+under_max_similar_iou: 0.5
+
+# ---- Step 2: 3-frame temporal median filter ----
+# 各 detection の verts を (self, prev_aligned, next_aligned) の element-wise
+# median に置換。prev/next は same-class の best IoU match、pivot-alignment で
+# 頂点順を self に揃えてから median を取る。
+#
+# 設計意図: YOLO の 1-frame vertex-order flip artifact を除去。
+# 静止 / 持続的変化には影響を与えない (median = 中央値 = raw に近い)。
+median_filter:
+  enabled: true
+  iou_match_min: 0.5       # prev/next 対応付け IoU 閾値

@@ -708,10 +708,8 @@ class _GrootWorkerClient:
         self._socket_path = Path(
             f"/tmp/iros_2026_ramen_groot_{os.getpid()}_{uuid.uuid4().hex}.sock"
         )
-        # VENDOR PATCH (Team RAMEN、boundary container 用):
-        # RAMEN_WORKER_PYTHON_53D (lerobot 0.6.1 の python) 指定時はそれで worker を
-        # 直接起動 (container は pixi 不在、pick=0.6.0 と別 env のため専用変数)。
-        # 互換のため RAMEN_WORKER_PYTHON も見る。未指定なら従来の pixi run にフォールバック。
+        # VENDOR PATCH (Team RAMEN、boundary container 用): RAMEN_WORKER_PYTHON_53D
+        # (lerobot 0.6.1 python) で worker 直接起動 (container は pixi 不在)。
         worker_python = os.environ.get("RAMEN_WORKER_PYTHON_53D") or os.environ.get(
             "RAMEN_WORKER_PYTHON"
         )

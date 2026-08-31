@@ -1,0 +1,58 @@
+# State machine enter 関数の閾値 (code change なしに iter で tune できるよう外出し)。
+# key の命名: <function_name>_<signal_name>_<comparison>
+#
+# 参照側: `inference/desktop/skill_planner/enter_conditions.py` が module import 時に load。
+
+# ---- _enter_move_table_base_next & enter_flip_table ----
+# 両 rule 共通の 2 条件 OR:
+#   (a) hand_left AABB と table_top 左辺 segment の最短距離 <= *_max_dist
+#       (normalized 0-1、0.02 ≈ 13px @ 640-width)
+#   (b) 0 < (hand_left ∩ table_top / hand_left area) <= *_hand_in_table_frac_max
+#       (hand が table に部分重なり = 端を掴んでる姿勢、full-inside は除外)
+# state guard: move_base_next=n_legs 1..3、flip=n_legs==3 (4th cycle 中に発火)
+move_table_base_next_hand_left_table_top_left_max_dist: 0.02
+move_table_base_next_hand_in_table_frac_max: 0.70
+flip_hand_left_table_top_left_max_dist: 0.02
+flip_hand_in_table_frac_max: 0.70
+
+# ---- enter_pick_table_leg (hybrid rule) ----
+# state.n_legs_completed で signal 切替:
+#   1st pick (n=0): base_run = move_table_base(tid=7、直線移動)、回転量小さい (~20°)
+#     → Kabsch rotation angle (deg、[-90, 90]) で判定
+#     |Kabsch(ref, cur)| >= pick_first_leg_table_top_angle_delta_min で fire
+#   2nd+ pick (n=1,2,3): base_run = rotate_table_base(tid=5、大回転)、aspect が大きく変化
+#     → aspect ratio で判定
+#     cur_aspect / ref_aspect >= pick_next_leg_table_top_aspect_ratio_min で fire
+#
+# 分割理由: 全 pick で Kabsch にすると 2nd pick が peak 58° で threshold 60° 未達
+# で 0 fire。aspect ratio ベースにすれば 2nd pick は clean に取れるが 1st pick は
+# 回転量小さすぎて aspect 変化しない。
+#
+# ref は base_run 開始 (tid=5/7 start) の直前 N frame の table_top OBB を pivot
+# alignment 後 element-wise mean で構築 (YOLO 頂点順シフト noise 吸収)。
+pick_first_leg_table_top_angle_delta_min: 18.0
+pick_next_leg_table_top_aspect_ratio_min: 1.35
+pick_leg_ref_n_avg_frames: 3
+
+# ---- enter_insert_table_leg ----
+# 2 条件の AND:
+#   (1) 右手 ∩ leg AABB IoU > insert_right_hand_leg_iou_min (現 frame で掴んでる)
+#   (2) 左手 ∩ leg AABB IoU < insert_left_hand_leg_iou_max (現 frame では離れてる)
+#   + state.left_hand_touched_leg_since_pick == True (過去に左手が触れてる)
+# 「dual-hand pick → 左手離す → insert 準備完了」の temporal 判定。
+# left_hand_touched_leg_iou_seen_min は orchestrator が flag 立てる閾値。
+insert_right_hand_leg_iou_min: 0.10
+insert_left_hand_leg_iou_max: 0.05
+left_hand_touched_leg_iou_seen_min: 0.10
+
+# ---- enter_rotate_leg_to_tighten (3 条件 rule) ----
+# Condition 1: pick cycle 中に leg_tip ∩ hole overlap 発生履歴 (leg 挿入完了 proxy)
+leg_tip_hole_iou_seen_min: 0.10
+# Condition 2: pick cycle 中に 左手 ∩ 右手 overlap 発生履歴 (dual-hand grip 再結合)
+left_right_hand_iou_seen_min: 0.05
+# Condition 3 (current frame): 右手 OBB の「左下」頂点 (max(y-x) の vertex) の y と
+# table_top OBB の max y (下辺) との絶対差が threshold 未満 (0 近傍で fire)
+rotate_leg_right_hand_bl_vs_table_top_bottom_max_delta: 0.13
+
+# cleanup.yaml は perception layer なので別 yaml:
+#   inference/desktop/perception/configs/cleanup.yaml

@@ -1,0 +1,278 @@
+"""Small, reversible arm-only smoke test for G1 Regular Mode.
+
+The test never sends a walking command. It reads the current 14-D arm pose,
+moves only the two shoulder-roll joints outward by a small relative delta,
+then returns to the measured start pose before stopping ``rt/arm_sdk``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import numpy as np
+
+
+LEFT_SHOULDER_ROLL = 1
+RIGHT_SHOULDER_ROLL = 8
+MAX_SMOKE_DELTA_RAD = 0.12
+RETURN_TOLERANCE_RAD = 0.05
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--interface", required=True, help="G1 DDS NIC")
+    parser.add_argument(
+        "--delta-rad",
+        type=float,
+        default=0.08,
+        help="outward relative shoulder-roll motion [rad] (default: 0.08; max: 0.12)",
+    )
+    parser.add_argument(
+        "--hold-seconds",
+        type=float,
+        default=1.5,
+        help="target hold duration [s] (default: 1.5)",
+    )
+    parser.add_argument(
+        "--ramp-seconds",
+        type=float,
+        default=1.0,
+        help="outer target interpolation time in each direction [s] (default: 1.0)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the interactive physical-safety confirmation",
+    )
+    parser.add_argument(
+        "--release-only",
+        action="store_true",
+        help="do not move the arms; hand an existing arm_sdk mode back to Regular",
+    )
+    return parser.parse_args()
+
+
+def _pose_error(actual: np.ndarray, target: np.ndarray) -> float:
+    return float(np.max(np.abs(actual - target)))
+
+
+def _build_outward_target(before: np.ndarray, delta_rad: float) -> np.ndarray:
+    """Build a symmetric two-shoulder target from the measured pose."""
+    target = np.asarray(before, dtype=np.float64).copy()
+    if target.shape != (14,):
+        raise ValueError(f"before must have shape (14,), got {target.shape}")
+    target[LEFT_SHOULDER_ROLL] += delta_rad
+    target[RIGHT_SHOULDER_ROLL] -= delta_rad
+    return target
+
+
+def _wait_for_pose(
+    arm: object,
+    target: np.ndarray,
+    *,
+    timeout_s: float,
+    tolerance_rad: float,
+    label: str,
+) -> tuple[bool, np.ndarray, float]:
+    deadline = time.monotonic() + timeout_s
+    next_report = 0.0
+    actual = np.asarray(arm.read_arm_positions(), dtype=np.float64)  # type: ignore[attr-defined]
+    error = _pose_error(actual, target)
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        actual = np.asarray(arm.read_arm_positions(), dtype=np.float64)  # type: ignore[attr-defined]
+        error = _pose_error(actual, target)
+        if now >= next_report:
+            print(
+                f"[state] {label} left_shoulder_roll={actual[LEFT_SHOULDER_ROLL]:+.3f} "
+                f"right_shoulder_roll={actual[RIGHT_SHOULDER_ROLL]:+.3f} "
+                f"max_error={error:.4f}rad"
+            )
+            next_report = now + 0.25
+        if error <= tolerance_rad:
+            return True, actual, error
+        time.sleep(0.01)
+    return False, actual, error
+
+
+def _ramp_action(
+    arm: object,
+    start: np.ndarray,
+    target: np.ndarray,
+    *,
+    duration_s: float,
+    update_hz: float = 50.0,
+) -> None:
+    """Interpolate the commanded reference without weakening the inner servo.
+
+    Unitree's 20 rad/s limiter is an inner 250 Hz tracking guard. Reducing it
+    also reduces the available PD position error and can make a gravity-loaded
+    arm drift. Slow diagnostic motion therefore belongs in this outer ramp.
+    """
+
+    steps = max(1, int(round(duration_s * update_hz)))
+    sleep_s = duration_s / steps
+    for index in range(1, steps + 1):
+        alpha = index / steps
+        arm.send_action(start + alpha * (target - start))  # type: ignore[attr-defined]
+        time.sleep(sleep_s)
+
+
+def main() -> int:
+    args = parse_args()
+    if not 0.0 < args.delta_rad <= MAX_SMOKE_DELTA_RAD:
+        raise SystemExit(f"--delta-rad must be in (0, {MAX_SMOKE_DELTA_RAD}]")
+    if args.hold_seconds <= 0.0:
+        raise SystemExit("--hold-seconds must be positive")
+    if args.ramp_seconds <= 0.0:
+        raise SystemExit("--ramp-seconds must be positive")
+
+    from inference.desktop.lower_policy.actuators.g1_arm_sdk import (
+        G1ArmActuator,
+    )
+    from inference.desktop.lower_policy.actuators.g1_sdk import G1SDKWalkActuator
+
+    # Read-only high-level preflight. No locomotion method is called.
+    loco = G1SDKWalkActuator(interface=args.interface)
+    status = loco.get_loco_status()
+    if status.fsm_id != 501 or status.fsm_mode not in (0, 1):
+        raise RuntimeError(
+            "G1 must be in Regular/arm-sdk mode before arm smoke: "
+            f"actual=({status.fsm_id},{status.fsm_mode}), expected=(501,0 or 1)"
+        )
+
+    # Keep Unitree's official 20 rad/s inner servo guard. Slow visible motion
+    # is generated by _ramp_action at the command layer instead.
+    arm = G1ArmActuator()
+    before = np.asarray(arm.read_arm_positions(), dtype=np.float64)
+    if before.shape != (14,) or not np.all(np.isfinite(before)):
+        raise RuntimeError(f"invalid measured arm pose: shape={before.shape}")
+
+    if args.release_only:
+        if status.fsm_mode == 0:
+            print("[release-only] already in strict Regular (501,0); no command sent")
+            return 0
+        print(
+            "[release-only] arm_sdk ownership is active at (501,1); "
+            "the measured arm pose will be held while weight ramps 1 -> 0"
+        )
+        if not args.yes:
+            input(
+                "Harness / E-stop confirmed. Press Enter for controlled arm_sdk "
+                "release, Ctrl+C to cancel: "
+            )
+        arm.send_action(before)
+        arm.start()
+        try:
+            time.sleep(0.25)
+            arm.controlled_release(duration_s=2.0)
+            print("[release-only] arm_sdk weight reached 0.00")
+        finally:
+            arm.stop()
+        time.sleep(0.5)
+        final_status = loco.get_loco_status()
+        if (final_status.fsm_id, final_status.fsm_mode) != (501, 0):
+            raise RuntimeError(
+                "controlled release finished but strict Regular was not restored: "
+                f"actual=({final_status.fsm_id},{final_status.fsm_mode})"
+            )
+        print("[release-only] strict Regular handoff verified (501,0)")
+        return 0
+
+    if status.fsm_mode != 0:
+        raise RuntimeError(
+            "arm_sdk ownership is still active; run this command with --release-only "
+            "before another motion test"
+        )
+
+    target = _build_outward_target(before, args.delta_rad)
+    if np.max(np.abs(target)) > 1.5:
+        raise RuntimeError(
+            "small shoulder motion would cross the actuator diagnostic envelope; "
+            "no command was sent"
+        )
+
+    print(
+        "[preflight] strict Regular=(501,0); no walking command; "
+        f"relative shoulder-roll delta=+/-{args.delta_rad:.3f}rad"
+    )
+    print(
+        "[state] start "
+        f"left_shoulder_roll={before[LEFT_SHOULDER_ROLL]:+.3f} "
+        f"right_shoulder_roll={before[RIGHT_SHOULDER_ROLL]:+.3f}rad"
+    )
+    if not args.yes:
+        input(
+            "Harness / E-stop / both-arm clearance confirmed. "
+            f"Press Enter to move shoulders by {args.delta_rad:.2f} rad and return, "
+            "Ctrl+C to cancel: "
+        )
+
+    target_ok = False
+    return_ok = False
+    arm.send_action(before)
+    arm.start()
+    print("[run] arm_sdk started at the measured pose")
+    try:
+        time.sleep(0.05)
+        _ramp_action(
+            arm,
+            before,
+            target,
+            duration_s=args.ramp_seconds,
+        )
+        reached, _, error = _wait_for_pose(
+            arm,
+            target,
+            timeout_s=3.0,
+            tolerance_rad=RETURN_TOLERANCE_RAD,
+            label="outward",
+        )
+        if not reached:
+            print(f"[run] target TIMEOUT max_error={error:.4f}rad; returning")
+        else:
+            target_ok = True
+            time.sleep(args.hold_seconds)
+    except KeyboardInterrupt:
+        print("[stop] interrupted; returning to measured start pose")
+    finally:
+        return_start = np.asarray(arm.read_arm_positions(), dtype=np.float64)
+        _ramp_action(
+            arm,
+            return_start,
+            before,
+            duration_s=args.ramp_seconds,
+        )
+        returned, _, error = _wait_for_pose(
+            arm,
+            before,
+            timeout_s=5.0,
+            tolerance_rad=RETURN_TOLERANCE_RAD,
+            label="return",
+        )
+        return_ok = target_ok and returned
+        print(
+            f"[stop] return {'reached' if returned else 'TIMEOUT'} "
+            f"max_error={error:.4f}rad"
+        )
+        try:
+            print("[stop] arm_sdk controlled release started (weight 1.00 -> 0.00)")
+            arm.controlled_release(duration_s=2.0)
+            print("[stop] arm_sdk controlled release complete (weight=0.00)")
+        finally:
+            arm.stop()
+        print("[stop] arm_sdk publisher stopped; no walking command was sent")
+    time.sleep(0.5)
+    final_status = loco.get_loco_status()
+    handoff_ok = (final_status.fsm_id, final_status.fsm_mode) == (501, 0)
+    print(
+        "[stop] strict Regular handoff "
+        f"{'verified' if handoff_ok else 'FAILED'} "
+        f"({final_status.fsm_id},{final_status.fsm_mode})"
+    )
+    return 0 if return_ok and handoff_ok else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,354 @@
+# G1 lower policy skill 姿勢定義 (Issue #81)。
+#
+# 各 skill の default pose / stage 定義をここに集約する。
+# 数値変更のたびに Python code を書き換えずに、YAML 更新 → 実機再検証 で回す。
+#
+# Joint 順 (G1_ARM_JOINT_INDICES = 15..28、14 次元):
+#    L.shoulder_pitch  L.shoulder_roll  L.shoulder_yaw
+#    L.elbow           L.wrist_roll     L.wrist_pitch    L.wrist_yaw
+#    R.shoulder_pitch  R.shoulder_roll  R.shoulder_yaw
+#    R.elbow           R.wrist_roll     R.wrist_pitch    R.wrist_yaw
+#
+# pose_rad は sparse 記法:
+#   明示的に列挙した joint 以外は 0.0 rad として扱う。
+#   これにより「使わない joint は書かない」で意図が読みやすくなる。
+#
+# YAML の読み込みは必ず yaml.safe_load() を使うこと (Python object 復元を封じる)。
+
+# ---- Motion limits (Phase 3、Issue #128) ---- #
+#
+# VlaSkill.step の 30Hz per-tick target smoothing envelope。詳細は
+# inference/desktop/lower_policy/motion_limits.py の docstring 参照。
+#
+# 単位:
+#   arm_velocity_rad_s / arm_acceleration_rad_s2: waist+arm 各 joint (rad/s、rad/s²)。
+#   hand_velocity_rad_s / hand_acceleration_rad_s2: Dex1 physical rad ([0, 5.4] range)。
+#
+# Resolution order (`load_motion_limits_for_skill`):
+#   1. skills.<name>.motion_limits がある → それを使う
+#   2. motion_limits_default → それを使う
+#   3. どちらも無い → module DEFAULT_MOTION_LIMITS (hard-coded fallback)
+#
+# 初期値の根拠:
+#   - flip_table 1.5 / 10.0 は issue-70 flip_table dataset で verified (SDK default
+#     20-30 rad/s は速すぎ、1.0 は trajectory 歪む、1.5 が sweet spot と実測結論)
+#   - 他 skill は未 verified、保守的 default を置いて実機観察後 tuning
+motion_limits_default:
+  arm_velocity_rad_s: 2.0
+  arm_acceleration_rad_s2: 10.0
+  hand_velocity_rad_s: 6.0
+  hand_acceleration_rad_s2: 30.0
+
+skills:
+  # SetupSkill: entrypoint 起動直後に腕を安全 clearance 姿勢へ持っていく (Issue #81)。
+  # orchestrator の initial skill として dispatch され、指定 dwell 経過後に
+  # move_to_table へ auto-transition する。
+  setup:
+    stages:
+      # Stage 1: 真横の高い clearance pose。腕を table 前方空間に出さず、
+      #          肩 roll ±1.2 rad で腰・天板より上の安全な高さへ退避する。
+      #          (2026-07-19 実機で lateral clearance として確認済)
+      - name: lateral_clearance
+        dwell_sec: 2.0
+        pose_rad:
+          L.shoulder_roll:  1.2
+          R.shoulder_roll: -1.2
+
+      # Stage 2: Stage 1 の肩 roll を維持したまま shoulder pitch を -0.20 rad だけ
+      #          前へ傾けた forward clearance pose。真横退避 → 前方退避の順を
+      #          厳密に分けることで下ろす動作 (衝突可能性) を挟まない。
+      #          pitch 量は初回の実機安全確認用に保守的にしている。table clearance
+      #          が十分であることを目視・joint state で確認するまで大きくしないこと。
+      - name: forward_clearance
+        dwell_sec: 2.0
+        pose_rad:
+          L.shoulder_pitch: -0.20
+          L.shoulder_roll:   1.2
+          R.shoulder_pitch: -0.20
+          R.shoulder_roll:  -1.2
+
+  # MoveToTable: 組立台の前まで歩く Type A skill (Issue #64、Issue #81 Phase 2b で YAML 化)。
+  #   - vx: 前進速度 [m/s]、default 0.185 は Issue #64 で実機確定した決め打ちルール。
+  #   - max_dwell_sec: host / firmware 両方の fail-safe (host は orchestrator 側 auto-transition、
+  #                    firmware は set_velocity の duration 引数として同値を渡す)。
+  #                    到達時は orchestrator が TRANSITIONS graph の first candidate =
+  #                    move_table_base へ auto-transition する。
+  move_to_table:
+    vx: 0.185
+    max_dwell_sec: 1.0
+
+  # SampleVLASkill: move_table_base 発火時に真横高い水平姿勢を返す Type B mock (Issue #75)。
+  #   - default_pose_rad: SetupSkill Stage 1 と同じ肩 roll ±1.2 で腕高さを維持し、
+  #                       move_to_table 到着 → move_table_base 遷移で腕が下がらないようにする。
+  # (VLA 実装が入った段階でこの skill は差し替え予定、YAML section は残らない可能性あり)
+  #
+  # VLA 実装 (MoveTableBaseVlaSkill) 用の追加 field:
+  #   - dispatch_waist: Model waist chunk[0:3] を actuator に流すか (default true)。
+  #                     false = Model 出力を捨てる (arm_actuator は hold pose)。
+  #                     腰暴走 → 脚 balance 崩れ懸念のある variant を安全に走らせる用。
+  #                     SampleVLASkill (mock) は無視する field、real VlaSkill だけ読む。
+  move_table_base:
+    default_pose_rad:
+      L.shoulder_roll:  1.2
+      R.shoulder_roll: -1.2
+    dispatch_waist: true
+    # YOLO transition 検知漏れ時の last-resort hard timeout (policy 実行時間、
+    # arm pre-motion / hand init overhead は含まない、orchestrator 側で加算)。
+    # 出典: compute_skill_timeout.py, HARA task 7 384ep, p95=6.0s × 1.5, ceil。
+    max_seconds_hard: 9
+    # Phase 3 motion_limits (partial override、未指定 field は motion_limits_default 継承):
+    # 大きい motion (table base 回転 + 移動) を想定、accel を default より上げる。
+    motion_limits:
+      arm_acceleration_rad_s2: 12.0
+    # 単体評価は clearance pose で待機せず、task_index=7 の dataset
+    # frame-0 median まで移動してから policy 開始 Enter を待つ。
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.3111256957
+        L.shoulder_roll:   0.5789217949
+        L.shoulder_yaw:   -0.3182108998
+        L.elbow:          -0.0019328644
+        L.wrist_roll:     -0.1308855787
+        L.wrist_pitch:     0.2843062431
+        L.wrist_yaw:      -1.0727896690
+        R.shoulder_pitch: -0.1488823593
+        R.shoulder_roll:  -0.5614076257
+        R.shoulder_yaw:    0.1484381706
+        R.elbow:          -0.2750582993
+        R.wrist_roll:      0.2954401076
+        R.wrist_pitch:     0.4890955836
+        R.wrist_yaw:       0.8323650360
+      dex1_opening_fraction:
+        left:  0.7139263948
+        right: 1.0000000000
+      dataset_repo_id: "BitRobot/G1_WBT_Dex1_Building-Children-Table"
+      dataset_revision: "4b5961c6f8b97ececa75ee73041b30bcbf463ae2"
+      training_episode_count: 368
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+      requires_separate_hand_initialization: false
+
+  # rotate_table_base: move_table_base から split した新設 VLA skill (task_index=5)。
+  #   Model は同一 (RAMEN-Ori task 5+7 combined)、skill_id conditioning で区別。
+  #   dispatch_waist は default true (実運用時に必要に応じ false 化)。
+  #   initial_pose は dataset frame-0 の実測 median (531 ep)。
+  rotate_table_base:
+    dispatch_waist: true
+    # 出典: compute_skill_timeout.py, HARA task 5 1401ep, p95=7.7s × 1.5, ceil。
+    max_seconds_hard: 12
+    # Phase 3 motion_limits (move_table_base と同じ envelope、大きい motion 想定)
+    motion_limits:
+      arm_acceleration_rad_s2: 12.0
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.4830605686
+        L.shoulder_roll:   0.4441821277
+        L.shoulder_yaw:   -0.0769655555
+        L.elbow:           0.2223441899
+        L.wrist_roll:      0.0807874203
+        L.wrist_pitch:     0.4568341970
+        L.wrist_yaw:      -0.5851719379
+        R.shoulder_pitch: -0.3696676791
+        R.shoulder_roll:  -0.1454999149
+        R.shoulder_yaw:    0.0941407904
+        R.elbow:           0.2638106048
+        R.wrist_roll:      0.1134036779
+        R.wrist_pitch:     0.3263158500
+        R.wrist_yaw:       0.4706455171
+      dex1_opening_fraction:
+        left:  0.2046381632
+        right: 0.8604006237
+      dataset_repo_id: "BitRobot/G1_WBT_Dex1_Building-Children-Table"
+      dataset_revision: "4b5961c6f8b97ececa75ee73041b30bcbf463ae2"
+      training_episode_count: 531
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+
+  # pick_table_leg: issue-70-flip-table-data-augmentation の PICK_LEG_FRAME0 転写。
+  #   dataset: Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1 (2114 ep)。
+  #   requires_separate_hand_initialization=false (leg 触っていない状態が start)。
+  pick_table_leg:
+    dispatch_waist: true
+    # 出典: compute_skill_timeout.py, HARA task 4 786ep, p95=13.8s × 1.5, ceil。
+    max_seconds_hard: 21
+    # Phase 3 motion_limits (大きい reach motion 想定、accel を上げる)
+    motion_limits:
+      arm_acceleration_rad_s2: 12.0
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.3292621821165085
+        L.shoulder_roll:   0.4412737190723419
+        L.shoulder_yaw:   -0.16212594509124756
+        L.elbow:          -0.15982457995414734
+        L.wrist_roll:     -0.16640856117010117
+        L.wrist_pitch:     0.5013763606548309
+        L.wrist_yaw:      -0.8052002191543579
+        R.shoulder_pitch: -0.668845921754837
+        R.shoulder_roll:  -0.27757230401039124
+        R.shoulder_yaw:   -0.05611474625766277
+        R.elbow:           0.41018396615982056
+        R.wrist_roll:      0.08590780571103096
+        R.wrist_pitch:     0.7006275355815887
+        R.wrist_yaw:       0.2249610498547554
+      dex1_opening_fraction:
+        left:  0.4608106613  # 2.073647975921631 / 4.5
+        right: 0.9934517013  # 4.470532655715942 / 4.5
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1"
+      dataset_revision: "4a5aef3bc43470b636f5c9d4f9102a30311b79a5"
+      training_episode_count: 2114
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+      requires_separate_hand_initialization: false
+
+  # insert_table_leg: issue-70 の INSERT_LEG_OPTIMAL_FRAME0 転写。
+  #   dataset: Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal (1510 ep)。
+  #   Model: groot_insert_leg_200k (200k step)。
+  #   requires_separate_hand_initialization=true (leg が hand に入った状態が start、
+  #   operator が起動前に物理的に leg を配置する必要あり)。
+  insert_table_leg:
+    dispatch_waist: true
+    # 出典: compute_skill_timeout.py, HARA task 0 1664ep, p95=14.0s × 1.5, ceil。
+    max_seconds_hard: 21
+    # Phase 3 motion_limits (精密 insertion、SOTA π0.5=52.5% の最難関 skill = 保守的)
+    motion_limits:
+      arm_velocity_rad_s: 1.0
+      arm_acceleration_rad_s2: 8.0
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.4920995235443115
+        L.shoulder_roll:   0.4307866245508194
+        L.shoulder_yaw:   -0.2969074547290802
+        L.elbow:           0.15555474162101746
+        L.wrist_roll:     -0.16958489269018173
+        L.wrist_pitch:     0.2890220284461975
+        L.wrist_yaw:      -0.9073362946510315
+        R.shoulder_pitch: -0.3478458970785141
+        R.shoulder_roll:  -0.26190248131752014
+        R.shoulder_yaw:   -0.013386612758040428
+        R.elbow:           0.002267619827762246
+        R.wrist_roll:      0.3340611010789871
+        R.wrist_pitch:     0.4669543653726578
+        R.wrist_yaw:       0.5253725945949554
+      dex1_opening_fraction:
+        left:  0.6792473793029785
+        right: 0.4212911128997803
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal"
+      dataset_revision: "c58c20e80337c493f4392f2817764718c1d7a3f6"
+      training_episode_count: 1510
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+      requires_separate_hand_initialization: true
+      hand_initialization_instruction: "Place the table leg in the dataset-matched grasp before insert policy inference."
+
+  # rotate_leg_to_tighten: issue-70 の ROTATE_LEG_TO_TIGHTEN_OPTIMAL_FRAME0 転写。
+  #   dataset: Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_curated_optimal (402 ep)。
+  #   Model: groot_rotate_leg_200k (200k step)。
+  #   requires_separate_hand_initialization=true (leg 挿入後、両 hand で dataset-matched grasp)。
+  rotate_leg_to_tighten:
+    dispatch_waist: true
+    # 出典: compute_skill_timeout.py, HARA task 3 290ep, p95=38.5s × 1.5, ceil。
+    max_seconds_hard: 58
+    # Phase 3 motion_limits (通常 tighten motion、default 相当だが flip 準拠で明示)
+    motion_limits:
+      arm_velocity_rad_s: 1.5
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.5647929012775421
+        L.shoulder_roll:   0.42547716200351715
+        L.shoulder_yaw:   -0.3933115601539612
+        L.elbow:           0.38866931200027466
+        L.wrist_roll:      0.026323318481445312
+        L.wrist_pitch:     0.09788772463798523
+        L.wrist_yaw:      -1.2527214288711548
+        R.shoulder_pitch: -0.3987988829612732
+        R.shoulder_roll:  -0.4521753191947937
+        R.shoulder_yaw:    0.17447586357593536
+        R.elbow:           0.31719131767749786
+        R.wrist_roll:      0.21218042820692062
+        R.wrist_pitch:     0.1664465069770813
+        R.wrist_yaw:       1.1244196891784668
+      dex1_opening_fraction:
+        left:  0.0
+        right: 0.8534150389  # 3.8403676748275757 / 4.5
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_curated_optimal"
+      dataset_revision: "ec6e3a01bb587be5b491d8cbda636b717749078a"
+      training_episode_count: 402
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+      requires_separate_hand_initialization: true
+      hand_initialization_instruction: "Place the inserted table leg as recorded, then close both Dex1 hands to the dataset-matched rotate-to-tighten grasp before inference."
+
+  # insert_and_tighten: curated task 8 (source task sequence 0 -> 3, gap=0)。
+  # arm/hand initial pose is the exact frame-0 median over the 289 training
+  # episodes listed by both 160k and 200k GR00T train_config.json files.
+  # The sequence begins before insertion, so initialization follows the same
+  # three-gate flow as insert_table_leg: open hands -> place leg -> dataset grip
+  # -> policy.  A dedicated language prompt prevents accidental evaluation with
+  # the rotate-only task-3 conditioning.
+  insert_and_tighten:
+    dispatch_waist: true
+    # 出典: insert_table_leg (21s) + rotate_leg_to_tighten (58s) の sum。
+    # 統合 skill = 2 skill 逐次実行なので個別 p95×1.5 の合算を保守側の上限として
+    # 採用。専用 dataset (Team-RAMEN/..._insert_and_tighten_curated_optimal, 289ep)
+    # から独立に p95 を出せば下振れする可能性あり、実機評価後に slide 検討。
+    max_seconds_hard: 79
+    motion_limits:
+      arm_velocity_rad_s: 1.0
+      arm_acceleration_rad_s2: 8.0
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch: -0.5474485158920288
+        L.shoulder_roll:   0.4248927831649780
+        L.shoulder_yaw:   -0.30508682131767273
+        L.elbow:           0.2318715900182724
+        L.wrist_roll:     -0.15515673160552979
+        L.wrist_pitch:     0.25118687748908997
+        L.wrist_yaw:      -0.9844419956207275
+        R.shoulder_pitch: -0.33353549242019653
+        R.shoulder_roll:  -0.2762238085269928
+        R.shoulder_yaw:   -0.025687849149107933
+        R.elbow:           0.009081864729523659
+        R.wrist_roll:      0.3412363827228546
+        R.wrist_pitch:     0.4426576495170593
+        R.wrist_yaw:       0.5473592877388
+      dex1_opening_fraction:
+        left:  0.6708845562405057
+        right: 0.4206856886545817
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_takada_insert_and_tighten_curated_optimal"
+      dataset_revision: "a5911ca298c9af795fd40a958e90bd76b489cc4c"
+      training_episode_count: 289
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
+      requires_separate_hand_initialization: true
+      hand_initialization_instruction: "Place the table leg in the dataset-matched pre-insertion grasp, then close both Dex1 hands before the combined insert-and-tighten policy starts."
+
+  # flip_table: issue-70 の FLIP_TABLE_V4_ABSOLUTE_FRAME0 転写 (n17_4 と共有)。
+  #   dataset: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4 (268 ep = full_success + recovery_success の train split)。
+  #   Model: groot_flip_table_n17_4。
+  flip_table:
+    # Physical flip-table policies own arms14 + Dex1 only.  Regular Mode owns
+    # waist/legs and must not receive the checkpoint's observed waist slots.
+    dispatch_waist: false
+    # 出典: compute_skill_timeout.py, HARA task 2 429ep, p95=24.4s × 1.5, ceil。
+    max_seconds_hard: 37
+    # Phase 3 motion_limits (issue-70 で flip_table dataset から verified、sweet spot)
+    motion_limits:
+      arm_velocity_rad_s: 1.5
+      arm_acceleration_rad_s2: 10.0
+    initial_pose:
+      arm_position_rad:
+        L.shoulder_pitch:  0.03441404365003109
+        L.shoulder_roll:   0.16259100288152695
+        L.shoulder_yaw:    0.21866360306739807
+        L.elbow:          -0.15529765188694
+        L.wrist_roll:     -0.1381627693772316
+        L.wrist_pitch:     0.12260473519563675
+        L.wrist_yaw:      -0.23490699380636215
+        R.shoulder_pitch: -0.018923509865999222
+        R.shoulder_roll:  -0.24823171645402908
+        R.shoulder_yaw:    0.040699612349271774
+        R.elbow:          -0.09826641529798508
+        R.wrist_roll:      0.3072306215763092
+        R.wrist_pitch:     0.256726399064064
+        R.wrist_yaw:       0.6130597293376923
+      dex1_opening_fraction:
+        left:  0.8401082621680366
+        right: 1.0
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4"
+      dataset_revision: "b402c17d2b5475b3a5438b95b61c7194fa23159a"
+      training_episode_count: 268
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2;train_split_full_success_or_recovery_success_only"
