@@ -118,3 +118,17 @@ groot_inference_server.py` の use_relative_actions=true + relative_exclude_join
 
 → **container で 53D を動かすには**: (a) lerobot 0.6.1 env を追加、(b) desktop の custom
    GR00T load を self-contained server に port。pick(38D, 0.6.0)は既に container 完結。
+
+### ✅ 解決 (2026-08-31、commit c591677 / image ikea-thor:20260831-groot-all)
+2 blocker を「desktop 53D subtree の vendor + lerobot 0.6.1 専用 venv」で解決し、全5 skill を
+1 image に同梱:
+- `components/ramen/vendor/desktop/` に desktop 53D closure を package path 保存で vendor
+  (groot.py の custom load = raw_config+streaming shards+tied-embedding 復元、が blocker2 を解決)。
+  vendored groot.py の worker spawn を pixi→`RAMEN_WORKER_PYTHON_53D` に patch。
+- `Dockerfile.thor.groot`: 53D 用 `/opt/venv-groot53` (lerobot **0.6.1**、base torch sm_110 継承) を
+  追加。pick=0.6.0 (image main) / 53D=0.6.1 の **2-env**。build check で両 venv の lerobot 版確認。
+- run 時 skill 切替: `-e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>`。
+- arm64 build+push 済: **ikea-thor:20260831-groot-all** index digest
+  `sha256:65ffd2621c58722e18f8747a328adb67ee695b448c5847afedb639f7eaf09041` → manifest.groot.yaml。
+- ⚠️ 実行(GR00T 推論)は sm_110 GPU 必要 = 実 Thor でのみ検証可(x86/QEMU は build のみ)。
+  1 run = 1 skill (model 選択=案A/B は未、「一通り全部」の複数 skill は follow-up)。
