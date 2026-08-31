@@ -59,12 +59,33 @@ import lerobot  # groot inference path が import 可能なこと
 print("[build] lerobot", lerobot.__version__)
 PY
 
+# parent (boundary server) が 53D の vendored config_loader を読むのに pyyaml が要る。
+RUN python3 -m pip install --no-cache-dir "pyyaml"
+
+# --- 53D skills 用 lerobot 0.6.1 env (pick=0.6.0 とは checkpoint 形式が違うため別 venv) ---
+# base torch(sm_110)を --system-site-packages で継承し、lerobot 0.6.1 + accelerate +
+# safetensors を venv に入れる (torch は制約 >=2.7,<2.12 を満たすので差し替わらない)。
+# desktop の custom GR00T load (raw_config + streaming shards、tied-embedding 復元) が
+# takada/suzuki 53D checkpoint を読むのに必要。
+RUN python3 -m venv --system-site-packages /opt/venv-groot53 \
+    && /opt/venv-groot53/bin/pip install --no-cache-dir \
+        "lerobot[groot]==0.6.1" "numpy==2.2.6" accelerate safetensors \
+    && /opt/venv-groot53/bin/python - <<'PY'
+import lerobot, torch, numpy, accelerate, safetensors
+print("[build] groot53 venv: lerobot", lerobot.__version__, "torch", torch.__version__,
+      "numpy", numpy.__version__)
+assert lerobot.__version__ == "0.6.1", lerobot.__version__
+PY
+
 # --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
 COPY . ./
 
-# GR00T pick を選択。worker は同一 env の python3 を使う。
+# 既定は pick (RAMEN_POLICY=groot_pick_real, worker=同 env python3=lerobot0.6.0)。
+# 53D skill に切替える時は run 時に -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>。
+# 53D worker は別 env python (RAMEN_WORKER_PYTHON_53D=0.6.1 venv) を使う。
 ENV RAMEN_POLICY=groot_pick_real \
     RAMEN_WORKER_PYTHON=python3 \
+    RAMEN_WORKER_PYTHON_53D=/opt/venv-groot53/bin/python \
     PEVAL_LANE=decoupled
 
 # weights (ver2-lora, private Team-RAMEN) は image に焼かず runtime に HF から取得。

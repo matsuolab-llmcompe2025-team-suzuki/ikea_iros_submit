@@ -1,0 +1,259 @@
+# Learned policy variant registry (Issue #125 Phase 7)。
+#
+# variant 名 = 内部 conceptual identifier (backbone × mode)、HF repo 名は ckpt_ref
+# に保持。実運用で "今日は GR00T baseline、明日は RAMEN-Ori C-2" みたいに config
+# swap で切替える (CLI arg or entrypoint config で variant 指定)。
+#
+# 全 combination:
+# - GR00T: 2 mode (none / overlay)。GR00T は explicit OBB token channel が無い
+#   ので precomputed_token 非対応。
+# - RAMEN-Ori: 3 mode (none / overlay / precomputed_token)。C-2 (token) は独自 channel、
+#   C-11 (overlay) は backbone hint、default (none) は OBB signal 無し。
+#
+# ckpt_ref format:
+#   HF repo: "Team-RAMEN/<repo>@<optional_sha>" (@revision は再現性 pin 用)
+#   Local:   "/path/to/ckpt.pt" (dev/debug 用)
+#   Null:    未 train / まだ ckpt 上がってない (from_ckpt() 呼ぶと error)
+
+policies:
+  # ---- GR00T (2 mode) ---- #
+
+  groot_baseline:
+    policy_type: groot
+    mode: none
+    # NOTE: HF repo 名は "..._groot_100k_v1" (baseline suffix 無し、Team-RAMEN
+    # 実在)。以前 "..._groot_baseline_100k_v1" と書いていたが該当 repo 無しで誤り。
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_groot_100k_v1
+    device: cuda
+    dtype: bf16   # subtask_training.json:groot.use_bf16=true
+    # Phase 4 (Issue #128) async replan: task 5+7 = REAL_G1_RELATIVE_EEF embodiment
+    # → issue-70 の "groot_relative_eef_v1" profile (lead=4, max_age=0.35s) を適用。
+    # execution_steps=10 = issue-70 VALID_EXECUTION_STEPS の中庸、333ms cadence。
+    replan_family: "groot_relative_eef_v1"
+    execution_steps: 10
+
+  # ---- insert_table_leg (LeRobot GR00T、REAL_G1_RELATIVE_EEF、200k step) ---- #
+
+  groot_insert_leg_200k:
+    policy_type: groot
+    mode: none
+    # takada finetune (LeRobot fork wrapper)、200k step。150k もあり、coarse_insert
+    # のみの Dex1_v2 は insert 全体ではなく前半 phase 特化 (別 variant として追加可)。
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k@0f0927bcc1aed6927fb26b82c017009961ee3d35
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"  # Phase 4: 同 embodiment
+    execution_steps: 10
+
+  # ---- rotate_leg_to_tighten (LeRobot GR00T、curated optimal) ---- #
+
+  groot_rotate_leg_160k:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_160k@4c6bc5c29e3b4f8dfaaefd6285d0fe004780dbda
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    execution_steps: 10
+
+  groot_rotate_leg_200k:
+    policy_type: groot
+    mode: none
+    # takada finetune (LeRobot fork wrapper)、200k step。160k もあり。
+    # 全 533ep 分布の 50% を占める dominant skill (rotate_leg 系)。
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"  # Phase 4: 同 embodiment
+    execution_steps: 10
+
+  # ---- insert + tighten sequence (LeRobot GR00T、task 8) ---- #
+
+  groot_insert_and_tighten_160k:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_takada_insert_and_tighten_optimal_gr00t_160k@23ea1d01677107511d6de2d28a0408e13aaf8fa9
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    execution_steps: 10
+
+  groot_insert_and_tighten_200k:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_takada_insert_and_tighten_optimal_gr00t_200k@3988504d73e6cca137c12c1c43b7354bed67128c
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    execution_steps: 10
+
+  # ---- flip_table (LeRobot GR00T、n17_4 最新) ---- #
+
+  # Legacy near-success v2 baseline, selected immutable step 20k. The HF repo
+  # contains multiple Trainer checkpoints, so load only this nested model.
+  groot_flip_table_n17_2_baseline:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff
+    checkpoint_subdir: checkpoints/020000/pretrained_model
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    temporal_lambda: -0.1
+    execution_steps: 10
+
+  groot_flip_table_n17_4:
+    policy_type: groot
+    mode: none
+    # suzuki finetune (LeRobot fork wrapper)、n17_4 iteration 最新。
+    # 他 candidate: _n17_2_baseline_checkpoints / _n17_insertion_candidate。
+    # 組立最終工程 (table flip)、全 533ep 分布 5%。
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_4@737ce9179ee2bba8594687a8603f9b8ab1b33281
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"  # Phase 4: 同 embodiment
+    execution_steps: 10
+
+  # Focused M3-M4 insertion expert.  It was warm-started from the legacy
+  # near-success 20k flip-table policy, but its final 2k updates use only the
+  # left-support -> right-insertion windows.  Keep the normal flip_table skill
+  # identity/initial pose for controlled retention tests; deployment remains
+  # arm+Dex1 only and executes four H40 steps before replanning.
+  groot_flip_table_insertion_candidate:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_insertion_candidate@13b0295b1a4b618d504ed8245a00fa31e63f5ab5
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    # The sealed candidate was evaluated/trained as a four-step specialist
+    # without cross-chunk temporal blending.  The generic GR00T default (-0.1)
+    # is intentionally not inherited here because blending relative-action
+    # chunks would change the candidate's unvalidated execution contract.
+    temporal_lambda: null
+    execution_steps: 4
+
+  # ---- pick_table_leg (Isaac-GR00T native raw、full-body embodiment、別 schema) ---- #
+
+  groot_pick_legs_v1:
+    policy_type: groot_pick_legs
+    mode: none
+    # Isaac-GR00T native raw finetune (Team-RAMEN 内別担当者 upload、命名 pattern
+    # 違い、subdir load 必要)。実 ckpt は checkpoint-40000/ 下、config.json は
+    # base_model=GR00T-N1.7-3B、embodiment=NEW_EMBODIMENT (raw robot_q 38D)。
+    # checkpoint_subdir=null は root load (ver2-lora) を意味するので、subdir 配置の
+    # ver1 は明示指定する (未指定=root の規約は generic groot 経路と共通)。
+    ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ver1
+    checkpoint_subdir: checkpoint-40000
+    device: cuda
+    dtype: bf16
+
+  # pick_table_leg ver2-lora (LeRobot/root layout、明日の運営評価 deploy 用)。
+  # ver1 と同じ new_embodiment 38D raw だが、Isaac Trainer subdir ではなく
+  # LeRobot GR00T 形式で root 直下に merged safetensors + processor/statistics/
+  # embodiment_id を配置。lora_adapter/ は再現 artifact (load 経路は使わない)。
+  # → checkpoint_subdir 未指定 (null) = root load。action 処理は groot_pick_legs
+  # のまま (38D new_embodiment、worker contract は ...ver2-lora を既定 pin 済)。
+  groot_pick_legs_v2:
+    policy_type: groot_pick_legs
+    mode: none
+    ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1
+    device: cuda
+    dtype: bf16
+
+  # ---- GR00T overlay (task_5+7 系、C-11 学習 run) ---- #
+
+  groot_overlay:
+    policy_type: groot
+    mode: overlay
+    # C-11 overlay 学習 run (Issue #122 GR00T overlay task)。head_left/right の 2 cam に
+    # YOLO-OBB overlay を描画した状態で GR00T を fine-tune した variant。
+    # 実 repo 名は "_v11b_100k_v1" (v11b = YOLO OBB Cycle 2 ckpt)、handoff doc
+    # docs/handoff/issue_122_groot_overlay_task.md L283 と一致。
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_groot_overlay_v11b_100k_v1
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"  # Phase 4: 同 embodiment
+    execution_steps: 10
+
+  # ---- RAMEN-Ori task5+7 (Phase 2 recipe、5 variant 全 HF push 済) ---- #
+
+  ramen_ori_default:
+    policy_type: ramen_ori
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_default_100k_v1
+    device: cuda
+    dtype: fp32   # base.yaml:vision_backbone.dtype=fp32 (Phase 2 で bf16 検討)
+
+  ramen_ori_g3:
+    policy_type: ramen_ori
+    mode: none
+    # Fusion CrossAttn (G-3 variant、default の FusionTransformer と比較)
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_g3_100k_v1
+    device: cuda
+    dtype: fp32
+    hydra_overrides:
+      - model.fusion._target_=model.ramen_ori.fusion.FusionCrossAttn
+
+  ramen_ori_meanflow:
+    policy_type: ramen_ori
+    mode: none
+    # MeanFlow action expert (B-8 variant、default の Flow Matching と比較)
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_meanflow_100k_v1
+    device: cuda
+    dtype: fp32
+    # configs/real_task5_7_meanflow.yaml の学習時構造をそのまま再現する。
+    hydra_overrides:
+      - model.action_expert._target_=model.ramen_ori.action_expert.MeanFlow
+      - model.action_expert.embed_dim=512
+      - model.action_expert.depth=6
+      - model.action_expert.num_heads=8
+      - model.action_expert.mlp_ratio=4.0
+      - model.sample_n_steps=1
+
+  ramen_ori_awr:
+    policy_type: ramen_ori
+    mode: none
+    # Advantage Weighted Regression (training.awr.enabled=true)
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_awr_100k_v1
+    device: cuda
+    dtype: fp32
+
+  ramen_ori_radio:
+    policy_type: ramen_ori
+    mode: none
+    # RADIO vision backbone (A-2 variant、default の LingBot と比較)
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_radio_100k_v1
+    device: cuda
+    dtype: fp32
+    hydra_overrides:
+      - vision_backbone.variant=radio-b
+
+  ramen_ori_token:
+    policy_type: ramen_ori
+    mode: precomputed_token
+    ckpt_ref: null  # TODO: C-2 学習 run 未着、HF push 待ち
+    device: cuda
+    dtype: fp32
+
+  ramen_ori_overlay:
+    policy_type: ramen_ori
+    mode: overlay
+    ckpt_ref: null  # TODO: C-11 学習 run 未着、HF push 待ち
+    device: cuda
+    dtype: fp32
+
+# ---- shared config (Skill wrapper が参照) ---- #
+
+yolo:
+  # v11b Cycle 2 (2026-08-19 upload、Issue #122 D-3 決定値)。overlay / precomputed_token
+  # mode 両方で共通に使う。SHA pin で再現性確保 (別 SHA を使いたい時は overridekab)。
+  ckpt_ref: Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@8221d0aef45d63666537c1f030810fb9b56dd1ed
+
+# skill_name → policy_variant + skill_id/language mapping (Phase 9 で追加予定)
+# 例:
+#   skills:
+#     move_table_base:
+#       variant: ramen_ori_default
+#       skill_id: 5
+#       language: "rotate and move table base (combined 5+7)"  # GR00T 用 (variant swap 時)

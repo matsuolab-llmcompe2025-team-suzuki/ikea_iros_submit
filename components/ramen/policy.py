@@ -157,10 +157,11 @@ class Groot53Backend(InferenceBackend):
     ):
         import os
         import sys
+        from pathlib import Path
 
-        repo = desktop_repo or os.environ.get(
-            "RAMEN_DESKTOP_REPO", "/datadrive2/iros_2026_ramen"
-        )
+        # 既定は vendored desktop subtree (self-contained)。RAMEN_DESKTOP_REPO で override 可。
+        vendored = str(Path(__file__).resolve().parent / "vendor" / "desktop")
+        repo = desktop_repo or os.environ.get("RAMEN_DESKTOP_REPO") or vendored
         if repo not in sys.path:
             sys.path.insert(0, repo)
         from inference.desktop.lower_policy.policies.base import (  # noqa: E402
