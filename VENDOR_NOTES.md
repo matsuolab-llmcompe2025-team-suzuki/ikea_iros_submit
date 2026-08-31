@@ -90,9 +90,11 @@
   - ⚠️ **実行は未検証**（sm_110 GPU 必要、x86/QEMU では GPU 実行不可）: 実 Thor で
     `RAMEN_POLICY=groot_pick_real python3 components/server.py` の worker ready + conformance +
     (T,25) 出力を確認する。weights は `-e HF_TOKEN=...` で runtime 取得。
-  - ✅ **GHCR push 済（2026-08-31）**: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor-groot:20260831-groot-pick`
-    index digest `sha256:f574beaf30c9dd9eed487ad1c03a3839cd3f726b7048f85d31a70570aaed11b5`
-    （arm64 platform manifest = `sha256:678dd78501b9601dbc2b5bd73575a4545554fa21f3cfa60886a52b4ddf711586`）。
+  - ✅ **GHCR push 済（2026-08-31）**: 既存 **`ikea-thor`** package の新 tag
+    `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-pick`
+    index digest `sha256:207c8db9027325a50dca7ff47298aaed2ca0e3a2e9732456b5aadfa7f650c3a5`
+    （arm64 platform manifest = `sha256:2c00de8edef8da824e92dd5aa24954daf3a12fafa09a5af96e21e1f6001ebe9c`）。
     → `manifest.groot.yaml`（RAMEN-Ori 用 manifest.yaml と別 track）に反映済。
-    ⚠️ 新規 package は **private** = 運営に read 権限付与が別途必要（Finding 2 と同じ手続き）。
+    ※ 運営に伝達済の package 名 `ikea-thor` を維持（`:onboarding` tag は温存、read 権限は既存のまま）。
+    ※ 初回誤って push した `ikea-thor-groot` package は堀江が別途削除予定。
 - ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。
