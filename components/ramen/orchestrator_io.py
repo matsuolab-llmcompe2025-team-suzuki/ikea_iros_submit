@@ -129,6 +129,21 @@ class BoundaryFrameData:
     t: int
 
 
+class BoundaryWristSource:
+    """boundary wrist 画像 (BGR) を注入 → orchestrator が get() で FrameData を読む。"""
+
+    def __init__(self) -> None:
+        self._latest: BoundaryFrameData | None = None
+
+    def update(self, bgr: np.ndarray, t: int) -> None:
+        self._latest = BoundaryFrameData(
+            rgb=np.ascontiguousarray(np.asarray(bgr, dtype=np.uint8)), t=int(t)
+        )
+
+    def get(self) -> "BoundaryFrameData | None":
+        return self._latest
+
+
 def build_frame_data(head_bgr: np.ndarray, t: int, packed_stereo: bool = True) -> BoundaryFrameData:
     """boundary head 画像 (BGR) → FrameData。
 
