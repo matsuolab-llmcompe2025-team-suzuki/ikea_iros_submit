@@ -98,3 +98,23 @@
     ※ 運営に伝達済の package 名 `ikea-thor` を維持（`:onboarding` tag は温存、read 権限は既存のまま）。
     ※ 初回誤って push した `ikea-thor-groot` package は堀江が別途削除予定。
 - ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。
+
+## 53D skills (rotate_table_base / insert / rotate_leg / flip) — 2026-08-31
+pick 以外の4 skill は REAL_G1_RELATIVE_EEF 53D LeRobot GR00T。`Groot53Backend` は現状
+**desktop 依存**（RAMEN_DESKTOP_REPO + inference/desktop pixi env=lerobot0.6.1）。実 GPU で
+rotate_leg / flip の (T,25) 契約 PASS を確認済（obs→49D state[build_state_from_raw +
+G1WristFK ee_state]→predict→19D→body29→adapter）。arm relative は post_processor が
+current arm state 加算で絶対化（原さん `evaluate/flip_table_simulation/groot_runtime/
+groot_inference_server.py` の use_relative_actions=true + relative_exclude_joints で確認）。
+
+**self-contained 化は 2 blocker で保留**（`components/ramen/vendor/groot53` + `groot53_worker.py`
++ `vendor/dex1` は WIP・未使用）:
+1. **lerobot 版分裂**: 53D checkpoint は **0.6.1** 形式（pick は 0.6.0）。container で lerobot
+   env が分裂（pick 0.6.0 / 53D 0.6.1 の 2 venv が要る）。Dockerfile.thor.groot は 0.6.0 のみ。
+2. **checkpoint load 経路**: takada 53D checkpoint は `embed_tokens` の tied-weight を持ち、
+   原さん server の vanilla `GrootPolicy.from_pretrained` が strict load で
+   "Unexpected key ... embed_tokens.weight" 失敗。desktop groot.py の custom load
+   (raw_config + streaming shards) だけが読める。→ その load を server に port するのが follow-up。
+
+→ **container で 53D を動かすには**: (a) lerobot 0.6.1 env を追加、(b) desktop の custom
+   GR00T load を self-contained server に port。pick(38D, 0.6.0)は既に container 完結。

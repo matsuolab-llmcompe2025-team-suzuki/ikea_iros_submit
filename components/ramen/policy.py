@@ -132,21 +132,21 @@ class Groot53Backend(InferenceBackend):
     """53D LeRobot GR00T backend (rotate_table_base / insert / rotate_leg / flip)。
 
     pick(38D Isaac native)と異なり、これらは REAL_G1_RELATIVE_EEF 53D (arm relative、
-    lerobot post_processor が current arm state 加算で absolute 化)。desktop の
-    `Gr00tPolicy` を再利用: obs → 49D state (build_state_from_raw + G1WristFK ee_state) →
-    predict → 19D executable (waist3 + arm14 + hand2、絶対) → body29 → (T,38)。
+    post_processor が current arm state 加算で absolute 化)。desktop `Gr00tPolicy` を
+    再利用: obs → 49D state (build_state_from_raw + G1WristFK ee_state) → predict →
+    19D executable (waist3 + arm14 + hand2、絶対) → body29 → (T,38)。camera 3個。
 
-    camera は 3 個 (head_left/left_wrist/right_wrist)。boundary の ego_view→head_left、
-    left/right_wrist をそのまま (pick と違い head_right 複製は不要)。
-
-    NOTE: desktop 依存 (RAMEN_DESKTOP_REPO + inference/desktop pixi env で 53D worker、
-    model.subtask_policy_training の dex1 synergy)。self-contained 化は follow-up。
+    ⚠️ 現状 **desktop 依存**(RAMEN_DESKTOP_REPO + inference/desktop pixi env=lerobot0.6.1)。
+    self-contained 化 (components/ramen/vendor/groot53 + groot53_worker) は 2 blocker で
+    保留: (1) 53D は lerobot 0.6.1、pick は 0.6.0 = container で env 分裂、(2) takada 53D
+    checkpoint は embed_tokens tied-weight で原さん vanilla server の from_pretrained が
+    strict load 失敗 = desktop の custom load (raw_config+streaming) が必須。→ VENDOR_NOTES。
     """
 
     _WAIST = slice(0, 3)
     _ARMS = slice(3, 17)
     _HANDS = slice(17, 19)
-    _DEX1_OPEN_VALUE = 4.5   # Dex1 physical open [rad] (state 入力用)
+    _DEX1_OPEN_VALUE = 4.5
 
     def __init__(
         self,
@@ -203,7 +203,7 @@ class Groot53Backend(InferenceBackend):
         body_q = np.asarray(obs["body_q"], dtype=np.float32)
         if body_q.shape != (_BODY_DIM,):
             raise ValueError(f"obs.body_q must be (29,), got {body_q.shape}")
-        ee_state = self._fk.compute_ee_state(body_q)   # (12,) left(xyz+euler)+right
+        ee_state = self._fk.compute_ee_state(body_q)
         hand_state = (self._dex1_open * self._DEX1_OPEN_VALUE).astype(np.float32)
         state49 = self._build_state(self._RawRobotState(
             joint_positions=body_q, hand_state=hand_state, ee_state=ee_state,

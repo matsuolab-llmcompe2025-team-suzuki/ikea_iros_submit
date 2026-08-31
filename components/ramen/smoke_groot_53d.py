@@ -1,6 +1,6 @@
 """53D LeRobot GR00T (rotate/insert/flip) → (T,25) smoke (GPU 必要)。
 
-iros_2026_ramen の runtime env から実行する想定:
+現状 Groot53Backend は desktop 依存 (RAMEN_DESKTOP_REPO)。実行:
     cd /datadrive2/iros_2026_ramen && \
     RAMEN_DESKTOP_REPO=/datadrive2/iros_2026_ramen \
     pixi run -e runtime python /datadrive2/ikea_iros_submit/components/ramen/smoke_groot_53d.py \
