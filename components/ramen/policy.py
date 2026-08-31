@@ -301,3 +301,108 @@ class GrootPickTaskspacePolicy:
         self._steps = 0
         self._backend.reset()
         return {"ok": True}
+
+
+# prompt keyword → skill_key (先勝ち)。organizer が skill 毎に prompt を変える前提 (Q5)。
+_PROMPT_SKILL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("flip",), "flip"),
+    (("insert",), "insert"),
+    (("tighten",), "rotate_leg"),
+    (("pick",), "pick"),
+    (("rotate", "move", "base"), "rotate_table_base"),
+)
+
+# skill_key → backend 生成 (lazy)。pick=38D self-contained worker、他=53D。
+_SKILL_BACKENDS: dict[str, "callable"] = {
+    "pick": lambda: GrootWorkerBackend(),
+    "rotate_table_base": lambda: Groot53Backend("groot_overlay"),
+    "insert": lambda: Groot53Backend("groot_insert_leg_200k"),
+    "rotate_leg": lambda: Groot53Backend("groot_rotate_leg_200k"),
+    "flip": lambda: Groot53Backend("groot_flip_table_n17_2_baseline"),
+}
+
+
+def resolve_skill_from_prompt(prompt: str | None, default_skill: str) -> str:
+    """prompt 文字列 → skill_key。keyword 一致 (先勝ち)、無ければ default。"""
+    text = (prompt or "").lower()
+    for keywords, skill in _PROMPT_SKILL_RULES:
+        if any(k in text for k in keywords):
+            return skill
+    return default_skill
+
+
+class MultiSkillTaskspacePolicy:
+    """prompt 駆動で 5 skill の backend を切替える decoupled Policy (案A)。
+
+    act(obs) 毎に obs["prompt"] から skill を判定し、対応 backend で (T,25) を返す。
+    backend は skill 初回使用時に lazy load しキャッシュ (pick=lerobot0.6.0 worker /
+    53D=lerobot0.6.1 worker、各自別 subprocess)。organizer が skill 毎に prompt を
+    変えれば「一通り全部」も追従する。prompt が skill を示さない時は default_skill。
+
+    ⚠️ organizer が run 内で prompt をどう与えるか (Q5) 未確認。prompt が固定なら
+    実質 1 skill (=default) になる。GPU memory: skill を跨ぐと複数 model が常駐しうる
+    (Thor 128GB 想定)。default_skill は env RAMEN_DEFAULT_SKILL で指定。
+    """
+
+    ACTION_CHUNK = 16
+    OBS_CHUNK = 1
+
+    def __init__(
+        self,
+        lane: str = "decoupled",
+        default_skill: str = "pick",
+        ee_frame_transform: np.ndarray | None = None,
+    ):
+        if lane != "decoupled":
+            raise ValueError(f"MultiSkill is decoupled-only, got {lane!r}")
+        if default_skill not in _SKILL_BACKENDS:
+            raise ValueError(
+                f"unknown default_skill {default_skill!r}; "
+                f"known: {sorted(_SKILL_BACKENDS)}"
+            )
+        self.lane = lane
+        self._default_skill = default_skill
+        self._ee_frame_transform = ee_frame_transform
+        self._fk = G1WristFK.from_urdf()
+        self._backends: dict[str, InferenceBackend] = {}
+        self._steps = 0
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "lane": self.lane,
+            "action_chunk_size": self.ACTION_CHUNK,
+            "obs_chunk_size": self.OBS_CHUNK,
+            "camera_keys": ["ego_view", "left_wrist", "right_wrist"],
+            "wants_state": True,
+            "wants_prompt": True,
+        }
+
+    def _backend(self, skill: str) -> InferenceBackend:
+        backend = self._backends.get(skill)
+        if backend is None:
+            print(f"[server] MultiSkill: loading backend for skill={skill}")
+            backend = _SKILL_BACKENDS[skill]()
+            self._backends[skill] = backend
+        return backend
+
+    def act(self, obs: dict) -> dict:
+        self._steps += 1
+        skill = resolve_skill_from_prompt(obs.get("prompt"), self._default_skill)
+        chunk_38 = self._backend(skill).infer(obs, self.ACTION_CHUNK)
+        actions = groot_chunk_to_taskspace(
+            chunk_38, self._fk, ee_frame_transform=self._ee_frame_transform
+        )
+        return {"actions": actions}
+
+    def reset(self) -> dict:
+        self._steps = 0
+        for backend in self._backends.values():
+            backend.reset()
+        return {"ok": True}
+
+    def close(self) -> None:
+        for backend in self._backends.values():
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
