@@ -125,13 +125,16 @@ def _build_policy(lane: str, delay_ms: float):
     """RAMEN_POLICY env で policy 実装を選ぶ。
 
     未設定 / "stub"        → 参照 hold-still Policy (conformance の既定、挙動不変)。
-    "groot_pick" (decoupled) → GrootPickTaskspacePolicy (段階1 PoC、案C = pick 単体)。
-                              backend は既定 HoldPoseBackend (現在姿勢保持、GPU 不要)。
+    "groot_pick"           → GrootPickTaskspacePolicy + HoldPoseBackend (GPU 不要 PoC)。
+    "groot_pick_real"      → 同上 + 実 GR00T pick (38D Isaac native、self-contained worker)。
+    "groot_53d_real"       → 同上 + 実 53D LeRobot GR00T。skill は env RAMEN_VARIANT で選ぶ
+                             (例 groot_rotate_leg_200k / groot_insert_leg_200k /
+                              groot_overlay / groot_flip_table_n17_2_baseline)。desktop 依存。
     """
     choice = os.environ.get("RAMEN_POLICY", "stub").strip().lower()
     if choice in ("", "stub", "reference"):
         return Policy(lane, delay_ms)
-    if choice in ("groot_pick", "groot_pick_real"):
+    if choice in ("groot_pick", "groot_pick_real", "groot_53d_real"):
         if lane != "decoupled":
             raise SystemExit(f"RAMEN_POLICY={choice} requires --lane decoupled")
         from components.ramen.policy import GrootPickTaskspacePolicy
@@ -142,10 +145,23 @@ def _build_policy(lane: str, delay_ms: float):
 
             print("[server] loading real GR00T pick worker (may take ~1 min)")
             backend = GrootWorkerBackend()
+        elif choice == "groot_53d_real":
+            from components.ramen.policy import Groot53Backend
+
+            variant = os.environ.get("RAMEN_VARIANT", "").strip()
+            if not variant:
+                raise SystemExit(
+                    "RAMEN_POLICY=groot_53d_real requires RAMEN_VARIANT "
+                    "(e.g. groot_rotate_leg_200k / groot_insert_leg_200k / "
+                    "groot_overlay / groot_flip_table_n17_2_baseline)"
+                )
+            print(f"[server] loading real 53D GR00T ({variant}) ...")
+            backend = Groot53Backend(variant=variant)
         print(f"[server] using GrootPickTaskspacePolicy (decoupled, {choice})")
         return GrootPickTaskspacePolicy(lane=lane, backend=backend)
     raise SystemExit(
-        f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick / groot_pick_real"
+        f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick / "
+        "groot_pick_real / groot_53d_real"
     )
 
 

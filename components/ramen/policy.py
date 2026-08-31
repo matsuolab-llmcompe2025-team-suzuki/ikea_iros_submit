@@ -128,6 +128,127 @@ class GrootWorkerBackend(InferenceBackend):
         self._worker.close()
 
 
+class Groot53Backend(InferenceBackend):
+    """53D LeRobot GR00T backend (rotate_table_base / insert / rotate_leg / flip)。
+
+    pick(38D Isaac native)と異なり、これらは REAL_G1_RELATIVE_EEF 53D (arm relative、
+    lerobot post_processor が current arm state 加算で absolute 化)。desktop の
+    `Gr00tPolicy` を再利用: obs → 49D state (build_state_from_raw + G1WristFK ee_state) →
+    predict → 19D executable (waist3 + arm14 + hand2、絶対) → body29 → (T,38)。
+
+    camera は 3 個 (head_left/left_wrist/right_wrist)。boundary の ego_view→head_left、
+    left/right_wrist をそのまま (pick と違い head_right 複製は不要)。
+
+    NOTE: desktop 依存 (RAMEN_DESKTOP_REPO + inference/desktop pixi env で 53D worker、
+    model.subtask_policy_training の dex1 synergy)。self-contained 化は follow-up。
+    """
+
+    _WAIST = slice(0, 3)
+    _ARMS = slice(3, 17)
+    _HANDS = slice(17, 19)
+    _DEX1_OPEN_VALUE = 4.5   # Dex1 physical open [rad] (state 入力用)
+
+    def __init__(
+        self,
+        variant: str,
+        desktop_repo: str | None = None,
+        dex1_open_fraction: tuple[float, float] = (1.0, 1.0),
+        task: str | None = None,
+    ):
+        import os
+        import sys
+
+        repo = desktop_repo or os.environ.get(
+            "RAMEN_DESKTOP_REPO", "/datadrive2/iros_2026_ramen"
+        )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from inference.desktop.lower_policy.policies.base import (  # noqa: E402
+            CameraKey,
+            Observation,
+            RawRobotState,
+        )
+        from inference.desktop.lower_policy.policies.config_loader import (  # noqa: E402
+            load_policy_variant,
+            resolve_policy_class,
+        )
+        from inference.desktop.lower_policy.policies.groot import (  # noqa: E402
+            build_state_from_raw,
+        )
+        from inference.desktop.perception.g1_urdf_fk import G1WristFK  # noqa: E402
+
+        self._CameraKey = CameraKey
+        self._Observation = Observation
+        self._RawRobotState = RawRobotState
+        self._build_state = build_state_from_raw
+        self._fk = G1WristFK.from_urdf()
+        self._dex1_open = np.clip(np.asarray(dex1_open_fraction, np.float32), 0.0, 1.0)
+        self._task = task
+
+        cfg_path = os.path.join(
+            repo, "inference/desktop/lower_policy/configs/policy_config.yaml"
+        )
+        entry = load_policy_variant(cfg_path, variant)
+        cls = resolve_policy_class(entry.policy_type)
+        self._policy = cls.from_ckpt(entry.policy_config)
+
+    @staticmethod
+    def _bgr(images: dict, key: str) -> np.ndarray:
+        img = images.get(key)
+        if img is None:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        return np.ascontiguousarray(np.asarray(img, dtype=np.uint8)[:, :, ::-1])
+
+    def infer(self, obs: dict, horizon: int) -> np.ndarray:
+        body_q = np.asarray(obs["body_q"], dtype=np.float32)
+        if body_q.shape != (_BODY_DIM,):
+            raise ValueError(f"obs.body_q must be (29,), got {body_q.shape}")
+        ee_state = self._fk.compute_ee_state(body_q)   # (12,) left(xyz+euler)+right
+        hand_state = (self._dex1_open * self._DEX1_OPEN_VALUE).astype(np.float32)
+        state49 = self._build_state(self._RawRobotState(
+            joint_positions=body_q, hand_state=hand_state, ee_state=ee_state,
+        ))
+        images = obs.get("images", {})
+        frames = {
+            self._CameraKey.HEAD_LEFT: self._bgr(images, "ego_view"),
+            self._CameraKey.WRIST_LEFT: self._bgr(images, "left_wrist"),
+            self._CameraKey.WRIST_RIGHT: self._bgr(images, "right_wrist"),
+        }
+        observation = self._Observation(
+            frames_bgr=frames, frames_bgr_prev=None, state=state49,
+            skill_id=None, language=self._task or obs.get("prompt"),
+            obb_detections=None, timestamp_ns=0,
+        )
+        action19 = np.asarray(
+            self._policy.predict(observation).action_chunk, dtype=np.float64
+        )
+        if action19.ndim != 2 or action19.shape[1] != 19:
+            raise ValueError(f"expected 53D-policy 19D chunk, got {action19.shape}")
+
+        legs12 = body_q[:12].astype(np.float64)
+        rows = []
+        for row in action19:
+            body29 = np.concatenate([legs12, row[self._WAIST], row[self._ARMS]])
+            rows.append(
+                np.concatenate([_ROOT_PROXY_XYZ_WXYZ, body29, row[self._HANDS]])
+            )
+        chunk38 = np.stack(rows)
+        if chunk38.shape[0] >= horizon:
+            return chunk38[:horizon]
+        pad = np.tile(chunk38[-1:], (horizon - chunk38.shape[0], 1))
+        return np.concatenate([chunk38, pad])
+
+    def reset(self) -> None:
+        reset = getattr(self._policy, "reset", None)
+        if callable(reset):
+            reset()
+
+    def close(self) -> None:
+        close = getattr(self._policy, "close", None)
+        if callable(close):
+            close()
+
+
 class GrootPickTaskspacePolicy:
     """boundary decoupled Policy: obs → backend → adapter → (T, 25)。
 
