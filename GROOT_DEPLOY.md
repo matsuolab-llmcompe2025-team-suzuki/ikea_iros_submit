@@ -5,7 +5,7 @@ lane の `(T,25)` task-space に載せて** 運営評価に出すための実装
 
 - 実装: `components/ramen/`
 - 提出 manifest: `manifest.groot.yaml`
-- image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch-np2`
+- image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260901-groot-orch-orchfix`
 - 技術詳細 / 判断ログ: `VENDOR_NOTES.md` §「GR00T-pick 提出トラック」「53D skills」ほか
 
 ---
@@ -30,7 +30,7 @@ docker run --rm --runtime nvidia --network host \
   -e NVIDIA_DISABLE_REQUIRE=1 \
   -e RAMEN_POLICY=groot_orchestrator \
   -e HF_TOKEN=<Team-RAMEN HF read token> \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-orch-np2
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260901-groot-orch-orchfix
 ```
 - `NVIDIA_DISABLE_REQUIRE=1` は Thor で GPU passthrough に必須 (onboarding Finding 1)。
 - weights (GR00T / YOLO) は image に焼かず **runtime に HF から取得** → `HF_TOKEN` 必須。
