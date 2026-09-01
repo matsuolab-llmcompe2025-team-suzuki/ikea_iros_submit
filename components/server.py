@@ -172,6 +172,43 @@ def _build_policy(lane: str, delay_ms: float):
     )
 
 
+# serve 前に実 GR00T 推論を1度回す modes (cold CUDA kernel compile / graph capture を
+# 逃がす)。stub / GPU 無し HoldPose は対象外。IAC eval 指摘: 初回 .act() が ~10.9s かかり
+# 実 run 最初の act_policy stage で stale-chunk window を食う。MEL-CRAFT も同パターン。
+_WARMUP_MODES = ("groot_pick_real", "groot_53d_real", "groot_orchestrator")
+
+
+def _warmup_policy(policy, label: str, iters: int = 2) -> None:
+    """Dummy obs で act() を数回叩き、GR00T の初回 compile を serve 前に済ませる。
+
+    best-effort: 失敗しても serve は継続する (warmup が理由でサーバを落とさない)。
+    dummy obs は boundary の obs 形式 (body_q (29,) + ego/wrist 画像 (480,640,3) uint8)。
+    orchestrator は initial_skill=rotate_table_base で起動するので、zeros 画像でも
+    最初の skill worker が dispatch されて温まる (perception 検出は skill 遷移用で、
+    現 active skill の GR00T は毎 tick 走る)。
+    """
+    dummy = {
+        "body_q": np.zeros((29,), dtype=np.float32),
+        "base_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        "images": {
+            "ego_view": np.zeros((480, 640, 3), dtype=np.uint8),
+            "left_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
+            "right_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
+        },
+        "prompt": "warmup",
+    }
+    t0 = time.time()
+    try:
+        for i in range(iters):
+            policy.act(dummy)
+        reset = getattr(policy, "reset", None)
+        if callable(reset):
+            reset()   # warmup tick の state を捨てて本番を綺麗に始める
+        print(f"[server] warmup done ({label}, {iters} iters, {time.time() - t0:.1f}s)")
+    except Exception as exc:   # noqa: BLE001 — warmup 失敗で serve を止めない
+        print(f"[server] warmup skipped ({label}): {type(exc).__name__}: {exc}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lane", choices=LANES,
@@ -185,7 +222,12 @@ def main():
     args = parser.parse_args()
 
     print(f"[server] lane={args.lane} delay={args.delay_ms:.0f}ms")
-    serve_policy(_build_policy(args.lane, args.delay_ms), host=args.host, port=args.port)
+    policy = _build_policy(args.lane, args.delay_ms)
+    choice = os.environ.get("RAMEN_POLICY", "stub").strip().lower()
+    if choice in _WARMUP_MODES and os.environ.get("RAMEN_WARMUP", "1") != "0":
+        print(f"[server] warming up ({choice}) before serving ...")
+        _warmup_policy(policy, choice)
+    serve_policy(policy, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
