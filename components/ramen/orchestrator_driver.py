@@ -151,7 +151,9 @@ class OrchestratorDriver:
         snap = Path(snapshot_download(
             repo_id=repo_id, revision=revision, allow_patterns=("*.pt",)
         ))
-        pts = sorted(snap.glob("*.pt"))
+        # snapshot は repo の nested 構造を保持する (weight は runs/.../weights/best.pt に居る)。
+        # Path.glob("*.pt") は非再帰で top-level しか見ず空になるので recursive glob を使う。
+        pts = sorted(snap.glob("**/*.pt"))
         if not pts:
             raise FileNotFoundError(f"no .pt in YOLO repo {repo_id}")
         return str(pts[0])
