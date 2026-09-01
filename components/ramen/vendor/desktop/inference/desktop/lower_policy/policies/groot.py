@@ -1322,9 +1322,7 @@ class Gr00tPolicy:
         # 実 env (sakura .venv_lerobot060) で本 method が走る前提。
         # lazy: env-isolated dependencies (lerobot は sakura training env pin)
         import torch
-        from lerobot.policies.groot.configuration_groot import (
-            GrootConfig as _LrGrootConfig,
-        )
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.groot.processor_groot import (
             make_groot_pre_post_processors_from_pretrained,
         )
@@ -1385,7 +1383,13 @@ class Gr00tPolicy:
             load_cfg = FurnitureGrootRuntimeConfig.from_pretrained(str(checkpoint_root))
             policy_base_class = FurnitureGrootRuntimePolicy
         else:
-            load_cfg = _LrGrootConfig.from_pretrained(str(checkpoint_root))
+            # config.json は lerobot の polymorphic discriminator "type": "groot" を
+            # 持つ。concrete subclass (GrootConfig) の from_pretrained を直に呼ぶと
+            # draccus.parse(GrootConfig, ...) が "type" を未知フィールドとして弾く
+            # (DecodingError, IAC eval 指摘)。base PreTrainedConfig.from_pretrained は
+            # "type" で subclass を dispatch し pop してから decode するのでこちらを使う
+            # (type="groot" → GrootConfig を返す)。
+            load_cfg = PreTrainedConfig.from_pretrained(str(checkpoint_root))
         # Uploaded checkpoints may retain a training-workstation absolute
         # path. Resolve the pinned official base snapshot locally instead.
         base_revision = str(
