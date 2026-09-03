@@ -470,7 +470,20 @@ def _require_groot_load_headroom(
             f"checkpoint={checkpoint_bytes / 1024**3:.1f}GiB"
         )
 
-    gpu_required = checkpoint_bytes + _GROOT_GPU_LOAD_OVERHEAD_BYTES
+    # GPU load overhead は既定 12GiB (base model + activation + transient buffer)。
+    # IAC eval 指摘: dev-kit bench は CUDA-visible ~122GiB でも idle 空きが ~33.6GiB
+    # (driver/platform reservation と推測) で、YOLO load 後 19.8GiB まで削れ、
+    # checkpoint 11.7 + 12 = 23.7GiB のガードに掛かって warmup skip。実機 Thor の
+    # 実 headroom が未知なため overhead を env `RAMEN_GROOT_GPU_OVERHEAD_GB` で調整可に
+    # (既定据え置き = 挙動不変、opt-in で緩める。実機に余裕があれば触らない)。
+    gpu_overhead = _GROOT_GPU_LOAD_OVERHEAD_BYTES
+    _env_gb = os.environ.get("RAMEN_GROOT_GPU_OVERHEAD_GB")
+    if _env_gb:
+        try:
+            gpu_overhead = int(float(_env_gb) * 1024**3)
+        except ValueError:
+            pass
+    gpu_required = checkpoint_bytes + gpu_overhead
     if gpu_free_bytes is not None and gpu_free_bytes < gpu_required:
         raise MemoryError(
             "insufficient free GPU memory for GR00T load/warmup: "
