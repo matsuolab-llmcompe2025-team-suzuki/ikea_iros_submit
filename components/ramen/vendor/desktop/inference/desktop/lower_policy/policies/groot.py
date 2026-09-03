@@ -1376,11 +1376,17 @@ class Gr00tPolicy:
         policy_base_class = None
         if artifact_contract.policy_type == "furniture_groot":
             from inference.desktop.lower_policy.policies.furniture_groot_runtime import (
-                FurnitureGrootRuntimeConfig,
+                FurnitureGrootRuntimeConfig,  # noqa: F401 — import が "furniture_groot" subclass を register
                 FurnitureGrootRuntimePolicy,
             )
 
-            load_cfg = FurnitureGrootRuntimeConfig.from_pretrained(str(checkpoint_root))
+            # 下記 else と同じ理由: concrete subclass (FurnitureGrootRuntimeConfig) の
+            # from_pretrained を直に呼ぶと "type": "furniture_groot" discriminator を
+            # draccus が未知フィールドとして弾く (IAC eval 指摘)。上の import で
+            # furniture_groot subclass が register 済なので、base PreTrainedConfig.
+            # from_pretrained が type="furniture_groot" → FurnitureGrootRuntimeConfig に
+            # dispatch する (progress_* 等の追加 field も subclass が宣言済で正しく decode)。
+            load_cfg = PreTrainedConfig.from_pretrained(str(checkpoint_root))
             policy_base_class = FurnitureGrootRuntimePolicy
         else:
             # config.json は lerobot の polymorphic discriminator "type": "groot" を
