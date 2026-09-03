@@ -13,12 +13,12 @@ platform: linux/arm64
 images:
   thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、onboarding tag は温存)。
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260901-groot-orch-cfgfix"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260902-groot-orch-flipfix"
     # image index digest (arm64 host で arm64 manifest に解決)。
     # cfgfix = numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
-    #   GrootConfig type discriminator strip (base registry 経由ロード)。
+    #   GrootConfig + FurnitureGrootRuntimeConfig type strip (base registry) + GPU overhead env 化。
     # build 時 from_numpy bridge assert 両 env 通過済。
-    digest: "sha256:5834bcbc5e76813c5ed8dd62cc7048fda90b3302f49c8451a39d8e278f94894d"
+    digest: "sha256:6d6ba6f9661491ac8825b94418d1e1c62df76fc8bb468861db7aaa1a63c2743f"
     base_image: "nvcr.io/nvidia/pytorch:25.12-py3"   # numpy 2.x ABI torch (25.08 は numpy 1.x で from_numpy が壊れる)
     # image ENV 既定は pick 単体 (RAMEN_POLICY=groot_pick_real)。run 時 env で切替:
     #   - full orchestrator (推奨、perception[YOLO]+dwell で skill 自動遷移=「一通り全部」):
