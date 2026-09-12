@@ -16,7 +16,8 @@ images:
     repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260912-groot-orch-fkfix"
     # image index digest (arm64 host で arm64 manifest に解決)。
     # cfgfix = numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
-    #   GrootConfig + FurnitureGrootRuntimeConfig type strip (base registry) + GPU overhead env 化。
+    #   GrootConfig + FurnitureGrootRuntimeConfig type strip (base registry) + GPU overhead env 化
+    #   + 53D FK を CWD 非依存 path (assets/) に修正 (全 53D skill 起動可)。
     # build 時 from_numpy bridge assert 両 env 通過済。
     digest: "sha256:eeeeef583e1b47b7fa6a9db649ab43de88a43b4aea68372ade3811a6b1301f1a"
     base_image: "nvcr.io/nvidia/pytorch:25.12-py3"   # numpy 2.x ABI torch (25.08 は numpy 1.x で from_numpy が壊れる)
