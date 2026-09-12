@@ -176,7 +176,13 @@ class Groot53Backend(InferenceBackend):
         from inference.desktop.lower_policy.policies.groot import (  # noqa: E402
             build_state_from_raw,
         )
-        from inference.desktop.perception.g1_urdf_fk import G1WristFK  # noqa: E402
+        # NOTE: G1WristFK は module-level import (policy.py 冒頭) の
+        # components/ramen/g1_urdf_fk.py を使う。vendored copy
+        # (inference.desktop.perception.g1_urdf_fk) は DEFAULT_URDF_PATH が
+        # "inference/orin/.../*.urdf" のハードコード相対 path で、container の CWD
+        # (/app) から解決できず FileNotFoundError で全 53D skill が起動失敗する
+        # (IAC eval 指摘)。top-level 版は assets/ を __file__ 相対で持ち CWD 非依存。
+        # 両者の compute_ee_state は数値一致 (20 random q で max diff 0.0) を確認済。
 
         self._CameraKey = CameraKey
         self._Observation = Observation
