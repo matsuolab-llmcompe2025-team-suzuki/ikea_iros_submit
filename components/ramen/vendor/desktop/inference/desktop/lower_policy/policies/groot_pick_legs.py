@@ -239,18 +239,42 @@ class _PickLegsWorkerClient:
             send_message,
         )
 
+        import shutil
+
         repo_root = Path(__file__).resolve().parents[4]
+        # VENDOR PATCH (Team RAMEN、boundary container 用): vendor tree では
+        # components/ramen/vendor/{desktop,model} と desktop/ が 1 段挟まるので、
+        # parents[4] は vendor/desktop を指す。その下にも
+        # model/subtask_policy_training/ はあるが gr00t/ ライブラリだけで
+        # deployment/ を持たないため、directory の有無では判別できない。
+        # worker script 自体を持つ方を root にする (本 repo では parents[4] が
+        # そのまま repo root なので素通りする)。
+        worker_rel = (
+            "model/subtask_policy_training/deployment/real_groot_n17_worker.py"
+        )
+        if (
+            not (repo_root / worker_rel).is_file()
+            and (repo_root.parent / worker_rel).is_file()
+        ):
+            repo_root = repo_root.parent
         checkpoint = self._resolve_checkpoint(repo_root, cfg)
         model_repo_id, model_revision = self._parse_ref(cfg)
-        worker_python = repo_root / "model/subtask_policy_training/.venv/bin/python"
-        worker_script = (
-            repo_root
-            / "model/subtask_policy_training/deployment/real_groot_n17_worker.py"
+        # VENDOR PATCH: worker interpreter は RAMEN_WORKER_PYTHON (container では
+        # lerobot 0.6.0 を持つ system python3)。dev の .venv は fallback に回す。
+        worker_python_env = (os.environ.get("RAMEN_WORKER_PYTHON") or "").strip()
+        if worker_python_env and not Path(worker_python_env).is_file():
+            worker_python_env = shutil.which(worker_python_env) or ""
+        worker_python = (
+            Path(worker_python_env)
+            if worker_python_env
+            else repo_root / "model/subtask_policy_training/.venv/bin/python"
         )
+        worker_script = repo_root / worker_rel
         if not worker_python.is_file() or not worker_script.is_file():
             raise FileNotFoundError(
                 "pick-leg GR00T worker runtime is incomplete: "
-                f"python={worker_python} script={worker_script}"
+                f"python={worker_python} script={worker_script} "
+                "(set RAMEN_WORKER_PYTHON to a lerobot[groot] interpreter)"
             )
         command = [
             str(worker_python),
