@@ -13,40 +13,38 @@ platform: linux/arm64
 images:
   thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-boundary-stagefix"
-    # image index digest (arm64 host で arm64 manifest に解決)。
-    #   linux/arm64 manifest = sha256:d59ed6131a080e09169527dffe6df9dccddbae9d442236e1dfaa53dfa7ebf66b
     #
-    # boundary-stagefix (2026-09-20、Issue #1) = 旧 20260912-groot-orch-fkfix からの変更:
-    #   1. components/ramen/vendor/desktop/ を iros_2026_ramen@5ee6b20 へ全面同期
-    #      (77 files。約 3 週間のドリフト解消。YOLO warmup 欠落の修正 = 初回推論 1.8s が
-    #       CAMERA_STALE_TIMEOUT_S=0.5 を超えて毎回 safety-stop していたバグを含む)
+    # 🔴 **この digest は 2 系統の修正が合流する前のもの (main 由来 = eeorigin)。**
+    #    両方入りの image を焼いたら必ず差し替えること。下の「合流待ち」を参照。
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-groot-orch-eeorigin"
+    digest: "sha256:53253f61b947633ef6c4e9071fb37572d61a6bc4e84430c4955c2263b830425f"
+    #   linux/arm64 manifest = sha256:0e3125a64367281df6447ad228a4d853de28436c8df513865a9415be2458276a
+    #
+    # --- eeorigin (main、#128) に入っているもの -------------------------------
+    #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
+    #   GrootConfig / FurnitureGrootRuntimeConfig type strip (base registry) +
+    #   GPU overhead env 化 + 53D FK を CWD 非依存 path (assets/) に修正 +
+    #   **publish EE を wrist_yaw_link 原点 (zero tool offset) に修正**
+    #   (運営 IK は zero offset 固定 = WBC_RUNBOOK §3。pick の IK 残差 60x の原因だった)
+    #
+    # --- boundary-stagefix (この branch、#1) に入っているもの -------------------
+    #   1. components/ramen/vendor/desktop/ を iros_2026_ramen へ全面同期 (77 files、
+    #      約 3 週間のドリフト解消)。YOLO warmup 欠落の修正 = 初回推論 1.8s が
+    #      CAMERA_STALE_TIMEOUT_S=0.5 を超えて毎回 safety-stop していたバグを含む
     #   2. 自前経路 (inference/desktop/entrypoint.py) を image に同梱
-    #   3. CycloneDDS 0.10.2 + unitree_sdk2py@65691c8 を同梱 (自前経路の rt/arm_sdk / LocoClient 用)
+    #   3. CycloneDDS 0.10.2 + unitree_sdk2py@65691c8 を同梱 (rt/arm_sdk / LocoClient 用)
     #   4. base を index digest で pin (可変 tag の入れ替わり防止)
-    #   5. **--action-sink boundary で stage 1-4 が起動できなかったバグの修正**。
-    #      _require_real_waist_and_hand が無条件に --use-real-waist を要求する一方、
-    #      boundary はそれを排他で禁止していたため、pick / insert / screw を含む
-    #      stage が丸ごと起動できなかった。boundary では腰も (T,25) の torso 列で
-    #      渡す (指令が無ければ実測値で埋まる) ので要求ごと外した。
-    #      併せて boundary では --synthetic-hand-state を必須にした。無いと
-    #      hand actuator が skill ごとに別 instance になり、グリッパ指令が
-    #      **エラーも出さずに** (T,25) へ届かなくなる。
+    #   5. --action-sink boundary で stage 1-4 が起動できなかったバグの修正
+    #      (グリッパを使う stage が丸ごと取れない状態だった)
+    #   6. RAMEN_POLICY=groot_orchestrator が DeferredPolicy の signature 変更で
+    #      起動不能だったのを修正 (manifest が「推奨」と書いている経路)
     #
-    # 一つ前の tag 20260920-vendorsync-sdk には 5 が入っていない (グリッパを使う
-    # stage が起動しない)。誤って pull しないこと。
-    #
-    # build 時 assert 通過: torch 2.7-2.11 / numpy==2.2.6 / from_numpy bridge (両 env) /
-    #   lerobot 0.6.0 (main) / 0.6.1 (venv-groot53) / cyclonedds 0.10.2 /
-    #   LOCO_SERVICE_NAME=="sport" / CRC() 初期化。
-    # image 内検証 (2026-09-20): conformance.py --lane decoupled が
-    #   RAMEN_POLICY=stub / groot_pick の両方で PASS (40 accepted / 0 rejected)。
-    #   boundary + stage 1 / boundary + 連続 run 0..4 が起動できることを image 内で確認。
-    digest: "sha256:d38b5f8ad9281893e4d6ef7759d024bb817375b4d8d95a2d9150e1aa188df48f"
-    # numpy 2.x ABI torch (25.08 は numpy 1.x で from_numpy が壊れる)。
-    # 可変 tag なので Dockerfile では index digest で pin している (2026-09-20 解決)。
+    # ⚠️ **合流待ち**: 上の 2 系統はまだ同じ image に入っていない。
+    #    20260920-groot-orch-eeorigin には 1-6 が無く、
+    #    20260920-boundary-stagefix には EE 原点修正が無い。
+    #    この merge 後に両方入りを 1 本焼いて、repo_tag / digest をそこへ向けること。
     base_image: "nvcr.io/nvidia/pytorch@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8"
-    base_image_tag: "nvcr.io/nvidia/pytorch:25.12-py3"
+    base_image_tag: "nvcr.io/nvidia/pytorch:25.12-py3"   # numpy 2.x ABI torch
     # image ENV 既定は pick 単体 (RAMEN_POLICY=groot_pick_real)。run 時 env で切替:
     #   - full orchestrator (推奨、perception[YOLO]+dwell で skill 自動遷移=「一通り全部」):
     #       -e RAMEN_POLICY=groot_orchestrator -e HF_TOKEN=<token>
