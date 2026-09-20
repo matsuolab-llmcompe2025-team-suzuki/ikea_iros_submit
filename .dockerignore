@@ -1,0 +1,29 @@
+# docker/Dockerfile.* は `COPY . ./` で repo を丸ごと image に焼く。
+# ここに書いたものは image に入らない。
+#
+# 注意: build context は **git ではなく working directory** なので、.gitignore で
+# 無視されているだけのファイルも放っておくと image に入る。両方で弾く。
+
+# git 履歴を image に持ち込まない (提出物なので不要。commit のたびに層が変わるのも避ける)
+.git
+.gitignore
+.dockerignore
+
+# ローカルで生成されたバイトコード。ホスト (macOS) の Python で作られたものが
+# 混ざるだけで益が無い。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 資格情報・ローカル環境。**公開 image に焼かない**。
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# エディタ / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

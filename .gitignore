@@ -6,6 +6,11 @@ __pycache__/
 venv/
 env/
 
+# 資格情報。この repo は提出物として公開され image にも焼かれるので絶対に入れない
+# (NGC / HF / GHCR の鍵は docker login と -e HF_TOKEN で渡す。.dockerignore にも同じ記述あり)
+.env
+.env.*
+
 # Teams put model weights here; they must never reach the repo
 *.pt
 *.pth

@@ -110,9 +110,15 @@ PY
 #   自前経路 : 歩行 (Stage 0 = +2点) と腕。運営 IK を通らないので EE frame 問題が無い
 #   大会経路 : グリッパが動く唯一の経路 ((T,25) の [0:2]/[2:4] を運営 adapter が relay)
 
-# 1) CycloneDDS C ライブラリ。python binding の cyclonedds 0.10.2 は wheel が無く、
-#    CYCLONEDDS_HOME を見て libddsc にリンクする形で source build される。
-ARG CYCLONEDDS_REF=releases/0.10.x
+# 1) CycloneDDS C ライブラリ。python binding の cyclonedds 0.10.2 は
+#    linux/aarch64 wheel が存在せず (wheel は cp310 まで)、CYCLONEDDS_HOME を見て
+#    libddsc にリンクする形で sdist から source build される。
+#    → 2026-09-20 に base (Python 3.12.3 / aarch64) 上で単体検証済み:
+#      cyclonedds-0.10.2-cp312-cp312-linux_aarch64.whl の生成に成功。
+#
+#    ⚠️ branch ではなく **tag で pin** する。releases/0.10.x の先端は 0.10.5 で、
+#    binding (0.10.2) と版がずれる。同版に揃えておく。
+ARG CYCLONEDDS_REF=0.10.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git cmake build-essential \
     && rm -rf /var/lib/apt/lists/* \
