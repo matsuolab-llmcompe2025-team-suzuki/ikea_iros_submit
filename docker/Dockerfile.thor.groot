@@ -34,7 +34,14 @@
 # する (IAC eval 指摘、実 weight load 時のみ発現)。25.12 は numpy 2.1.0 同梱 + torch 2.10 が
 # numpy 2.x ABI なので bridge OK (QEMU 検証済: numpy 2.2.6 でも from_numpy 成功)。下の build 中
 # assert が bridge を毎回検証する。
-ARG BASE=nvcr.io/nvidia/pytorch:25.12-py3
+# ⚠️ tag ではなく **index digest で pin** する。`25.12-py3` は可変 tag で、NVIDIA が
+# 同じ tag を再 push すると中身が変わる。上の 25.08 の事故が「build は緑で通るのに
+# 実推論だけ壊れる」形だったので、base が黙って入れ替わる余地を残さない。
+#   tag      : nvcr.io/nvidia/pytorch:25.12-py3
+#   解決日   : 2026-09-20 (docker buildx imagetools inspect)
+#   linux/arm64 manifest: sha256:a086b7d17665c18526fd28f8d65fde91b92475289262bf419ca4b55e244709eb
+# index digest なので multi-platform のまま解決される (arm64 host なら arm64 を引く)。
+ARG BASE=nvcr.io/nvidia/pytorch@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8
 FROM ${BASE}
 
 WORKDIR /app
