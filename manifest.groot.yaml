@@ -14,10 +14,10 @@ images:
   thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
-    # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) が合流した最初の image。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-eeorigin-vendorsync"
-    digest: "sha256:0dd99a6352b2aff61ba8f16e288ece185a93b579813862ec055625eaee49bb00"
-    #   linux/arm64 manifest = sha256:ce24d003a5e856e0f6032c4a31c63341cd55f0ab0cb8608ace476bd42484f267
+    # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正入り。**
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-orch-lerobot61"
+    digest: "sha256:cdaf7a3d1da8584f7adf20470b32f686e03294ad70d07132b18ceb8d3e46a1c8"
+    #   linux/arm64 manifest = sha256:c3fb6e5f921b40325044b05798f5f26784cff1774124ac7b0799f273ccb9ca79
     #
     # --- eeorigin (main、#128) に入っているもの -------------------------------
     #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
@@ -37,6 +37,14 @@ images:
     #      (グリッパを使う stage が丸ごと取れない状態だった)
     #   6. RAMEN_POLICY=groot_orchestrator が DeferredPolicy の signature 変更で
     #      起動不能だったのを修正 (manifest が「推奨」と書いている経路)
+    #   7. **同じ経路が 53D expert を 1 つも読めなかったのを修正。**
+    #      orchestrator は 53D を server 自身の process に読むが、それは
+    #      lerobot 0.6.1 でないと config.json を draccus が弾く。image の CMD は
+    #      0.6.0 で、0.6.1 の /opt/venv-groot53 は worker にしか渡っていなかった。
+    #      → RAMEN_POLICY=groot_orchestrator のとき 0.6.1 へ os.execv で入り直す。
+    #      併せて warmup の例外握りつぶしをやめた (この不具合は起動ログ上
+    #      正常に見えていた)。RunPod の A100 80GB で実測:
+    #        修正前 DecodingError / GPU 425MiB → 修正後 policy ready / GPU 7273MiB
     #
     # 🔴 **旧 tag を誤って pull しないこと。どちらも片方を欠いている:**
     #      20260920-groot-orch-eeorigin … 上記 1-6 が無い。とくに
@@ -44,6 +52,8 @@ images:
     #        **起動しない** (manifest が「推奨」と書いている経路)。
     #        --action-sink boundary の stage 1-4 も起動しない
     #      20260920-boundary-stagefix   … EE 原点修正が無い (pick の IK 残差 60x が残る)
+    #      20260920-eeorigin-vendorsync … 上記 7 が無い
+    #        (groot_orchestrator が 53D を読めず、しかも起動したように見える)
     #
     # image 内検証 (2026-09-20、arm64 コンテナ内で実行):
     #   - 大会経路 components/ramen/g1_urdf_fk.compute_ee_transforms が
