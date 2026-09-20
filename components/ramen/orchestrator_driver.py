@@ -62,17 +62,18 @@ class OrchestratorDriver:
             sys.path.insert(0, _VENDOR_DESKTOP)
         from inference.desktop.orchestrator import Orchestrator, DEFAULT_ENTER_CHECK
         from inference.desktop.lower_policy.dispatcher import SkillDispatchLowerPolicy
+        from inference.desktop import assembly as _assembly
         from inference.desktop.lower_policy.policies.config_loader import (
-            load_policy_variant, resolve_policy_class,
+            load_policy_variant,
         )
-        from inference.desktop.lower_policy.policies.deferred import DeferredPolicy
         from inference.desktop.lower_policy.skills import vla_skill as _vla
         from inference.desktop.perception.cleaner import load_cleanup_config
         from inference.desktop.perception.stream import DetectionStream
         from inference.desktop.perception.yolo_obb import YoloObbPerception
 
         weight = self._resolve_yolo_weight(
-            yolo_weight or os.environ.get(
+            yolo_weight
+            or os.environ.get(
                 "RAMEN_YOLO_WEIGHT",
                 "/datadrive2/iros_2026_ramen/outputs/yolo_obb/weights/m_lowaug_v4_flat.pt",
             )
@@ -98,12 +99,19 @@ class OrchestratorDriver:
         cleaner = DetectionStream(load_cleanup_config())
 
         # skills (lazy DeferredPolicy + interceptor actuators)
+        #
+        # DeferredPolicy を直接組み立てず **vendor 側の assembly.load_policy を通す**。
+        # Issue #141 で DeferredPolicy の signature が変わり
+        # (policy_cls, policy_config, label=...) → (policy_cls, *, label, loader)
+        # ここが追従できずに TypeError で起動不能になっていた
+        # (2026-09-20、RAMEN_POLICY=groot_orchestrator が丸ごと死んでいた)。
+        # 公開 API を通せば同じ事故が再発しないうえ、load 直後の warmup も付く
+        # (付けないと skill 切替の初回 forward をロボットが動いている最中に払う)。
         registry = {}
         for skill_name, cls_name, variant in _STAGE_SKILLS:
             entry = load_policy_variant(cfg_path, variant)
-            policy = DeferredPolicy(
-                resolve_policy_class(entry.policy_type), entry.policy_config,
-                label=f"{skill_name}:{variant}",
+            policy = _assembly.load_policy(
+                entry, deferred=True, label=f"{skill_name}:{variant}"
             )
             VlaCls = getattr(_vla, cls_name)
             registry[skill_name] = VlaCls(
@@ -120,7 +128,9 @@ class OrchestratorDriver:
         enter_check = {c: DEFAULT_ENTER_CHECK[c] for c in _candidates}
 
         self._orch = Orchestrator(
-            perception, cleaner, dispatcher,
+            perception,
+            cleaner,
+            dispatcher,
             initial_skill="rotate_table_base",
             transitions=_TRANSITIONS,
             enter_check=enter_check,
@@ -129,7 +139,7 @@ class OrchestratorDriver:
             dex1_state_source=self._dex1_src,
             wrist_left_source=self._wrist_l,
             wrist_right_source=self._wrist_r,
-            head_perception_view="left",   # boundary は単一 head を packed で複製
+            head_perception_view="left",  # boundary は単一 head を packed で複製
         )
 
     @staticmethod
@@ -142,15 +152,17 @@ class OrchestratorDriver:
         if os.path.isfile(ref):
             return ref
         if "/" not in ref:
-            return ref   # そのまま (存在しなければ後段で error)
+            return ref  # そのまま (存在しなければ後段で error)
         from huggingface_hub import snapshot_download
 
         repo_id, revision = ref, None
         if "@" in ref:
             repo_id, revision = ref.rsplit("@", 1)
-        snap = Path(snapshot_download(
-            repo_id=repo_id, revision=revision, allow_patterns=("*.pt",)
-        ))
+        snap = Path(
+            snapshot_download(
+                repo_id=repo_id, revision=revision, allow_patterns=("*.pt",)
+            )
+        )
         # snapshot は repo の nested 構造を保持する (weight は runs/.../weights/best.pt に居る)。
         # Path.glob("*.pt") は非再帰で top-level しか見ず空になるので recursive glob を使う。
         pts = sorted(snap.glob("**/*.pt"))
@@ -166,21 +178,31 @@ class OrchestratorDriver:
         ego = images.get("ego_view")
         head_bgr = (
             np.ascontiguousarray(np.asarray(ego, np.uint8)[:, :, ::-1])
-            if ego is not None else np.zeros((480, 640, 3), np.uint8)
+            if ego is not None
+            else np.zeros((480, 640, 3), np.uint8)
         )
         frame = build_frame_data(head_bgr, t=self._t, packed_stereo=True)
 
         def _bgr(key):
             im = images.get(key)
-            return (np.ascontiguousarray(np.asarray(im, np.uint8)[:, :, ::-1])
-                    if im is not None else np.zeros((480, 640, 3), np.uint8))
+            return (
+                np.ascontiguousarray(np.asarray(im, np.uint8)[:, :, ::-1])
+                if im is not None
+                else np.zeros((480, 640, 3), np.uint8)
+            )
+
         self._wrist_l.update(_bgr("left_wrist"), t=self._t)
         self._wrist_r.update(_bgr("right_wrist"), t=self._t)
 
-        self._arm.reset(); self._waist.reset(); self._hand.reset()
+        self._arm.reset()
+        self._waist.reset()
+        self._hand.reset()
         result = self._orch.tick(frame)
-        arms14 = result.action if (result is not None and result.action is not None) \
+        arms14 = (
+            result.action
+            if (result is not None and result.action is not None)
             else self._arm.last
+        )
         if arms14 is None:
             # buffer 充填中など: 現在姿勢保持で (T,25)
             arms14 = body_q[15:29]
@@ -188,12 +210,14 @@ class OrchestratorDriver:
 
         body29 = np.concatenate([body_q[:12], step19[0:3], step19[3:17]])
         root = np.array([0, 0, 0.70, 1, 0, 0, 0], dtype=np.float64)
-        action38 = np.concatenate([root, body29, step19[17:19]])[None, :]   # (1,38)
+        action38 = np.concatenate([root, body29, step19[17:19]])[None, :]  # (1,38)
         actions = groot_chunk_to_taskspace(
             action38, self._fk, ee_frame_transform=self._ee_frame_transform
         )
-        return {"actions": actions, "current_skill":
-                getattr(result, "current_skill", None) if result else None}
+        return {
+            "actions": actions,
+            "current_skill": getattr(result, "current_skill", None) if result else None,
+        }
 
     def reset(self) -> None:
         self._t = 0
