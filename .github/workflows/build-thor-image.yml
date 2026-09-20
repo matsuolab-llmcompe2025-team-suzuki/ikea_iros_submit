@@ -18,6 +18,13 @@
 name: build thor image
 
 on:
+  # ⚠️ workflow_dispatch は **default branch (main) にファイルが無いと呼べない**。
+  # main は提出まわりが全部終わってから PR で 1 本にする方針なので、それまでは
+  # この branch への push でも起動できるようにしておく (path を絞って暴発を防ぐ)。
+  # main に入ったらこの push trigger は落としてよい。
+  push:
+    branches: [issue/1-vendor-sync-and-sdk-layer]
+    paths: [.github/workflows/build-thor-image.yml]
   workflow_dispatch:
     inputs:
       tag:
@@ -57,7 +64,7 @@ jobs:
             | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: ghcr.io にログイン
-        if: inputs.push
+        if: ${{ inputs.push == true }}
         run: |
           echo '${{ secrets.GHCR_PAT }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
@@ -69,12 +76,13 @@ jobs:
           context: .
           file: docker/Dockerfile.thor.groot
           platforms: linux/arm64
-          push: ${{ inputs.push }}
-          tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ inputs.tag }}
+          # push 起動 (inputs 空) では **ビルドのみ**。GHCR を汚さない。
+          push: ${{ inputs.push == true }}
+          tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ inputs.tag || 'ci-dryrun' }}
           provenance: false # 提出物の manifest を素の index に保つ
 
       - name: digest を記録 (manifest.groot.yaml に書く値)
-        if: inputs.push
+        if: ${{ inputs.push == true }}
         run: |
           {
             echo "## 提出 manifest に記入する値"
