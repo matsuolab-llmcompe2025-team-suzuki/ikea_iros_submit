@@ -161,6 +161,22 @@ target.write_text("/opt/unitree_sdk2_python\n")
 print("[build] wrote", target)
 PY
 
+# 3) unitree の interface 指定 config から <Tracing> を落とす。
+#
+#    cyclonedds 0.10.2 は `<Tracing><Verbosity>config</Verbosity></Tracing>` を
+#    含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって
+#    `*** buffer overflow detected ***` で **core dump** する
+#    (この image の中で実測、2026-09-21)。unitree の ChannelConfigHasInterface は
+#    必ずこの block を持つので `ChannelFactoryInitialize(0, <interface>)` が全滅
+#    = **自前経路 (entrypoint.py) が起動できない** (Stage 0 の歩行 = +2点 を含む)。
+#
+#    interface を渡さない ChannelConfigAutoDetermine は元から Tracing を持たず
+#    落ちない。これが「interface を渡したときだけ落ちる」理由で、素の import や
+#    DomainParticipant(0) では露見しない。
+#    Tracing は /tmp/cdds.LOG への診断出力なので、落としても通信に影響しない。
+COPY tools/patch_unitree_tracing.py /tmp/patch_unitree_tracing.py
+RUN python3 /tmp/patch_unitree_tracing.py && rm /tmp/patch_unitree_tracing.py
+
 RUN python3 - <<'PY'
 from importlib.metadata import version
 
@@ -174,8 +190,17 @@ from unitree_sdk2py.utils.crc import CRC
 assert LOCO_SERVICE_NAME == "sport", LOCO_SERVICE_NAME
 assert version("cyclonedds") == "0.10.2", version("cyclonedds")
 CRC()  # crc_aarch64.so が無いとここで落ちる (find_packages 取りこぼしの検出)
+
+# ⚠️ **interface を渡した初期化まで実際にやる。** import や DomainParticipant(0) は
+# 通るのに `ChannelFactoryInitialize(0, <iface>)` だけが core dump する、という形の
+# 事故を踏んだ (cyclonedds 0.10.2 + Tracing block)。自前経路はこの呼び出しから
+# 始まるので、ここが通らないと歩行も腕も動かない。
+# lo は build container にも必ずあるので CI で検証できる。
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+ChannelFactoryInitialize(0, "lo")
+
 print("[build] cyclonedds", version("cyclonedds"),
-      "| unitree_sdk2py OK (service=sport, CRC ok)")
+      "| unitree_sdk2py OK (service=sport, CRC ok, iface init ok)")
 PY
 
 RUN /opt/venv-groot53/bin/python - <<'PY'
