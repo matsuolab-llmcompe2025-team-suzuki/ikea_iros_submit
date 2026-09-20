@@ -1,0 +1,61 @@
+### GITHUB_TOKEN だけで ghcr.io に push できるかを測る **使い捨て probe**。
+#
+# なぜ要るか:
+#   org の "default workflow permissions" は read に固定されていて、
+#   repo 側から write へ上げようとすると org policy に 409 で弾かれる。
+#   ただし **workflow 側で permissions: packages: write を明示した場合に
+#   通るかどうか**は別問題で、試さないと分からない。
+#
+#   通れば PAT を 1 つも増やさずに済む。通らなければ write:packages **だけ** の
+#   PAT を発行して secret に入れる (今ある広すぎる PAT は使わない)。
+#
+# 測り終わったらこの workflow は消す。
+
+name: probe ghcr push
+
+on:
+  push:
+    branches: [issue/1-vendor-sync-and-sdk-layer]
+    paths: [.github/workflows/probe-ghcr-push.yml]
+  workflow_dispatch:
+
+# org 既定は read。ここで明示的に上げられるかがこの probe の主題。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: GITHUB_TOKEN で ghcr.io にログイン
+        run: |
+          echo '${{ secrets.GITHUB_TOKEN }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: 極小の image を既存 package へ push
+        run: |
+          # 提出物の ikea-thor package に、捨て tag を 1 つ足せるかを見る。
+          # 中身は数KBの scratch なので、失敗しても何も壊れない。
+          TAG=ghcr.io/${{ github.repository_owner }}/ikea-thor:ci-push-probe
+          printf 'FROM scratch\nCOPY README.md /\n' > /tmp/Dockerfile.probe
+          docker build -f /tmp/Dockerfile.probe -t "$TAG" .
+          docker push "$TAG"
+          echo "✅ GITHUB_TOKEN だけで push できた。PAT は不要。" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 捨て tag を消す
+        if: always()
+        run: |
+          # package version を API で消す。消せなくても probe の結論は変わらない。
+          gh api --method GET \
+            "/orgs/${{ github.repository_owner }}/packages/container/ikea-thor/versions" \
+            --jq '.[] | select(.metadata.container.tags[]? == "ci-push-probe") | .id' \
+          | while read -r id; do
+              gh api --method DELETE \
+                "/orgs/${{ github.repository_owner }}/packages/container/ikea-thor/versions/$id" \
+                && echo "削除: version $id"
+            done || echo "削除できず (手で消すこと: ci-push-probe)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
