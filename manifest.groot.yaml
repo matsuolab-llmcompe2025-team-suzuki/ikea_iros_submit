@@ -5,7 +5,8 @@
 #
 # ⚠️ thor image は private (新規 GHCR package)。運営アカウントに read 権限付与が必要
 #    (既存 ikea-thor/ikea-orin と同じ手続き = onboarding Finding 2)。
-# ⚠️ 実 Thor での実行 (server ready + conformance + (T,25)) は未検証。arm64 build のみ検証済。
+# ⚠️ 実 Thor (sm_110) での実行は未検証。arm64 build と、**同一 Dockerfile の amd64 image を
+#    A100 80GB の pod に載せた実行検証**まで済んでいる (下の「実 image 検証」を参照)。
 
 lane: decoupled
 platform: linux/arm64
@@ -14,10 +15,11 @@ images:
   thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
-    # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-orch-lerobot61"
-    digest: "sha256:cdaf7a3d1da8584f7adf20470b32f686e03294ad70d07132b18ceb8d3e46a1c8"
-    #   linux/arm64 manifest = sha256:c3fb6e5f921b40325044b05798f5f26784cff1774124ac7b0799f273ccb9ca79
+    # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-pickfix-unbuffered"
+    digest: "sha256:c2f517bf670b0a9a10afad0df9a49a3ab3ecd9c3bcd77931632791a5d72ec1d2"
+    #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
+    #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
     # --- eeorigin (main、#128) に入っているもの -------------------------------
     #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
@@ -46,7 +48,32 @@ images:
     #      正常に見えていた)。RunPod の A100 80GB で実測:
     #        修正前 DecodingError / GPU 425MiB → 修正後 policy ready / GPU 7273MiB
     #
-    # 🔴 **旧 tag を誤って pull しないこと。どちらも片方を欠いている:**
+    #   8. **pick_table_leg (Stage 1 の先頭) が container で必ず落ちていたのを修正。**
+    #      vendor tree は components/ramen/vendor/{desktop,model} で desktop/ が 1 段
+    #      挟まるため、上流 groot_pick_legs.py の repo_root = parents[4] が
+    #      vendor/desktop を指し worker script を見失う。さらに worker interpreter が
+    #      dev 専用の model/subtask_policy_training/.venv/bin/python 決め打ちで、
+    #      .dockerignore が .venv/ を除外しているため image には存在し得ない。
+    #      どちらも fallback 無しの FileNotFoundError。DeferredPolicy は skill 開始時に
+    #      初めて load するので、rotate_table_base が通った後に落ちる = 起動ログ上は
+    #      正常に見える。→ worker script の実在で repo root を選び、interpreter は
+    #      RAMEN_WORKER_PYTHON を見る (tools/vendor_patches.py の 2 本目)
+    #   9. **os.execv が -u を落として `listening` 行が出なかったのを修正。**
+    #      stdout が block buffer になり
+    #        [serve] policy server listening on ws://0.0.0.0:8765
+    #      が出ない。会場手順は「この行が出るまで client を繋ぐな」なので、
+    #      先に繋ぐと accept が near-zero になり、しかも症状が「Thor を PC2 より
+    #      先に起動した」場合と同じで切り分けできない。re-exec するのは
+    #      RAMEN_POLICY=groot_orchestrator = 大会当日の構成だけなので会場でだけ踏む
+    #
+    # build 時に worker の起動可能性を assert するようにした (image が緑なのに会場で
+    # worker だけ落ちる形を build で止める):
+    #   [build] pick worker OK (lerobot 0.6.0 + accelerate + safetensors)
+    #   [build] 53D worker OK (lerobot 0.6.1 env から -m で起動できる)
+    #   [build] orchestrator pick worker OK
+    #
+    # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
+    #      20260920-orch-lerobot61      … 上記 8-9 が無い。**pick_table_leg が必ず落ちる**
     #      20260920-groot-orch-eeorigin … 上記 1-6 が無い。とくに
     #        RAMEN_POLICY=groot_orchestrator が DeferredPolicy の TypeError で
     #        **起動しない** (manifest が「推奨」と書いている経路)。
@@ -54,6 +81,18 @@ images:
     #      20260920-boundary-stagefix   … EE 原点修正が無い (pick の IK 残差 60x が残る)
     #      20260920-eeorigin-vendorsync … 上記 7 が無い
     #        (groot_orchestrator が 53D を読めず、しかも起動したように見える)
+    #
+    # 実 image 検証 (2026-09-20、同一 Dockerfile の amd64 image を RunPod A100 80GB の
+    # pod の image にして実行。venv 再現ではなく image そのもの):
+    #   - orchestrator の 4 expert が全て load + forward
+    #       pick_table_leg        groot_pick_legs_v2     load 24.7s / 3 tick / (16,19) finite
+    #       insert_table_leg      groot_insert_leg_200k  92s / 3 tick finite
+    #       rotate_leg_to_tighten groot_rotate_leg_200k  69s / 3 tick finite
+    #       rotate_table_base     groot_overlay          load 64.6s + first forward
+    #         ※ tick は「overlay はダミー画像を拒否」で止まる = 仕様
+    #   - OrchestratorDriver が valid (T,25) を出す (skill=rotate_table_base)
+    #   - RAMEN_POLICY=groot_orchestrator が listening まで到達 (約 2 分)
+    #   - 53D 推論時 GPU 5.9GiB (tensor-streamed load)
     #
     # image 内検証 (2026-09-20、arm64 コンテナ内で実行):
     #   - 大会経路 components/ramen/g1_urdf_fk.compute_ee_transforms が
