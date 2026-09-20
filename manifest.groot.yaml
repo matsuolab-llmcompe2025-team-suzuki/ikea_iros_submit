@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-pickfix-unbuffered"
-    digest: "sha256:c2f517bf670b0a9a10afad0df9a49a3ab3ecd9c3bcd77931632791a5d72ec1d2"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-orch-seedfix"
+    digest: "sha256:558de3f6e5339720e8150aefa4e66cf869456000a5814352a629dbd8c743b178"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -72,8 +72,25 @@ images:
     #   [build] 53D worker OK (lerobot 0.6.1 env から -m で起動できる)
     #   [build] orchestrator pick worker OK
     #
+    #  10. 🔴 **orchestrator が rotate_table_base から永久に出られなかったのを修正。**
+    #      `enter_pick_table_leg` は `state.base_rotation_start_table_top_verts` が
+    #      None なら必ず False を返す。この基準は `state.transition()` の ctx 経由
+    #      でしか入らないが、`rotate_table_base` が **initial_skill** のときの
+    #      auto start は `dispatcher.start()` を直接呼ぶので transition を通らない。
+    #      boundary の OrchestratorDriver は initial_skill="rotate_table_base" なので
+    #      **大会経路そのものが該当**し、Stage 1 の 1 skill 目から先へ進めなかった。
+    #      → ring が満ちた最初の tick で基準を 1 度だけ seed する
+    #  11. 🔴 **RAMEN_POLICY=groot_53d_real が 53D を読めなかったのを修正。**
+    #      #7 と同じ原因 (親が lerobot 0.6.0) だが re-exec の条件が
+    #      groot_orchestrator だけで 53D 単体経路が漏れていた。
+    #      **flip_table (Stage 5 の唯一の skill) はこの経路でしか動かせない**。
+    #      pick(38D) は worker を別 process に出すので踏まない = pick だけ試しても
+    #      気付けなかった
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260920-orch-lerobot61      … 上記 8-9 が無い。**pick_table_leg が必ず落ちる**
+    #      20260920-pickfix-unbuffered  … 上記 10-11 が無い。**orchestrator が
+    #        rotate_table_base から進めず、flip も起動しない**
+    #      20260920-orch-lerobot61      … 上記 8-11 が無い。**pick_table_leg が必ず落ちる**
     #      20260920-groot-orch-eeorigin … 上記 1-6 が無い。とくに
     #        RAMEN_POLICY=groot_orchestrator が DeferredPolicy の TypeError で
     #        **起動しない** (manifest が「推奨」と書いている経路)。
@@ -93,6 +110,26 @@ images:
     #   - OrchestratorDriver が valid (T,25) を出す (skill=rotate_table_base)
     #   - RAMEN_POLICY=groot_orchestrator が listening まで到達 (約 2 分)
     #   - 53D 推論時 GPU 5.9GiB (tensor-streamed load)
+    #
+    # 実シーン 1 枚 (outputs/yolo_smoke_20260920/frame_raw.jpg) を回しながら
+    # OrchestratorDriver を 40 tick 駆動 (2026-09-21):
+    #   - seeded base rotation reference → tick 10 (25°) で
+    #     `fire transition: rotate_table_base -> pick_table_leg`
+    #   - 遷移先の expert が DeferredPolicy として skill 開始時に load される所まで確認
+    #   - 38/40 tick で valid (T,25)
+    #   ※ insert 以降は手の接触 signal が要る (enter_insert_table_leg) ので、
+    #     手が写っていない静止シーンでは発火しない。配線の確認であって
+    #     推論品質の検証ではない。
+    #
+    # 運営 harness 相当 (mock_orin + server + client + mock_wbc、2026-09-21):
+    #   - groot_pick_real                      40 accepted / 0 rejected
+    #   - groot_53d_real + flip                40 accepted / 0 rejected (T=14〜16、age 0.012s)
+    #   - groot_orchestrator                   mock カメラに卓が無く overlay が拒否
+    #     → **conformance.py で推奨経路は検証できない**。実カメラが要る
+    # ⚠️ conformance.py は server 起動後 **2.0 秒**しか待たない (conformance.py:93)。
+    #    実 policy は listening まで 45〜60 秒かかるので、素で走らせると必ず
+    #    "0 accepted / FAIL" になる。上の結果は server を先に温めてから同じ 4 process を
+    #    組んだもの。運営 harness は無改変のまま。
     #
     # image 内検証 (2026-09-20、arm64 コンテナ内で実行):
     #   - 大会経路 components/ramen/g1_urdf_fk.compute_ee_transforms が

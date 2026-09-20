@@ -343,7 +343,26 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
             "Phase 3 stage 5 keeps waist/legs under Regular Mode; "
             "--use-real-waist is forbidden"
         )
-    if not args.use_real_hand:
+    if getattr(args, "action_sink", "sdk") == "boundary":
+        # boundary は手も `(T,25)` の hand 列で運営 WBC に渡すので SDK 直の実 hand は
+        # 使わない (併用は上の `_validate_phase3_config` が禁止している)。
+        # stage 1-4 と同じ理由で `--synthetic-hand-state` を要求する: 無いと
+        # `_build_hand_actuator` が skill ごとに別 instance を返し、`.latest` が
+        # boundary sink に届かず **グリッパ指令が黙って落ちる**。
+        #
+        # ここに例外が無いと `--stage 5 --action-sink boundary` が成立しない
+        # (boundary は --use-real-hand を禁止、stage 5 はそれを要求する)。
+        # flip は **グリッパが最も効く skill** で、会場で flip だけやり直す手段が
+        # 塞がる (`--phase3-full` 経由は `_require_real_waist_and_hand` の例外を
+        # 通るので動く。単独 stage だけが落ちていた)。
+        if not getattr(args, "synthetic_hand_state", False):
+            raise ValueError(
+                "Phase 3 stage 5 with --action-sink boundary requires"
+                " --synthetic-hand-state (otherwise each skill gets its own mock"
+                " hand actuator and the (T,25) hand columns never see the"
+                " policy's gripper commands)"
+            )
+    elif not args.use_real_hand:
         raise ValueError("Phase 3 stage 5 requires --use-real-hand")
 
 
