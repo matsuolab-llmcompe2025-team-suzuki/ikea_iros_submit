@@ -70,11 +70,21 @@ def _reexec_into_groot53_if_needed() -> None:
     if os.path.abspath(interp) == os.path.abspath(sys.executable):
         return  # 既に 0.6.1 の venv で動いている
     os.environ["RAMEN_SERVER_REEXECED"] = "1"
+    # ⚠️ image の CMD は `python3 -u` だが、exec し直すと **-u が落ちる**。
+    # stdout が block buffer になり
+    #     [serve] policy server listening on ws://0.0.0.0:8765
+    # が 4KB 溜まるまで出てこない。手順書 (venue_runbook §2-4b) は
+    # **この行が出るまで client を繋ぐな**と指示しており、先に繋ぐと accept rate が
+    # near-zero になる (症状が「Thor を先に起動した」場合と同じで切り分け不能)。
+    # re-exec するのは groot_orchestrator = 大会当日の構成だけなので、ここを外すと
+    # 会場でだけ踏む。-u と PYTHONUNBUFFERED の両方を効かせる
+    # (後者は spawn される worker にも伝わる)。
+    os.environ["PYTHONUNBUFFERED"] = "1"
     print(
         f"[server] re-exec into {interp} (groot_orchestrator は lerobot 0.6.1 が要る)",
         file=sys.stderr,
     )
-    os.execv(interp, [interp, os.path.abspath(__file__), *sys.argv[1:]])
+    os.execv(interp, [interp, "-u", os.path.abspath(__file__), *sys.argv[1:]])
 
 
 _reexec_into_groot53_if_needed()
