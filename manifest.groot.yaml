@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-orch-seedfix"
-    digest: "sha256:558de3f6e5339720e8150aefa4e66cf869456000a5814352a629dbd8c743b178"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-stage-dds-fix"
+    digest: "sha256:5f2d9e3aeae638a2fce288d039ebc6de1d68e11ce50716c73814827a167d0ba4"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -87,8 +87,27 @@ images:
     #      pick(38D) は worker を別 process に出すので踏まない = pick だけ試しても
     #      気付けなかった
     #
+    #  12. **`--stage 5 --action-sink boundary` が成立しなかったのを修正。**
+    #      boundary は --use-real-hand を禁止する一方、stage 5 の検証はそれを要求して
+    #      いて boundary 例外が無かった (#5 で stage 1-4 を直したときの漏れ)。
+    #      --phase3-full は別の検証関数を通るので動いており、**単独 stage だけ**が
+    #      落ちていた = 会場で flip だけやり直す手段が塞がっていた
+    #  13. 🔴 **自前経路 (entrypoint.py) が container で一切起動できなかったのを修正。**
+    #      cyclonedds 0.10.2 は `<Tracing><Verbosity>config</Verbosity></Tracing>` を
+    #      含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって
+    #      `*** buffer overflow detected ***` で **core dump** する。unitree の
+    #      ChannelConfigHasInterface は必ずこの block を持つので
+    #      `ChannelFactoryInitialize(0, <interface>)` が全滅し、--interface を必ず
+    #      渡す entrypoint は Stage 0 の歩行 (+2点) を含めて起動できなかった。
+    #      interface 指定なしの ChannelConfigAutoDetermine は Tracing を持たず
+    #      落ちないので、import / DomainParticipant(0) / CRC() だけを見ていた
+    #      従来の build assert は通り抜けていた。
+    #      → Tracing block を剥がし、build assert に
+    #        `ChannelFactoryInitialize(0, "lo")` を追加した
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260920-pickfix-unbuffered  … 上記 10-11 が無い。**orchestrator が
+    #      20260921-orch-seedfix        … 上記 12-13 が無い。**自前経路が起動しない**
+    #      20260920-pickfix-unbuffered  … 上記 10-13 が無い。**orchestrator が
     #        rotate_table_base から進めず、flip も起動しない**
     #      20260920-orch-lerobot61      … 上記 8-11 が無い。**pick_table_leg が必ず落ちる**
     #      20260920-groot-orch-eeorigin … 上記 1-6 が無い。とくに
@@ -126,6 +145,11 @@ images:
     #   - groot_53d_real + flip                40 accepted / 0 rejected (T=14〜16、age 0.012s)
     #   - groot_orchestrator                   mock カメラに卓が無く overlay が拒否
     #     → **conformance.py で推奨経路は検証できない**。実カメラが要る
+    # 自前経路の起動確認 (--interface lo、実機なしなので state 待ちで止まる、2026-09-21):
+    #   - --stage 0 / 1 / 5 いずれも --action-sink boundary --synthetic-hand-state で
+    #     起動して待機に入る (DDS 初期化を通過)
+    #   - --policy-variant-* の欠落は起動時に正しく reject される
+    #
     # ⚠️ conformance.py は server 起動後 **2.0 秒**しか待たない (conformance.py:93)。
     #    実 policy は listening まで 45〜60 秒かかるので、素で走らせると必ず
     #    "0 accepted / FAIL" になる。上の結果は server を先に温めてから同じ 4 process を
