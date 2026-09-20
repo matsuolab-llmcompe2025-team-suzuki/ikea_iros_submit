@@ -179,7 +179,27 @@ def _require_real_waist_and_hand(args: argparse.Namespace, label: str) -> None:
     実姿勢と食い違って飛ぶので、**実ハンドを使わない代わりに state を合成する**
     という運用に倒す。その場合 hand actuator は mock 固定 = グリッパには
     一切指令を出さないので、安全側に外れる。
+
+    `--action-sink boundary` はこの要求ごと外れる。腕・腰・手をまとめて `(T,25)` で
+    運営 WBC に渡すので SDK 直の実 actuator は要らない (併用は
+    `_validate_phase3_config` が禁止している)。腰は指令が無ければ実測値で埋まる。
+    **会場でグリッパを動かせるのはこの経路だけ**なので、ここを塞ぐと
+    stage 1-4 が丸ごと起動できなくなる。
     """
+
+    if getattr(args, "action_sink", "sdk") == "boundary":
+        # hand 指令は共有 mock actuator の `.latest` 経由で (T,25) の手の列に載る。
+        # `--synthetic-hand-state` が無いと `_build_hand_actuator` が skill ごとに
+        # **別 instance** を返すため、`.latest` が boundary sink に届かず
+        # **グリッパ指令が黙って落ちる** (エラーは出ない)。ここで要求しておく。
+        if not getattr(args, "synthetic_hand_state", False):
+            raise ValueError(
+                f"{label} with --action-sink boundary requires"
+                " --synthetic-hand-state (otherwise each skill gets its own mock"
+                " hand actuator and the (T,25) hand columns never see the"
+                " policy's gripper commands)"
+            )
+        return
 
     if not args.use_real_waist:
         raise ValueError(f"{label} requires --use-real-waist")
@@ -1749,7 +1769,6 @@ def main() -> None:
         if synthetic_hand_initial_rad is not None:
             # skill 共有 mock を繋いで、以降は policy の hand 指令をそのまま state に返す。
             sensors.dex1.bind_command_source(_build_hand_actuator())
-
 
         def _log_boundary_taskspace(record: dict) -> None:
             """publish した raw (T,25) を JSONL で残す。
