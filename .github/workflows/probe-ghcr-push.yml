@@ -37,10 +37,13 @@ jobs:
       - name: 極小の image を既存 package へ push
         run: |
           # 提出物の ikea-thor package に、捨て tag を 1 つ足せるかを見る。
-          # 中身は数KBの scratch なので、失敗しても何も壊れない。
+          # 中身は数バイトなので、失敗しても何も壊れない。
+          # (checkout していないので context は自前で作る)
           TAG=ghcr.io/${{ github.repository_owner }}/ikea-thor:ci-push-probe
-          printf 'FROM scratch\nCOPY README.md /\n' > /tmp/Dockerfile.probe
-          docker build -f /tmp/Dockerfile.probe -t "$TAG" .
+          mkdir -p /tmp/ctx && echo probe > /tmp/ctx/probe.txt
+          printf 'FROM scratch\nCOPY probe.txt /\n' > /tmp/ctx/Dockerfile
+          docker build -t "$TAG" /tmp/ctx
+          # login は read だけでも通るので、**push の成否**で判定する。
           docker push "$TAG"
           echo "✅ GITHUB_TOKEN だけで push できた。PAT は不要。" \
             | tee -a "$GITHUB_STEP_SUMMARY"
