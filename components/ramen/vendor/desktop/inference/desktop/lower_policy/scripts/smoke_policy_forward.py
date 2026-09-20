@@ -87,6 +87,7 @@ def _vram_snapshot() -> dict:
     """CUDA VRAM 使用量 (available なら)。"""
     try:
         import torch  # type: ignore
+
         if not torch.cuda.is_available():
             return {"available": False}
         return {
@@ -99,6 +100,21 @@ def _vram_snapshot() -> dict:
         return {"available": False, "reason": "torch import failed"}
 
 
+def _smoke_language(policy, fallback: str) -> str:
+    """smoke が送る language prompt を決める。
+
+    `groot_pick_legs` の worker は task を manifest task と **厳密一致**で検証し、
+    違えば `ValueError: task must exactly match manifest task ...` で predict が
+    全滅する。policy が既定 prompt を公開しているならそれを使う。
+
+    load-only と dry-run で別々に書いていたせいで dry-run 側だけ任意文字列を
+    送っており、正常な pick policy が FAIL に見えていた (2026-09-20、実 image 上で
+    確認)。会場でこの誤診を踏むと「pick が壊れた」と判断して時間を失うので、
+    両経路が同じ 1 箇所を通るようにする。
+    """
+    return getattr(policy, "DEFAULT_LANGUAGE_PROMPT", fallback)
+
+
 def _build_zeros_observation(policy, entry) -> Any:
     """Zero-filled Observation (state / frames / obb すべて 0)、warmup 用途。"""
     from inference.desktop.lower_policy.policies.base import Observation
@@ -109,9 +125,7 @@ def _build_zeros_observation(policy, entry) -> Any:
     state = np.zeros(policy.STATE_DIM, dtype=np.float32)
     # skill / language: variant によって使う方が異なる
     skill_id = 0  # 適当な有効 id (0..NUM_SKILLS-1)
-    # groot_pick_legs は worker が task を manifest task と厳密一致検証するので、
-    # policy が既定 prompt を持つ場合はそれを使う (それ以外は任意の smoke 文字列)。
-    language = getattr(policy, "DEFAULT_LANGUAGE_PROMPT", "smoke test")
+    language = _smoke_language(policy, "smoke test")
     return Observation(
         frames_bgr=frames,
         frames_bgr_prev=None,
@@ -216,9 +230,7 @@ def _load_captured_observation(path: Path, policy):
             current = np.asarray(payload[key])
             previous = np.asarray(payload[previous_key])
             allowed_shapes = (
-                {(480, 640, 3), (480, 848, 3)}
-                if camera.is_wrist
-                else {(480, 640, 3)}
+                {(480, 640, 3), (480, 848, 3)} if camera.is_wrist else {(480, 640, 3)}
             )
             for label, frame in ((key, current), (previous_key, previous)):
                 if (
@@ -326,7 +338,7 @@ def _run_dry_run(
     # variant 依存の skill_id / language (build_batch_dict の要求を満たすため)
     is_ramen_ori = entry.policy_type == "ramen_ori"
     skill_id = 0 if is_ramen_ori else None
-    language = None if is_ramen_ori else "smoke dry-run"
+    language = None if is_ramen_ori else _smoke_language(policy, "smoke dry-run")
 
     H, W = 480, 640
 
@@ -340,7 +352,8 @@ def _run_dry_run(
             snap = src.get()
             jp = (
                 np.asarray(snap.position, dtype=np.float32)
-                if snap is not None and snap.position is not None
+                if snap is not None
+                and snap.position is not None
                 and len(snap.position) == 29
                 else np.zeros(29, dtype=np.float32)
             )
@@ -394,7 +407,9 @@ def _run_dry_run(
             latencies_ms.append(action.latency_ms)
             tick_ok_count += 1
         except Exception as e:
-            print(f"[tick {i}] predict failed: {type(e).__name__}: {e}", file=sys.stderr)
+            print(
+                f"[tick {i}] predict failed: {type(e).__name__}: {e}", file=sys.stderr
+            )
 
         # buffer update (次 tick が使う)
         if captured_state is None:
@@ -429,7 +444,11 @@ def _run_dry_run(
         mean_step_diff = None
 
     latencies_sorted = sorted(latencies_ms)
-    p95 = latencies_sorted[int(len(latencies_sorted) * 0.95)] if latencies_sorted else None
+    p95 = (
+        latencies_sorted[int(len(latencies_sorted) * 0.95)]
+        if latencies_sorted
+        else None
+    )
 
     # The 19-D actuator contract is waist(3), arms(14), Dex1(2).  Reporting
     # only a global min/max can hide an unsafe waist target behind otherwise
@@ -478,9 +497,12 @@ def _run_dry_run(
         },
         "real_state_used": captured_state is not None or not no_real_state,
         "state_source": (
-            "captured_observation_npz" if captured_frames is not None
-            else "captured_json" if captured_state is not None
-            else "live_dds" if not no_real_state
+            "captured_observation_npz"
+            if captured_frames is not None
+            else "captured_json"
+            if captured_state is not None
+            else "live_dds"
+            if not no_real_state
             else "zeros"
         ),
         "camera_input": (
@@ -508,38 +530,52 @@ def main() -> int:
         description="Real ckpt load + dry-run forward smoke (Issue #125 Phase 1.9 / 1.10)."
     )
     parser.add_argument(
-        "--variant", required=True,
+        "--variant",
+        required=True,
         help="policy variant 名 (policy_config.yaml の policies section key)",
     )
     parser.add_argument(
-        "--config", type=Path, default=_default_config_path(),
+        "--config",
+        type=Path,
+        default=_default_config_path(),
         help="policy_config.yaml path",
     )
     parser.add_argument(
-        "--mode", required=True, choices=["load-only", "dry-run"],
+        "--mode",
+        required=True,
+        choices=["load-only", "dry-run"],
         help="load-only=Phase 1.9 単発 load+warmup、dry-run=Phase 1.10 30-tick loop",
     )
     parser.add_argument("--ticks", type=int, default=30, help="dry-run tick 数")
     parser.add_argument("--tick-hz", type=float, default=30.0, help="dry-run tick rate")
     parser.add_argument(
-        "--interface", type=str, default=None,
+        "--interface",
+        type=str,
+        default=None,
         help="cyclonedds NIC (dry-run で --no-real-state 未指定時に必須)",
     )
     parser.add_argument(
-        "--no-real-state", action="store_true",
+        "--no-real-state",
+        action="store_true",
         help="dry-run で joint_state を zeros 固定 (JointStateSource 抜き、Model forward だけ verify)",
     )
     parser.add_argument(
-        "--state-dump", type=Path, default=None,
+        "--state-dump",
+        type=Path,
+        default=None,
         help="smoke_state_assembly JSONを使う（model envへDDS依存を混ぜない推奨経路）",
     )
     parser.add_argument(
-        "--observation-dump", type=Path, default=None,
+        "--observation-dump",
+        type=Path,
+        default=None,
         help="capture_policy_observation NPZの実4カメラ＋stateを使う推奨経路",
     )
     parser.add_argument("--warmup-iters", type=int, default=3, help="warmup call 回数")
     parser.add_argument(
-        "--dump-path", type=Path, default=None,
+        "--dump-path",
+        type=Path,
+        default=None,
         help="結果 JSON dump path (省略時は stdout のみ)",
     )
     args = parser.parse_args()
@@ -560,8 +596,13 @@ def main() -> int:
         result = _run_load_only(args.variant, args.config, args.warmup_iters)
     else:
         result = _run_dry_run(
-            args.variant, args.config, args.ticks, args.tick_hz,
-            args.interface, args.no_real_state, args.warmup_iters,
+            args.variant,
+            args.config,
+            args.ticks,
+            args.tick_hz,
+            args.interface,
+            args.no_real_state,
+            args.warmup_iters,
             args.state_dump,
             args.observation_dump,
         )
