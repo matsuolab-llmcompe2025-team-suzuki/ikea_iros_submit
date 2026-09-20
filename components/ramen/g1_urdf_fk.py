@@ -343,18 +343,24 @@ class G1WristFK:
     def compute_ee_transforms(
         self, joint_positions: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """(29,) joint_positions → 左右 tool-point の (pos(3), R(3x3))。
+        """(29,) joint_positions → 左右 **wrist_yaw_link 原点**の (pos(3), R(3x3))。
 
-        `compute_ee_state` と同じ pelvis frame・同じ 5cm tool offset を使うが、
-        回転を euler ではなく **回転行列そのまま**で返す。task-space adapter が
-        matrix→quat 直変換 (gimbal lock 縮退回避) するための下位 API。
+        ⚠️ ここは publish する (T,25) action 用の下位 API。運営 WBC の decoupled IK は
+        **zero tool offset(生の wrist_yaw_link 原点)固定**で我々の (T,25) を解く
+        (WBC_RUNBOOK §3)。したがって action として publish する EE 位置は
+        **tool offset を足さない wrist_yaw_link 原点**でなければならない。以前は
+        `+ R @ WRIST_TOOL_OFFSET_M`(5cm)を足して tool point を publish していたが、
+        これが運営 IK 期待点との系統偏り(pick で IK 残差 60x ≈ 6cm)の原因だった。
+        model の **state 入力**側 (`compute_ee_state`) は学習時と同じ 5cm offset を
+        維持する(runbook: state input は real offset のままでよい)。回転行列は
+        wrist-yaw link 姿勢そのまま(matrix→quat は adapter 側で実施)。
 
         Args:
             joint_positions: (29,) float、G1_JOINT_NAMES 順。
 
         Returns:
             (left_pos(3), left_R(3x3), right_pos(3), right_R(3x3)) 全て float64。
-            pos は wrist tool point (pelvis frame)、R は wrist-yaw link の姿勢。
+            pos は wrist_yaw_link 原点 (pelvis frame, zero tool offset)、R は姿勢。
         """
         jp = np.asarray(joint_positions, dtype=np.float64)
         if jp.shape != (29,):
@@ -363,6 +369,7 @@ class G1WristFK:
         T_right = self._fk_chain(self._right_chain, jp)
         left_R = T_left[:3, :3].copy()
         right_R = T_right[:3, :3].copy()
-        left_pos = T_left[:3, 3] + left_R @ WRIST_TOOL_OFFSET_M
-        right_pos = T_right[:3, 3] + right_R @ WRIST_TOOL_OFFSET_M
+        # zero tool offset = wrist_yaw_link 原点 (運営 IK 準拠、WBC_RUNBOOK §3)
+        left_pos = T_left[:3, 3].copy()
+        right_pos = T_right[:3, 3].copy()
         return left_pos, left_R, right_pos, right_R
