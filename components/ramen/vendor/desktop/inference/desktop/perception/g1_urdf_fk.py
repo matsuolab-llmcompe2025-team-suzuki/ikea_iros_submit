@@ -55,35 +55,35 @@ DEFAULT_URDF_PATH: str = str(
 
 # 参照: g1_hw_bridge/joint_mapping.py:G1_JOINT_NAMES と一致 (SDK motor index 順)
 G1_JOINT_NAMES: tuple[str, ...] = (
-    "left_hip_pitch_joint",       # 0
-    "left_hip_roll_joint",        # 1
-    "left_hip_yaw_joint",         # 2
-    "left_knee_joint",            # 3
-    "left_ankle_pitch_joint",     # 4
-    "left_ankle_roll_joint",      # 5
-    "right_hip_pitch_joint",      # 6
-    "right_hip_roll_joint",       # 7
-    "right_hip_yaw_joint",        # 8
-    "right_knee_joint",           # 9
-    "right_ankle_pitch_joint",    # 10
-    "right_ankle_roll_joint",     # 11
-    "waist_yaw_joint",            # 12
-    "waist_roll_joint",           # 13
-    "waist_pitch_joint",          # 14
+    "left_hip_pitch_joint",  # 0
+    "left_hip_roll_joint",  # 1
+    "left_hip_yaw_joint",  # 2
+    "left_knee_joint",  # 3
+    "left_ankle_pitch_joint",  # 4
+    "left_ankle_roll_joint",  # 5
+    "right_hip_pitch_joint",  # 6
+    "right_hip_roll_joint",  # 7
+    "right_hip_yaw_joint",  # 8
+    "right_knee_joint",  # 9
+    "right_ankle_pitch_joint",  # 10
+    "right_ankle_roll_joint",  # 11
+    "waist_yaw_joint",  # 12
+    "waist_roll_joint",  # 13
+    "waist_pitch_joint",  # 14
     "left_shoulder_pitch_joint",  # 15
-    "left_shoulder_roll_joint",   # 16
-    "left_shoulder_yaw_joint",    # 17
-    "left_elbow_joint",           # 18
-    "left_wrist_roll_joint",      # 19
-    "left_wrist_pitch_joint",     # 20
-    "left_wrist_yaw_joint",       # 21
-    "right_shoulder_pitch_joint", # 22
+    "left_shoulder_roll_joint",  # 16
+    "left_shoulder_yaw_joint",  # 17
+    "left_elbow_joint",  # 18
+    "left_wrist_roll_joint",  # 19
+    "left_wrist_pitch_joint",  # 20
+    "left_wrist_yaw_joint",  # 21
+    "right_shoulder_pitch_joint",  # 22
     "right_shoulder_roll_joint",  # 23
-    "right_shoulder_yaw_joint",   # 24
-    "right_elbow_joint",          # 25
-    "right_wrist_roll_joint",     # 26
-    "right_wrist_pitch_joint",    # 27
-    "right_wrist_yaw_joint",      # 28
+    "right_shoulder_yaw_joint",  # 24
+    "right_elbow_joint",  # 25
+    "right_wrist_roll_joint",  # 26
+    "right_wrist_pitch_joint",  # 27
+    "right_wrist_yaw_joint",  # 28
 )
 
 LEFT_WRIST_LINK: str = "left_wrist_yaw_link"
@@ -116,7 +116,7 @@ class ChainJoint:
     name: str
     joint_index: int
     fixed_T: np.ndarray  # (4, 4)
-    axis: np.ndarray     # (3,)
+    axis: np.ndarray  # (3,)
 
 
 def _euler_xyz_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -336,7 +336,9 @@ class G1WristFK:
         """
         joint_name_to_index = {name: i for i, name in enumerate(joint_names)}
         left_chain = _parse_urdf_chain(urdf_path, LEFT_WRIST_LINK, joint_name_to_index)
-        right_chain = _parse_urdf_chain(urdf_path, RIGHT_WRIST_LINK, joint_name_to_index)
+        right_chain = _parse_urdf_chain(
+            urdf_path, RIGHT_WRIST_LINK, joint_name_to_index
+        )
         return cls(
             left_chain=left_chain,
             right_chain=right_chain,
@@ -413,18 +415,30 @@ class G1WristFK:
     def compute_ee_transforms(
         self, joint_positions: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """(29,) joint_positions → 左右 tool-point の (pos(3), R(3x3))。
+        """(29,) joint_positions → 左右 **wrist_yaw_link 原点**の (pos(3), R(3x3))。
 
-        `compute_ee_state` と同じ pelvis frame・同じ left/right 別 tool offset を
-        使うが、回転を euler ではなく **回転行列そのまま**で返す。task-space adapter
-        が matrix→quat 直変換 (gimbal lock 縮退回避) するための下位 API。
+        ⚠️ これは **publish する `(T,25)` action 用**の下位 API。運営 WBC の decoupled
+        IK は **zero tool offset (生の wrist_yaw_link 原点) 固定**で我々の `(T,25)` を
+        解く (`WBC_RUNBOOK` §3)。したがって action として publish する EE 位置は
+        **tool offset を足さない wrist_yaw_link 原点**でなければならない。
+        以前は `+ R @ tool_offset` (5cm) を足した tool point を publish しており、
+        これが運営 IK 期待点との系統偏り = **pick の IK 残差 60x (≈6cm)** の原因だった
+        (2026-09-14 dry-run の "steady bias, not scattered noise" がこれ)。
+
+        model への **state 入力**側 (`compute_ee_state`) は学習時と同じ tool offset を
+        **維持する** (runbook: state input は real offset のままでよい)。両者で意味が
+        違うので、offset を共通化しないこと。
+
+        呼び出し元は publish 経路のみ (`taskspace_adapter` / `boundary_sink` /
+        `solve_boundary_ee_frame`)。回転は wrist-yaw link 姿勢そのまま
+        (matrix→quat は adapter 側で実施、gimbal lock 縮退回避)。
 
         Args:
             joint_positions: (29,) float、G1_JOINT_NAMES 順。
 
         Returns:
             (left_pos(3), left_R(3x3), right_pos(3), right_R(3x3)) 全て float64。
-            pos は wrist tool point (pelvis frame)、R は wrist-yaw link の姿勢。
+            pos は **wrist_yaw_link 原点** (pelvis frame、zero tool offset)、R は姿勢。
         """
         jp = np.asarray(joint_positions, dtype=np.float64)
         if jp.shape != (29,):
@@ -433,6 +447,7 @@ class G1WristFK:
         T_right = self._fk_chain(self._right_chain, jp)
         left_R = T_left[:3, :3].copy()
         right_R = T_right[:3, :3].copy()
-        left_pos = T_left[:3, 3] + left_R @ self._left_offset
-        right_pos = T_right[:3, 3] + right_R @ self._right_offset
+        # zero tool offset = wrist_yaw_link 原点 (運営 IK 準拠、WBC_RUNBOOK §3)
+        left_pos = T_left[:3, 3].copy()
+        right_pos = T_right[:3, 3].copy()
         return left_pos, left_R, right_pos, right_R

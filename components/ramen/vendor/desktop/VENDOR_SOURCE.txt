@@ -1,8 +1,8 @@
 # tools/sync_vendor_desktop.sh が生成。手で編集しない。
 source_repo   : iros_2026_ramen
-source_commit : 5ee6b20c59b84894b2817d4166a63c09c94db630
+source_commit : de0a983b5fa40b76f51cd2df82309497c40477c5
 source_branch : issue/149-venue-inference-support
 source_dirty  : no
-synced_at     : 2026-09-20T09:51:15Z
+synced_at     : 2026-09-20T11:41:29Z
 excluded      : tests/ __pycache__/ *.pyc .pytest_cache/ pixi.toml pixi.lock
 patches       : tools/vendor_patches.py
