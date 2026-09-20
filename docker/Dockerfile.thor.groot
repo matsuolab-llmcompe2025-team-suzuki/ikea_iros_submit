@@ -92,6 +92,86 @@ _arr = torch.from_numpy(np.zeros(3, dtype=np.float32)); _ = _arr.numpy()
 print("[build] groot53 venv: torch<->numpy bridge OK")
 PY
 
+# --- Unitree SDK + CycloneDDS (自前経路用、Issue #1) ---------------------------
+# 大会経路 (components/server.py) は boundary の ZMQ だけで完結するのでこの層は
+# 要らない。要るのは自前経路 (inference/desktop/entrypoint.py) の方で、
+# rt/arm_sdk への直 publish・LocoClient・rt/lowstate の直読みに DDS を使う。
+#
+# 会場で持てる image を 1 個にするため (提出 image と自前経路 image を分けない)、
+# ここに同居させる。大会経路には影響しない (import されない)。
+#
+#   自前経路 : 歩行 (Stage 0 = +2点) と腕。運営 IK を通らないので EE frame 問題が無い
+#   大会経路 : グリッパが動く唯一の経路 ((T,25) の [0:2]/[2:4] を運営 adapter が relay)
+
+# 1) CycloneDDS C ライブラリ。python binding の cyclonedds 0.10.2 は wheel が無く、
+#    CYCLONEDDS_HOME を見て libddsc にリンクする形で source build される。
+ARG CYCLONEDDS_REF=releases/0.10.x
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
+         https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cyclonedds \
+    && cmake -S /tmp/cyclonedds -B /tmp/cyclonedds/build \
+         -DCMAKE_INSTALL_PREFIX=/usr/local \
+         -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DBUILD_IDLC=ON \
+    && cmake --build /tmp/cyclonedds/build --target install -j"$(nproc)" \
+    && ldconfig \
+    && rm -rf /tmp/cyclonedds
+
+# CYCLONEDDS_HOME は build 時 (binding の link) と run 時 (import 時の .so 探索) の
+# 両方で要る。焼いておかないと import cyclonedds が LoaderException になる。
+ENV CYCLONEDDS_HOME=/usr/local
+
+RUN python3 -m pip install --no-cache-dir "cyclonedds==0.10.2"
+
+# 2) unitree_sdk2py。**pip install せず、ソースを置いて .pth で sys.path に通す。**
+#    setup.py が find_packages() だけで package_data を宣言しないため、wheel には
+#    utils/lib/crc_aarch64.so などが入らず CRC() の初期化で落ちる (実機で 21〜25
+#    ファイル不足を確認)。ソースごと置けばこの取りこぼしが起きない。
+#
+#    ⚠️ ref は固定する。運営 vendor 版 (GR00T-WholeBodyControl/external_dependencies)
+#    は LOCO_SERVICE_NAME="loco" で robot と話せず、全 RPC が 3102 になる。
+#    robot が publish しているのは rt/api/sport/*。下の assert がこれを毎回確かめる。
+ARG UNITREE_SDK_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+RUN git clone https://github.com/unitreerobotics/unitree_sdk2_python \
+      /opt/unitree_sdk2_python \
+    && git -C /opt/unitree_sdk2_python checkout --quiet "${UNITREE_SDK_REF}" \
+    && rm -rf /opt/unitree_sdk2_python/.git
+
+# PYTHONPATH ではなく .pth で sys.path に入れるのは、base の NGC image が
+# PYTHONPATH を設定している可能性があり、上書きで torch 側を壊したくないため。
+# .pth は --system-site-packages の groot53 venv からも効く。
+RUN python3 - <<'PY'
+import pathlib, site
+target = pathlib.Path(site.getsitepackages()[0], "unitree_sdk2py.pth")
+target.write_text("/opt/unitree_sdk2_python\n")
+print("[build] wrote", target)
+PY
+
+RUN python3 - <<'PY'
+from importlib.metadata import version
+
+# import が通れば libddsc の解決まで出来ている (CYCLONEDDS_HOME が効いている)。
+# cyclonedds package は __version__ を持たないので metadata から取る。
+from cyclonedds.domain import DomainParticipant  # noqa: F401
+from unitree_sdk2py.g1.loco.g1_loco_api import LOCO_SERVICE_NAME
+from unitree_sdk2py.utils.crc import CRC
+
+# robot は rt/api/sport/*。"loco" 版を掴むと全 RPC が 3102 で死ぬ。
+assert LOCO_SERVICE_NAME == "sport", LOCO_SERVICE_NAME
+assert version("cyclonedds") == "0.10.2", version("cyclonedds")
+CRC()  # crc_aarch64.so が無いとここで落ちる (find_packages 取りこぼしの検出)
+print("[build] cyclonedds", version("cyclonedds"),
+      "| unitree_sdk2py OK (service=sport, CRC ok)")
+PY
+
+RUN /opt/venv-groot53/bin/python - <<'PY'
+# 53D venv も system site-packages 経由で SDK を見られること。
+from unitree_sdk2py.utils.crc import CRC
+CRC()
+print("[build] groot53 venv: unitree_sdk2py OK")
+PY
+
 # --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
 COPY . ./
 
@@ -110,5 +190,18 @@ ENV RAMEN_POLICY=groot_pick_real \
 #   docker run 時に -e HF_TOKEN=<token> を渡す (private repo pull に必須)。
 #   manifest.yaml の weights_uri と整合。
 
+# 既定 (CMD) は大会経路。自前経路はこの image の中から直接起動できる:
+#
+#   docker run --rm --runtime nvidia --network host \
+#     -e NVIDIA_DISABLE_REQUIRE=1 -e HF_TOKEN=<token> \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     <image> \
+#     python3 -m inference.desktop.entrypoint --help
+#
+# PYTHONPATH=/app/components/ramen/vendor/desktop を渡すこと (vendor tree が
+# inference.desktop の repo root を兼ねる)。会場の I/O に合わせる主な option:
+#   --head-source zmq         会場は ROS2 カメラを publish しない (boundary :5555)
+#   --synthetic-hand-state    会場は hand state を publish しない (Dex1-1、設計どおり)
+#   --action-sink boundary    (T,25) を運営 adapter へ。グリッパはこの経路でのみ動く
 CMD ["python3", "-u", "components/server.py", \
      "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
