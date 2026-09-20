@@ -1,0 +1,12 @@
+diff --git a/teleop/robot_control/robot_hand_unitree.py b/teleop/robot_control/robot_hand_unitree.py
+index d10fd7a..e45114d 100644
+--- a/teleop/robot_control/robot_hand_unitree.py
++++ b/teleop/robot_control/robot_hand_unitree.py
+@@ -20 +19,0 @@ sys.path.append(parent2_dir)
+-from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+@@ -55,0 +55,5 @@ class Dex3_1_Controller:
++        # Dex1-1 grippers do not use dex_retargeting.  Keep this Dex3-only
++        # dependency lazy so a Dex1-1 deployment does not require the full
++        # dexterous-hand retargeting stack (Torch, NLOpt, etc.).
++        from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
++

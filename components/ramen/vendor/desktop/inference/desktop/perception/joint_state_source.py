@@ -30,6 +30,11 @@ class JointStateData:
         velocity: 関節速度 [rad/s]、shape (N,) float64 ndarray。
         effort: 関節トルク推定 [Nm]、shape (N,) float64 ndarray。
         t: `header.stamp` の nanosecond。orchestrator の tick sync 材料。
+            `LowStateJointSource` (rt/lowstate 直受け、Issue #141) は stamp を持た
+            ないので、受信時の monotonic ns が入る。
+        tick: ロボット側の通し番号 (lowstate の `tick`)。`/joint_states` 経由では None。
+        received_monotonic_ns: Desktop がこの sample を読んだ時刻。`/joint_states`
+            経由では None (callback 時刻は t と別に持っていない)。
     """
 
     name: tuple[str, ...]
@@ -37,6 +42,8 @@ class JointStateData:
     velocity: np.ndarray
     effort: np.ndarray
     t: int
+    tick: Optional[int] = None
+    received_monotonic_ns: Optional[int] = None
 
 
 class JointStateSource:

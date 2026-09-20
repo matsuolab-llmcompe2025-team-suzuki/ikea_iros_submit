@@ -51,8 +51,8 @@ Env 手順は `inference/desktop/pixi.toml` header +
 
 ```python
 cfg = PolicyConfig(
-    mode="none",
-    ckpt_ref="Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_groot_baseline_100k_v1",
+    mode="overlay",
+    ckpt_ref="Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_groot_overlay_v11b_100k_v1",
     dtype="bf16",
     cams=Gr00tPolicy.CAMERAS,
 )
@@ -85,6 +85,7 @@ import json
 import os
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -105,6 +106,12 @@ from inference.desktop.lower_policy.policies.base import (
     PolicyAction,
     PolicyConfig,
     RawRobotState,
+)
+from inference.desktop.lower_policy.rtc import (
+    AUTO_FROZEN_STEPS,
+    ChunkLeftoverBuffer,
+    DelayEstimator,
+    validate_rtc_against_chunk_len,
 )
 
 
@@ -169,7 +176,7 @@ EMBODIMENT_ID: int = 25
 # 本 adapter は post_processor が **absolute を返す前提** で slice のみ行う。
 # 実機で action_chunk[:, 3:17] (arm 14D) が **明らかに delta 相当の小さい値**
 # ばかりの場合、この前提が壊れているので caller が current_arm_joints を加算
-# する要 (docs/inference/realmachine_smoke_checklist.md の GR00T セクション参照)。
+# する要 (実機初回起動時の read-only preflight 手順は skill 別 handoff MD 参照)。
 _ACTION_53D_WAIST_SLICE: slice = slice(46, 49)      # waist yaw/roll/pitch (ABSOLUTE)
 _ACTION_53D_LEFT_ARM_SLICE: slice = slice(32, 39)   # 7D (訓練 rep=RELATIVE、post で ABS 化想定)
 _ACTION_53D_RIGHT_ARM_SLICE: slice = slice(39, 46)  # 7D (同上)
@@ -194,6 +201,24 @@ _GROOT_ALLOWED_TIED_CHECKPOINT_ALIASES: dict[str, str] = {
     "_groot_model.backbone.model.model.language_model.embed_tokens.weight":
         "_groot_model.backbone.model.lm_head.weight",
 }
+
+# Issue #134: rotate specialist の train patch
+# (`model/subtask_policy_training/scripts/rotate_specialist/patch_lerobot.py:128`) が
+# L4 FK anchor loss 用に `self._tr_fk_singleton = G1WristFKTorch(...)` を
+# `action_head` に attach する。Isaac-GR00T の module 定義には無い attribute で
+# state_dict に混入するが、inference では forward 経路に登場しないため無害。
+# rotate specialist Run 2 (L1+L4) と Run 3 (T0-1+L1+L4) の 2 ckpt が該当、
+# 他 GR00T ckpt (rotate default / takada rotate_leg / takada insert 系) は fk
+# singleton buffer 無しなので影響なし (HF safetensors metadata で verify 済)。
+_GROOT_ALLOWED_UNEXPECTED_PREFIXES: tuple[str, ...] = (
+    "_groot_model.action_head._tr_fk_singleton.",
+)
+
+
+def _is_allowed_groot_unexpected_key(key: str) -> bool:
+    """Return whether *key* is a proven training-only checkpoint tensor."""
+
+    return any(key.startswith(prefix) for prefix in _GROOT_ALLOWED_UNEXPECTED_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -308,13 +333,18 @@ def _validate_groot_checkpoint_keys(
             missing.remove(alias)
     unexpected = actual_keys - expected_keys
     allowed_unexpected = set(_GROOT_ALLOWED_TIED_CHECKPOINT_ALIASES)
-    disallowed = unexpected - allowed_unexpected
+    disallowed = {
+        k for k in unexpected - allowed_unexpected
+        if not _is_allowed_groot_unexpected_key(k)
+    }
     if missing or disallowed:
         raise RuntimeError(
             "GR00T checkpoint schema mismatch: "
             f"missing={sorted(missing)[:10]} unexpected={sorted(disallowed)[:10]}"
         )
-    for alias in sorted(unexpected):
+    # tied alias の byte-equal verify は tied-map の対象のみ、prefix allow-list
+    # 経由の unexpected (fk singleton buffer 等) は verify 対象外。
+    for alias in sorted(unexpected & allowed_unexpected):
         canonical = _GROOT_ALLOWED_TIED_CHECKPOINT_ALIASES[alias]
         if canonical not in actual_keys or not _safetensor_ranges_equal(
             checkpoint_file, alias, canonical
@@ -470,20 +500,7 @@ def _require_groot_load_headroom(
             f"checkpoint={checkpoint_bytes / 1024**3:.1f}GiB"
         )
 
-    # GPU load overhead は既定 12GiB (base model + activation + transient buffer)。
-    # IAC eval 指摘: dev-kit bench は CUDA-visible ~122GiB でも idle 空きが ~33.6GiB
-    # (driver/platform reservation と推測) で、YOLO load 後 19.8GiB まで削れ、
-    # checkpoint 11.7 + 12 = 23.7GiB のガードに掛かって warmup skip。実機 Thor の
-    # 実 headroom が未知なため overhead を env `RAMEN_GROOT_GPU_OVERHEAD_GB` で調整可に
-    # (既定据え置き = 挙動不変、opt-in で緩める。実機に余裕があれば触らない)。
-    gpu_overhead = _GROOT_GPU_LOAD_OVERHEAD_BYTES
-    _env_gb = os.environ.get("RAMEN_GROOT_GPU_OVERHEAD_GB")
-    if _env_gb:
-        try:
-            gpu_overhead = int(float(_env_gb) * 1024**3)
-        except ValueError:
-            pass
-    gpu_required = checkpoint_bytes + gpu_overhead
+    gpu_required = checkpoint_bytes + _GROOT_GPU_LOAD_OVERHEAD_BYTES
     if gpu_free_bytes is not None and gpu_free_bytes < gpu_required:
         raise MemoryError(
             "insufficient free GPU memory for GR00T load/warmup: "
@@ -604,6 +621,17 @@ def _load_groot_policy_streaming(
                     # a meta tensor, and skip it only for the omitted form.
                     if wrapper_key in allowed_aliases and inner_key not in inner_keys:
                         continue
+                    if inner_key not in inner_keys:
+                        if _is_allowed_groot_unexpected_key(wrapper_key):
+                            # L4's FK object is created lazily by the training
+                            # loss patch only.  Its six constant buffers never
+                            # participate in inference and must not be passed
+                            # to accelerate's module walker.
+                            continue
+                        raise RuntimeError(
+                            "GR00T checkpoint contains an unexpected inner tensor: "
+                            f"{wrapper_key!r}"
+                        )
                     tensor = reader.get_tensor(wrapper_key)
                     dtype = (
                         target_dtype
@@ -718,11 +746,13 @@ class _GrootWorkerClient:
         self.video_horizon = self.artifact_contract.video_horizon
         self.history_offset_ticks = self.artifact_contract.history_offset_ticks
         self._mode = cfg.mode
+        self._overlay_jpeg_subsampling = cfg.overlay_jpeg_subsampling
         self._socket_path = Path(
             f"/tmp/iros_2026_ramen_groot_{os.getpid()}_{uuid.uuid4().hex}.sock"
         )
-        # VENDOR PATCH (Team RAMEN、boundary container 用): RAMEN_WORKER_PYTHON_53D
-        # (lerobot 0.6.1 python) で worker 直接起動 (container は pixi 不在)。
+        # VENDOR PATCH (Team RAMEN、boundary container 用): worker は
+        # RAMEN_WORKER_PYTHON_53D (lerobot 0.6.1 の python) で直接起動する。
+        # container に pixi は無いので、本家の pixi run 経路は fallback に回す。
         worker_python = os.environ.get("RAMEN_WORKER_PYTHON_53D") or os.environ.get(
             "RAMEN_WORKER_PYTHON"
         )
@@ -755,7 +785,19 @@ class _GrootWorkerClient:
             cfg.device,
             "--dtype",
             cfg.dtype,
+            "--execution-steps",
+            str(cfg.execution_steps),
+            "--rtc-frozen-steps",
+            str(cfg.rtc.frozen_steps),
+            "--rtc-ramp-rate",
+            str(cfg.rtc.ramp_rate),
         ]
+        if cfg.replan_family is not None:
+            command.extend(["--replan-family", cfg.replan_family])
+        if cfg.rtc.enabled:
+            command.append("--rtc-enabled")
+        if cfg.rtc.overlap_steps is not None:
+            command.extend(["--rtc-overlap-steps", str(cfg.rtc.overlap_steps)])
         if cfg.checkpoint_subdir is not None:
             command.extend(["--checkpoint-subdir", cfg.checkpoint_subdir])
         print(
@@ -820,8 +862,16 @@ class _GrootWorkerClient:
             count=np.asarray([n_iter], dtype=np.int64),
         )
 
-    def predict(self, obs: Observation) -> PolicyAction:
-        frames, overlay_detection_count = _prepare_gr00t_frames(obs, self._mode)
+    def predict(
+        self,
+        obs: Observation,
+        *,
+        rtc_step: int | None = None,
+        rtc_tick_period_s: float | None = None,
+    ) -> PolicyAction:
+        frames, overlay_detection_count = _prepare_gr00t_frames(
+            obs, self._mode, self._overlay_jpeg_subsampling
+        )
         request = dict(
             kind=np.asarray("predict"),
             state=np.asarray(obs.state, dtype=np.float32),
@@ -830,6 +880,17 @@ class _GrootWorkerClient:
             wrist_right=np.asarray(frames[CameraKey.WRIST_RIGHT]),
             language=np.asarray(obs.language or DEFAULT_LANGUAGE_PROMPT),
             timestamp_ns=np.asarray([obs.timestamp_ns], dtype=np.int64),
+            rtc_step=np.asarray(
+                [-1 if rtc_step is None else int(rtc_step)], dtype=np.int64
+            ),
+            rtc_tick_period_s=np.asarray(
+                [
+                    np.nan
+                    if rtc_tick_period_s is None
+                    else float(rtc_tick_period_s)
+                ],
+                dtype=np.float64,
+            ),
         )
         if self.video_horizon == 2:
             if obs.frames_bgr_prev is None:
@@ -1044,19 +1105,26 @@ def build_batch_dict(
 
 
 def _prepare_gr00t_frames(
-    obs: Observation, mode: str
+    obs: Observation, mode: str, overlay_jpeg_subsampling: str | None = None
 ) -> tuple[dict[CameraKey, np.ndarray], int]:
     """Return model-ready frames, rendering the training-time OBB overlay.
 
     GR00T's overlay checkpoint was trained with rectangles on head-left only;
     wrist images remain raw.  ``None`` detections means that no detector is
     connected and is therefore a configuration error.  An empty list is a
-    valid YOLO result and produces an unchanged head image.
+    valid YOLO result: no rectangle is drawn, but the head image still passes
+    the training cache's JPEG encoding (`match_training_jpeg`), whose chroma
+    subsampling ``overlay_jpeg_subsampling`` is required in overlay mode.
     """
 
     frames = dict(obs.frames_bgr)
     if mode != "overlay":
         return frames, 0
+    if overlay_jpeg_subsampling is None:
+        raise ValueError(
+            "GR00T overlay mode requires overlay_jpeg_subsampling (the training "
+            "cache's JPEG chroma subsampling)"
+        )
     if obs.obb_detections is None:
         raise RuntimeError(
             "GR00T overlay mode requires live YOLO-OBB detections; refusing "
@@ -1066,11 +1134,13 @@ def _prepare_gr00t_frames(
     if CameraKey.HEAD_LEFT not in frames:
         raise KeyError("GR00T overlay mode requires a head_left frame")
     from inference.desktop.lower_policy.policies.ramen_ori import (
+        match_training_jpeg,
         overlay_obb_on_frame,
     )
 
-    frames[CameraKey.HEAD_LEFT] = overlay_obb_on_frame(
-        frames[CameraKey.HEAD_LEFT].copy(), detections
+    frames[CameraKey.HEAD_LEFT] = match_training_jpeg(
+        overlay_obb_on_frame(frames[CameraKey.HEAD_LEFT].copy(), detections),
+        overlay_jpeg_subsampling,
     )
     return frames, len(detections)
 
@@ -1258,6 +1328,10 @@ class Gr00tPolicy:
         )
         self._prediction_count = 0
         self._last_sync_metadata: dict[str, object] = {}
+        # 【Issue #137】pre/post processor はインスタンス状態 (pack step の raw
+        # state cache) を共有するため、in-process の推論区間は 1 スレッド限定。
+        # async worker と main の sync_fallback が同時に入る経路がある。
+        self._inference_lock = threading.Lock()
         # Phase 2 (Issue #128): temporal ensemble state。
         # cfg.temporal_lambda=None なら ensembler は作るが lambda=None passthrough、
         # blend せず最新 chunk[0] 相当を返す (実装 simplicity)。
@@ -1282,8 +1356,24 @@ class Gr00tPolicy:
         self._pipeline_lead_steps: int | None = None      # replan_after_steps 計算用
         self._pipeline_max_age_s: float | None = None
         self._pending_submit_step: int | None = None
+        self._last_emitted_target: np.ndarray | None = None
+        self._async_hold_ticks = 0
         # 初期 chunk seed 用 obs cache (async submit の predictor に渡す)
         self._last_seen_obs: Observation | None = None
+        # Phase B (Issue #137): Real-Time Chunking。cfg.rtc.enabled=False (既定) の
+        # 間は buffer も作らず、prefix 経路に一切入らない = 従来動作と同一。
+        self._rtc_leftover = (
+            ChunkLeftoverBuffer(action_dim=ACTION_DIM) if cfg.rtc.enabled else None
+        )
+        self._rtc_delay = DelayEstimator()
+        # tick 周期は policy ごとに違う (実測 GR00T 30.0Hz / RAMEN-Ori 16.2Hz) ので
+        # config 定数にせず predict() の呼出間隔から実測する。外れ値に引きずられ
+        # ないよう median を採る。
+        self._rtc_tick_deltas: deque[float] = deque(maxlen=32)
+        self._rtc_last_tick_ns: int | None = None
+        # RTC 経路で一度でも失敗したらそれ以降は prefix を渡さない (実機 slot を
+        # 落とさず、かつ「時々効く」状態にして数字を濁らせないため)。
+        self._rtc_disabled_after_error = False
 
     def reset(self) -> None:
         """Skill 遷移 / episode 開始時に呼ぶ (VlaSkill._on_start から)。
@@ -1304,7 +1394,16 @@ class Gr00tPolicy:
             self._pipeline = None
         self._last_seen_obs = None
         self._pending_submit_step = None
+        self._last_emitted_target = None
+        self._async_hold_ticks = 0
         self._frame_history.clear()
+        # RTC: 前 skill の chunk を新 skill の prefix に混ぜない。latency / tick
+        # 周期の実測値も skill を跨いで持ち越さない。
+        if self._rtc_leftover is not None:
+            self._rtc_leftover.reset()
+        self._rtc_delay.reset()
+        self._rtc_tick_deltas.clear()
+        self._rtc_last_tick_ns = None
 
     @classmethod
     def from_ckpt(cls, cfg: PolicyConfig) -> "Gr00tPolicy":
@@ -1335,7 +1434,9 @@ class Gr00tPolicy:
         # 実 env (sakura .venv_lerobot060) で本 method が走る前提。
         # lazy: env-isolated dependencies (lerobot は sakura training env pin)
         import torch
-        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot.policies.groot.configuration_groot import (
+            GrootConfig as _LrGrootConfig,
+        )
         from lerobot.policies.groot.processor_groot import (
             make_groot_pre_post_processors_from_pretrained,
         )
@@ -1345,6 +1446,10 @@ class Gr00tPolicy:
             checkpoint_ref, cfg.checkpoint_subdir
         )
         artifact_contract = _read_groot_artifact_contract(checkpoint_root)
+        # 【Issue #137】RTC の overlap は chunk 長を超えられない。chunk_size は
+        # ckpt の config.json にしか無いので config_loader では検証できないが、
+        # ここは **重み load の前** なので設定ミスは 1 秒程度で落ちる。
+        validate_rtc_against_chunk_len(cfg, artifact_contract.chunk_size)
         checkpoint_file = checkpoint_root / "model.safetensors"
         if not checkpoint_file.is_file():
             raise FileNotFoundError(
@@ -1389,26 +1494,14 @@ class Gr00tPolicy:
         policy_base_class = None
         if artifact_contract.policy_type == "furniture_groot":
             from inference.desktop.lower_policy.policies.furniture_groot_runtime import (
-                FurnitureGrootRuntimeConfig,  # noqa: F401 — import が "furniture_groot" subclass を register
+                FurnitureGrootRuntimeConfig,
                 FurnitureGrootRuntimePolicy,
             )
 
-            # 下記 else と同じ理由: concrete subclass (FurnitureGrootRuntimeConfig) の
-            # from_pretrained を直に呼ぶと "type": "furniture_groot" discriminator を
-            # draccus が未知フィールドとして弾く (IAC eval 指摘)。上の import で
-            # furniture_groot subclass が register 済なので、base PreTrainedConfig.
-            # from_pretrained が type="furniture_groot" → FurnitureGrootRuntimeConfig に
-            # dispatch する (progress_* 等の追加 field も subclass が宣言済で正しく decode)。
-            load_cfg = PreTrainedConfig.from_pretrained(str(checkpoint_root))
+            load_cfg = FurnitureGrootRuntimeConfig.from_pretrained(str(checkpoint_root))
             policy_base_class = FurnitureGrootRuntimePolicy
         else:
-            # config.json は lerobot の polymorphic discriminator "type": "groot" を
-            # 持つ。concrete subclass (GrootConfig) の from_pretrained を直に呼ぶと
-            # draccus.parse(GrootConfig, ...) が "type" を未知フィールドとして弾く
-            # (DecodingError, IAC eval 指摘)。base PreTrainedConfig.from_pretrained は
-            # "type" で subclass を dispatch し pop してから decode するのでこちらを使う
-            # (type="groot" → GrootConfig を返す)。
-            load_cfg = PreTrainedConfig.from_pretrained(str(checkpoint_root))
+            load_cfg = _LrGrootConfig.from_pretrained(str(checkpoint_root))
         # Uploaded checkpoints may retain a training-workstation absolute
         # path. Resolve the pinned official base snapshot locally instead.
         base_revision = str(
@@ -1436,6 +1529,14 @@ class Gr00tPolicy:
             file=sys.stderr,
         )
         target_dtype = torch.bfloat16 if cfg.dtype == "bf16" else torch.float32
+        if cfg.rtc.enabled:
+            # generic (None = LeRobot GrootPolicy) / furniture のどちらの base にも
+            # 同じ prefix override を載せる。
+            from inference.desktop.lower_policy.policies.groot_rtc import (
+                make_rtc_policy_class,
+            )
+
+            policy_base_class = make_rtc_policy_class(policy_base_class)
         policy = _load_groot_policy_streaming(
             load_cfg=load_cfg,
             checkpoint_file=checkpoint_file,
@@ -1445,6 +1546,10 @@ class Gr00tPolicy:
         )
         policy.config.device = cfg.device
         policy.config.model_params_fp32 = target_dtype == torch.float32
+        if cfg.rtc.enabled:
+            # per-variant の ramp rate。mixin 側が GrootConfig.rtc_ramp_rate を
+            # 優先して読むので、ここで cfg の値を載せておく。
+            policy.config.rtc_ramp_rate = float(cfg.rtc.ramp_rate)
         policy.eval()
         rss_before, rss_after, malloc_trimmed = _release_host_load_memory()
         before_text = (
@@ -1493,14 +1598,25 @@ class Gr00tPolicy:
         dummy_obs = self._make_dummy_observation()
         for _ in range(n_iter):
             self.predict(dummy_obs)
+        # 【Issue #137】warmup は dummy observation で、初回 JIT (~500ms-2s) も
+        # 含む。これを RTC の遅延推定 (window 内 max) に混ぜると d が過大評価され、
+        # overlap 全域が凍結されて応答性を失う (実測: 966ms の warmup latency で
+        # frozen が overlap と同値 8 になった)。dummy chunk が RTC prefix や
+        # temporal ensemble に流れ込むのも防ぐため、warmup 由来の状態は全て捨てる。
+        self.reset()
 
-    def _sync_predict_chunk_19d(self, obs: Observation) -> tuple[np.ndarray, float, np.ndarray]:
+    def _sync_predict_chunk_19d(
+        self, obs: Observation, *, rtc_step: int | None = None
+    ) -> tuple[np.ndarray, float, np.ndarray]:
         """1 tick observation を synchronous inference → 19D chunk + latency + raw 53D。
 
         Phase 1/2/4 の共通 sync inference path。
         - Phase 2 (replan_family=None): 毎 tick 呼ばれる (predict() 内)
         - Phase 4 (replan_family 設定時): 初回 seed / async worker predictor callback /
           candidate 欠損時 fallback で呼ばれる
+
+        後者 2 つは別スレッドから同時に来るため、in-process 経路は
+        `_inference_lock` で直列化する (理由は下のコメント参照)。
 
         Returns:
             (chunk_19d, latency_ms, raw_action_chunk_53d):
@@ -1509,7 +1625,11 @@ class Gr00tPolicy:
                 raw_action_chunk_53d = post_processor 直後、(16, 53) — debug 用
         """
         if self._worker_client is not None:
-            action = self._worker_client.predict(obs)
+            action = self._worker_client.predict(
+                obs,
+                rtc_step=rtc_step,
+                rtc_tick_period_s=self._rtc_tick_period_s(),
+            )
             raw_shape = tuple(
                 int(value)
                 for value in action.metadata.get(
@@ -1530,6 +1650,29 @@ class Gr00tPolicy:
             raise RuntimeError(
                 "Gr00tPolicy is not loaded. Call from_ckpt() first."
             )
+        # 【Issue #137】pre_processor (GrootN17PackInputsStep) は raw state を
+        # インスタンスにキャッシュし、post_processor の decode がそれを読んで
+        # relative → absolute を復元する。この区間へ async worker と main の
+        # sync_fallback が同時に入ると、後から state を書いた側の基準で相手の
+        # chunk が復元され、error を出さずに誤った絶対 action になる。
+        # 直列化して防ぐ (実測 sync_fallback の発火は 1444 tick 中 0 回、
+        # 待たされる経路自体がほぼ通らない)。
+        with self._inference_lock:
+            return self._in_process_predict_chunk_19d(obs, rtc_step=rtc_step)
+
+    def _in_process_predict_chunk_19d(
+        self,
+        obs: Observation,
+        *,
+        rtc_step: int | None = None,
+        rtc_tick_period_s: float | None = None,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """pre_processor → model forward → post_processor。
+
+        `_inference_lock` を保持した状態で呼ぶこと。pre/post processor が
+        インスタンス状態 (pack step の raw state cache) を共有するため、
+        この区間は同時に 1 スレッドしか入ってはいけない。
+        """
         # lazy: env-isolated dependencies (torch は runtime env 以上でのみ available)
         import torch
 
@@ -1540,7 +1683,9 @@ class Gr00tPolicy:
                 f"[groot] first prediction start ({_runtime_memory_snapshot()})",
                 file=sys.stderr,
             )
-        frames, overlay_detection_count = _prepare_gr00t_frames(obs, self.cfg.mode)
+        frames, overlay_detection_count = _prepare_gr00t_frames(
+            obs, self.cfg.mode, self.cfg.overlay_jpeg_subsampling
+        )
         effective_obs = Observation(
             frames_bgr=frames,
             frames_bgr_prev=obs.frames_bgr_prev,
@@ -1584,7 +1729,12 @@ class Gr00tPolicy:
             )
 
         # Predict action chunk: (1, chunk_len, max_action_dim=32) が返る
-        action_chunk_padded = self._lerobot_policy.predict_action_chunk(processed)
+        rtc_kwargs, rtc_metadata = self._build_rtc_prefix(
+            rtc_step, tick_period_s_override=rtc_tick_period_s
+        )
+        action_chunk_padded = self._lerobot_policy.predict_action_chunk(
+            processed, **rtc_kwargs
+        )
         if first_prediction:
             print(
                 f"[groot] first model forward complete ({_runtime_memory_snapshot()})",
@@ -1610,11 +1760,158 @@ class Gr00tPolicy:
             np.float32, copy=False
         )
         latency_ms = (time.monotonic_ns() - t0) / 1e6
+        if self._rtc_leftover is not None and rtc_step is not None:
+            # 次 replan の prefix 元。promote 前でも保存する (promote 待ちの間に
+            # replan が走ることは無いので、最新 chunk = 実行予定の chunk)。
+            self._rtc_leftover.store(action_chunk_53d, origin_step=int(rtc_step))
+        self._rtc_delay.add(latency_ms / 1000.0)
         self._last_sync_metadata = {
             "overlay_detection_count": int(overlay_detection_count),
+            "predict_latency_ms": float(latency_ms),
+            **rtc_metadata,
         }
         self._prediction_count += 1
         return chunk_19d, latency_ms, action_chunk_53d
+
+    def _rtc_tick_period_s(self) -> float | None:
+        """predict() の呼出間隔から実測した tick 周期 [s]。sample 不足なら None。"""
+        if len(self._rtc_tick_deltas) < 3:
+            return None
+        return float(statistics.median(self._rtc_tick_deltas))
+
+    def _build_rtc_prefix(
+        self,
+        rtc_step: int | None,
+        *,
+        tick_period_s_override: float | None = None,
+    ) -> tuple[dict, dict]:
+        """RTC prefix を組んで predict_action_chunk への kwargs を返す。
+
+        `_in_process_predict_chunk_19d` の中 (= `_inference_lock` 保持下、
+        pre_processor 実行直後) から呼ぶこと。prefix の基準 state は pack step が
+        今キャッシュしたものを使うため、この順序に依存する。
+
+        Returns:
+            (kwargs, metadata)。RTC を使わない tick では kwargs は空 dict で、
+            呼出側は従来どおり `predict_action_chunk(processed)` を呼ぶのと
+            同じになる。
+        """
+        if (
+            self._rtc_leftover is None
+            or rtc_step is None
+            or self._rtc_disabled_after_error
+        ):
+            return {}, {"rtc_enabled": False}
+
+        chunk_len = (
+            self._artifact_contract.chunk_size
+            if self._artifact_contract is not None
+            else CHUNK_LEN
+        )
+        overlap = self.cfg.rtc.overlap_steps
+        if overlap is None:
+            overlap = self.cfg.execution_steps
+        overlap = max(0, min(int(overlap), int(chunk_len)))
+
+        leftover = self._rtc_leftover.remaining(int(rtc_step))
+        if leftover is None or overlap < 1:
+            # 初回 (前 chunk 無し) / 使い切り。prefix 無しで通常推論。
+            return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+        rows = min(int(leftover.shape[0]), overlap)
+        leftover = leftover[:rows]
+
+        tick_period_s = (
+            self._rtc_tick_period_s()
+            if tick_period_s_override is None
+            else float(tick_period_s_override)
+        )
+        if self.cfg.replan_family is None:
+            # 同期実行 (async pipeline 無し) では推論中ロボットは最後の指令を保持
+            # したままで、新 chunk から先行して送信される action が 1 本も無い。
+            # frozen 領域は定義上ゼロで、latency から推定すると応答性を無駄に
+            # 捨てることになる (前 chunk の再現に数 step を費やす)。
+            frozen = 0
+        elif self.cfg.rtc.frozen_steps == AUTO_FROZEN_STEPS:
+            if tick_period_s is None:
+                # tick 周期がまだ測れていない = d を決められない。過小評価すると
+                # 送信済み step を書き換えるので、この tick は RTC を使わない。
+                return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+            frozen = self._rtc_delay.frozen_steps(tick_period_s, cap=rows)
+            if frozen is None:
+                return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+        else:
+            frozen = max(0, min(int(self.cfg.rtc.frozen_steps), rows))
+
+        try:
+            # lazy: env-isolated dependencies (lerobot 環境でのみ available)
+            import torch
+
+            from inference.desktop.lower_policy.policies.groot_rtc import (
+                encode_absolute_chunk_to_model_space,
+            )
+
+            decode_step = self._find_action_decode_step()
+            pack_step = getattr(decode_step, "pack_step", None)
+            raw_state = (
+                pack_step.get_cached_raw_state() if pack_step is not None else None
+            )
+            if raw_state is None:
+                raise RuntimeError(
+                    "GR00T pack step has no cached raw state; RTC prefix cannot be "
+                    "anchored to the current observation"
+                )
+            prefix = encode_absolute_chunk_to_model_space(
+                leftover,
+                reference_raw_state=raw_state,
+                decode_step=decode_step,
+            )
+        except Exception as exc:  # noqa: BLE001 - 実機 slot を落とさない
+            self._rtc_disabled_after_error = True
+            print(
+                f"[groot] WARNING: RTC prefix build failed ({type(exc).__name__}: "
+                f"{exc}). Continuing with RTC disabled for this policy instance.",
+                file=sys.stderr,
+            )
+            return {}, {"rtc_enabled": False, "rtc_error": f"{type(exc).__name__}"}
+
+        metadata = {
+            "rtc_enabled": True,
+            "rtc_prefix_rows": int(rows),
+            "rtc_frozen_steps": int(frozen),
+            "rtc_overlap_steps": int(overlap),
+            "rtc_ramp_rate": float(self.cfg.rtc.ramp_rate),
+            # 同期実行では frozen=0 が正 (先行送信される action が無い)。
+            # 実機ログでどちらの意味の 0 か判別できるようにしておく。
+            "rtc_async_execution": self.cfg.replan_family is not None,
+            "rtc_tick_period_ms": (
+                None if tick_period_s is None else float(tick_period_s * 1000.0)
+            ),
+            "rtc_delay_max_ms": (
+                None
+                if self._rtc_delay.max_latency_s is None
+                else float(self._rtc_delay.max_latency_s * 1000.0)
+            ),
+        }
+        return (
+            {
+                "inference_delay": int(frozen),
+                "prev_chunk_left_over": torch.from_numpy(prefix),
+            },
+            metadata,
+        )
+
+    def _find_action_decode_step(self):
+        """postprocessor から N1.7 の action decode step を取り出す。"""
+        # lazy: env-isolated dependencies (lerobot 環境でのみ available)
+        from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep
+
+        for step in getattr(self._post_processor, "steps", []):
+            if isinstance(step, GrootN17ActionDecodeStep):
+                return step
+        raise RuntimeError(
+            "postprocessor has no GrootN17ActionDecodeStep; RTC prefix encoding "
+            "requires the N1.7 action decode pipeline"
+        )
 
     def predict(self, obs: Observation) -> PolicyAction:
         """1 tick observation → GR00T action chunk。
@@ -1630,6 +1927,14 @@ class Gr00tPolicy:
               cadence 維持。詳細は module docstring の Phase 4 説明。
         """
         obs = self._with_model_history(obs)
+        # RTC の d は「latency ÷ tick 周期」で決まる。周期は policy ごとに違う
+        # (実測 GR00T 30.0Hz / RAMEN-Ori 16.2Hz) ので predict() の呼出間隔から測る。
+        tick_now_ns = time.monotonic_ns()
+        if self._rtc_last_tick_ns is not None:
+            delta_s = (tick_now_ns - self._rtc_last_tick_ns) / 1e9
+            if 0.0 < delta_s < 1.0:  # 一時停止や skill 遷移の穴は捨てる
+                self._rtc_tick_deltas.append(delta_s)
+        self._rtc_last_tick_ns = tick_now_ns
         # Phase 4: async pipeline 使用時は pipeline 経由、そうでなければ従来 sync
         chunk_source: str  # "sync" / "async_promoted" / "async_none_this_tick"
         latency_ms: float = 0.0
@@ -1638,7 +1943,9 @@ class Gr00tPolicy:
 
         if self.cfg.replan_family is None:
             # -------- Phase 2 legacy: per-tick sync predict --------
-            chunk_19d, latency_ms, raw_53d = self._sync_predict_chunk_19d(obs)
+            chunk_19d, latency_ms, raw_53d = self._sync_predict_chunk_19d(
+                obs, rtc_step=self._current_step
+            )
             self._ensembler.add_chunk(
                 origin_step=self._current_step, absolute_targets=chunk_19d
             )
@@ -1648,7 +1955,9 @@ class Gr00tPolicy:
             # -------- Phase 4: async pipeline replan --------
             # 初回 predict: sync seed chunk を取得して pipeline を build
             if self._pipeline is None:
-                seed_19d, latency_ms, raw_53d = self._sync_predict_chunk_19d(obs)
+                seed_19d, latency_ms, raw_53d = self._sync_predict_chunk_19d(
+                    obs, rtc_step=self._current_step
+                )
                 self._ensembler.add_chunk(
                     origin_step=self._current_step, absolute_targets=seed_19d
                 )
@@ -1657,16 +1966,31 @@ class Gr00tPolicy:
                 chunk_source = "sync"  # seed = sync
             else:
                 # 完了した async chunk があれば ensembler に追加
+                had_pending = self._pipeline.prediction_pending
                 promoted = self._pipeline.promote_if_ready()
                 if promoted is not None and self._pending_submit_step is not None:
+                    submit_step = self._pending_submit_step
                     self._ensembler.add_chunk(
-                        origin_step=self._pending_submit_step,
+                        origin_step=submit_step,
+                        # execution_steps controls when the pipeline replans;
+                        # TE must retain the model's complete native horizon so
+                        # a late replacement can still overlap and blend.
                         absolute_targets=promoted.actions.astype(np.float32),
+                    )
+                    # The chunk is timestamped at submission.  Do not execute
+                    # its already-expired prefix or restart its prefetch clock.
+                    self._pipeline.skip_consumed_prefix(
+                        max(0, self._current_step - submit_step)
                     )
                     self._pending_submit_step = None
                     chunk_source = "async_promoted"
                 else:
                     chunk_source = "async_none_this_tick"
+                    # A completed-but-stale prediction is removed by the
+                    # pipeline and must also release the policy-side latch so
+                    # a fresh request can be submitted immediately.
+                    if had_pending and not self._pipeline.prediction_pending:
+                        self._pending_submit_step = None
                 # Pipeline の index を進める (wants_prediction 計算に必要)
                 _pipeline_action, pipeline_index = self._pipeline.next_action()
                 # replan タイミングに来たら async submit
@@ -1678,7 +2002,9 @@ class Gr00tPolicy:
                     submit_step = self._current_step
 
                     def predictor():
-                        chunk_19d, ms, _raw = self._sync_predict_chunk_19d(obs_snapshot)
+                        chunk_19d, ms, _raw = self._sync_predict_chunk_19d(
+                            obs_snapshot, rtc_step=submit_step
+                        )
                         return (
                             chunk_19d.astype(np.float64),
                             float(ms),
@@ -1690,22 +2016,21 @@ class Gr00tPolicy:
                     )
                     self._pending_submit_step = submit_step
 
-                # candidate が current step に無い場合 = pipeline stall (inference 完了
-                # 遅れ + seed chunk が使い切られた) → sync fallback で hard stall 回避
-                if self._ensembler.candidate_count(self._current_step) == 0:
-                    chunk_19d, fallback_ms, raw_53d = self._sync_predict_chunk_19d(obs)
-                    self._ensembler.add_chunk(
-                        origin_step=self._current_step,
-                        absolute_targets=chunk_19d,
-                    )
-                    raw_action_shape_53d = tuple(raw_53d.shape)
-                    latency_ms = fallback_ms
-                    chunk_source = "sync_fallback"
-
-        # 現 step の blended target 取得
-        blended_target = self._ensembler.target(step=self._current_step)  # (19,)
-        blended_chunk = blended_target[None, :].astype(np.float32, copy=False)
         candidate_count = self._ensembler.candidate_count(self._current_step)
+        if candidate_count:
+            blended_target = self._ensembler.target(step=self._current_step)
+            self._last_emitted_target = blended_target.copy()
+        elif self._last_emitted_target is not None:
+            # Missing a deadline is not a reason to run inference synchronously
+            # on the 30 Hz command thread.  Exact target hold is deterministic
+            # and keeps arm_sdk ownership continuous until a fresh chunk lands.
+            blended_target = self._last_emitted_target.copy()
+            self._async_hold_ticks += 1
+            chunk_source = "async_hold"
+        else:
+            raise RuntimeError("asynchronous policy has no safe target to hold")
+
+        blended_chunk = blended_target[None, :].astype(np.float32, copy=False)
         # 事後: 次 tick に向けて step 進める
         self._current_step += 1
 
@@ -1721,9 +2046,25 @@ class Gr00tPolicy:
                 "temporal_lambda": self.cfg.temporal_lambda,
                 # 【Phase 4】async pipeline の diagnostics
                 "replan_family": self.cfg.replan_family,
-                "chunk_source": chunk_source,  # sync / async_promoted / async_none_this_tick / sync_fallback
+                "chunk_source": chunk_source,
                 "pipeline_index": pipeline_index,
                 "pending_submit_step": self._pending_submit_step,
+                # Issue #137: async pipeline の健全性。chunk が間に合わないと
+                # next_action() が前回 action を hold するが、その事実が今まで
+                # どこにも出ておらず「腕が止まっている理由」を判別できなかった。
+                "async_hold_ticks": self._async_hold_ticks,
+                "async_deadline_miss_ticks": (
+                    int(self._pipeline.deadline_miss_ticks)
+                    if self._pipeline is not None else None
+                ),
+                "async_stale_discard_count": (
+                    int(self._pipeline.stale_discard_count)
+                    if self._pipeline is not None else None
+                ),
+                "async_last_stale_discard_age_ms": (
+                    self._pipeline.last_stale_discard_age_ms
+                    if self._pipeline is not None else None
+                ),
                 # 【Phase 1】raw 53D shape (この tick で sync predict 発火時のみ埋まる)
                 "raw_action_shape_53d": raw_action_shape_53d,
                 # Debug 用: 実 dispatch した 19D の min/max
@@ -1735,6 +2076,14 @@ class Gr00tPolicy:
                 "overlay_detection_count": int(
                     self._last_sync_metadata.get("overlay_detection_count", 0)
                 ),
+                # 【Issue #137】RTC の実効値。設定どおりに効いているかは
+                # ここでしか分からない (telemetry table には出ない)。
+                # async 経路の predict latency もここで初めて記録される。
+                **{
+                    key: value
+                    for key, value in self._last_sync_metadata.items()
+                    if key.startswith("rtc_") or key == "predict_latency_ms"
+                },
             },
         )
 
@@ -1779,6 +2128,23 @@ class Gr00tPolicy:
         replan_after, max_age = family_replanning_schedule(
             self.cfg.replan_family, self.cfg.execution_steps
         )
+        # Issue #137: temporal ensemble が実際に blend できるのは、連続 chunk が
+        # 重なる区間だけ。重なり = chunk_len - execution_steps なので、
+        # execution_steps >= chunk_len だと候補が常に 1 個 = blend が一度も
+        # 起きない (実測: insert が execution_steps=16 / chunk_len=16 で重なり 0)。
+        # 本家 Isaac-GR00T の real_world_deployment.md も chunk 間の不連続を
+        # jitter 原因として挙げ、例示は --execution-horizon 8。
+        chunk_len = int(seed_chunk_19d.shape[0])
+        if self.cfg.temporal_lambda is not None and self.cfg.execution_steps >= chunk_len:
+            print(
+                f"[groot] WARNING: execution_steps={self.cfg.execution_steps} >= "
+                f"chunk_len={chunk_len}: consecutive chunks never overlap, so the "
+                f"temporal ensemble (temporal_lambda={self.cfg.temporal_lambda}) can "
+                "never blend. Chunk-boundary discontinuity will pass through to the "
+                "arm. Use execution_steps < chunk_len (Isaac-GR00T deployment guide "
+                "example: 8).",
+                file=sys.stderr,
+            )
         self._pipeline_lead_steps = self.cfg.execution_steps - replan_after
         self._pipeline_max_age_s = max_age
         self._pipeline = AsyncActionChunkPipeline(
@@ -1788,6 +2154,9 @@ class Gr00tPolicy:
             max_prediction_age_s=max_age,
             thread_name_prefix="gr00t-replan",
         )
+        # The seed's row zero is emitted by this same predict() call.  Keep the
+        # pipeline clock aligned with the physical/ensemble clock from tick 0.
+        self._pipeline.skip_consumed_prefix(1)
         # submit 中の origin_step tracking (promote 時に ensembler.add_chunk へ渡す)
         self._pending_submit_step: int | None = None
 

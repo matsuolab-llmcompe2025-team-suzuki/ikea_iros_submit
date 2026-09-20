@@ -355,3 +355,244 @@ class Ros2FrameSource:
         # 避ける。
         if channel is not None:
             channel.CloseReader()
+
+
+class ZmqFrameSource:
+    """運営 Orin bridge の ZeroMQ camera stream からの latest-only pull adapter。
+
+    # なぜ要るか
+
+    `Ros2FrameSource` は topology β (Orin が ROS2 CompressedImage を publish) を
+    前提にしている。大会会場の Orin は運営提供の `real_orin_cameras.py` が
+    **ZeroMQ に msgpack で配信** (`{"timestamps": {...}, "images": {key: jpeg}}`)
+    しており、ROS2 topic は誰も publish していない。
+
+    ZMQ → ROS2 の bridge を別プロセスで立てる案もあるが、**JPEG を再エンコードする
+    ことになり学習時の画と変わる**。本 repo は overlay の chroma subsampling 差で
+    p95 56/255 のズレを踏んだ前例があるため、ここでは ZMQ から受けた JPEG を
+    **1 回だけ decode** して ndarray を渡す。packed stereo も ndarray 上で
+    ``hconcat`` するので再エンコードは通らない。
+
+    cv2 / zmq / msgpack は `__init__` 内で lazy import する (main env から本 module
+    を import しても壊れない、`Ros2FrameSource` と同じ方針)。
+
+    Args:
+        endpoint: 運営 bridge の ZMQ endpoint (例 ``tcp://192.168.123.164:5555``)。
+        stereo_view: ``"packed"`` は左右を hconcat した全幅、``"left"`` / ``"right"``
+            は片眼。運営 bridge は左右を別キーで配信するため、``"packed"`` では
+            本 class が連結して `Ros2FrameSource` と同じ形に揃える。
+        image_key: 左右キーが無い stream での単眼 fallback キー。
+        rcvtimeo_ms: 受信 thread の `recv` timeout。close 時の応答性を決める。
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        stereo_view: str = "packed",
+        image_key: str = "ego_view",
+        rcvtimeo_ms: int = 2000,
+    ) -> None:
+        if stereo_view not in {"packed", "left", "right", "single"}:
+            raise ValueError(
+                "stereo_view must be one of 'packed', 'left', 'right', 'single', "
+                f"got {stereo_view!r}"
+            )
+        import cv2
+        import msgpack
+        import zmq
+
+        self._cv2 = cv2
+        self._msgpack = msgpack
+        self._zmq = zmq
+        self._stereo_view = stereo_view
+        self._image_key = image_key
+
+        self._latest: Optional[FrameData] = None
+        self._lock = threading.Lock()
+        self._closed = False
+        self._received_count = 0
+        self._decoded_count = 0
+        self._last_jpeg_size = 0
+        self._layout = "(未受信)"
+        self._warned_fallback = False
+
+        self._sock = zmq.Context.instance().socket(zmq.SUB)
+        self._sock.connect(endpoint)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.RCVTIMEO, rcvtimeo_ms)
+
+        self._thread: threading.Thread | None = threading.Thread(
+            target=self._recv_loop, name=f"zmq-camera:{endpoint}", daemon=True
+        )
+        self._thread.start()
+
+    # ------------------------------------------------------------------
+    def _unpack(self, raw: bytes):
+        """topic prefix が付く配信にも耐えるよう、msgpack として読める位置を探す。"""
+        candidates = [0]
+        for marker in (b"\x80", b"\x81", b"\x82", b"\x83", b"\x84"):
+            idx = raw.find(marker)
+            if idx > 0:
+                candidates.append(idx)
+        for cut in candidates:
+            try:
+                return self._msgpack.unpackb(raw[cut:], raw=False)
+            except Exception:
+                continue
+        return None
+
+    def _decode(self, jpeg: bytes) -> Optional[np.ndarray]:
+        return self._cv2.imdecode(np.frombuffer(jpeg, np.uint8), self._cv2.IMREAD_COLOR)
+
+    def _build_frame(self, images: dict) -> tuple[Optional[np.ndarray], str, int]:
+        """配信キーから 1 枚の BGR ndarray を組み立てる (JPEG 再エンコードなし)。"""
+        if self._stereo_view == "single":
+            # 手首カメラなど、stereo でない単一キーをそのまま返す。
+            if self._image_key not in images:
+                return None, "", 0
+            jpeg = images[self._image_key]
+            return self._decode(jpeg), self._image_key, len(jpeg)
+
+        left_key, right_key = "ego_view_left", "ego_view_right"
+        if self._stereo_view == "packed" and left_key in images and right_key in images:
+            left = self._decode(images[left_key])
+            right = self._decode(images[right_key])
+            if left is None or right is None:
+                return None, "", 0
+            return (
+                self._cv2.hconcat([left, right]),
+                f"hconcat({left_key}, {right_key})",
+                len(images[left_key]) + len(images[right_key]),
+            )
+        eye_key = f"ego_view_{self._stereo_view}"
+        if self._stereo_view in {"left", "right"} and eye_key in images:
+            return self._decode(images[eye_key]), eye_key, len(images[eye_key])
+        key = self._image_key if self._image_key in images else next(iter(images))
+        self._warn_fallback_once(key, sorted(images))
+        return self._decode(images[key]), f"{key} (単眼 fallback)", len(images[key])
+
+    def _warn_fallback_once(self, key: str, available: list) -> None:
+        """stereo を頼んだのに単眼しか無かったことを 1 度だけ知らせる。
+
+        運営 bridge は構成によって mono `ego_view` だけを配信することがある
+        (提出 template の `7a4f071` はそれしか定義していない。stereo キーは
+        `9f770d2` で追加された)。その場合ここで返るのは 640x480 の単眼だが、
+        orchestrator は packed (1280x480) を前提に左半分を切り出すため、
+        **例外を出さずに 320px を切り出す**という静かな失敗になる。
+        30Hz で出し続けても読めないので初回だけ出す。
+        """
+        if self._warned_fallback:
+            return
+        self._warned_fallback = True
+        print(
+            f"[ZmqFrameSource] stereo_view={self._stereo_view!r} を要求したが "
+            f"ego_view_left/right が配信に無い。{key!r} を単眼で使う "
+            f"(配信キー: {available})。packed 前提の切り出しは半分の幅になる",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _stamp_ns(msg: dict) -> int:
+        """配信側の timestamp を ns に寄せる。取れなければ受信時刻。"""
+        ts = msg.get("timestamps")
+        if isinstance(ts, dict) and ts:
+            try:
+                v = float(next(iter(ts.values())))
+                return int(v * 1e9) if v < 1e12 else int(v)
+            except Exception:
+                pass
+        return time.time_ns()
+
+    def _recv_loop(self) -> None:
+        """ZMQ 受信 thread。latest 1 frame だけ保持する (buffer を詰まらせない)。"""
+        while True:
+            with self._lock:
+                if self._closed:
+                    return
+            try:
+                raw = self._sock.recv()
+            except self._zmq.Again:
+                continue
+            except Exception:
+                return
+
+            msg = self._unpack(raw)
+            if not isinstance(msg, dict):
+                continue
+            images = msg.get("images")
+            if not isinstance(images, dict) or not images:
+                continue
+            with self._lock:
+                self._received_count += 1
+
+            try:
+                rgb, layout, jpeg_size = self._build_frame(images)
+            except Exception as e:
+                # System boundary (外部入力) なので受信 thread を殺さない。
+                print(f"[ZmqFrameSource] decode error: {e!r}", file=sys.stderr)
+                continue
+            if rgb is None:
+                continue
+
+            frame = FrameData(
+                rgb=rgb,
+                t=self._stamp_ns(msg),
+                received_monotonic_ns=time.monotonic_ns(),
+            )
+            with self._lock:
+                if self._closed:
+                    return
+                self._latest = frame
+                self._decoded_count += 1
+                self._last_jpeg_size = jpeg_size
+                self._layout = layout
+
+    # ------------------------------------------------------------------
+    def get(self) -> Optional[FrameData]:
+        with self._lock:
+            return None if self._closed else self._latest
+
+    def diagnostics(self) -> dict[str, int]:
+        """`Ros2FrameSource.diagnostics` と同じ counters (smoke check 用)。"""
+        with self._lock:
+            return {
+                "received_count": self._received_count,
+                "decoded_count": self._decoded_count,
+                "last_jpeg_size": self._last_jpeg_size,
+            }
+
+    @property
+    def layout(self) -> str:
+        """実際に組み立てている画の構成 (起動直後の確認用)。"""
+        with self._lock:
+            return self._layout
+
+    def close(self) -> None:
+        """受信 thread を止めてから socket を閉じる。冪等。
+
+        **順序が重要**: ZeroMQ の socket は thread-safe ではない。受信 thread が
+        ``recv()`` に入っている最中に別 thread から ``close()`` すると
+        ``Assertion failed: pfd.revents & POLLIN (signaler.cpp)`` で abort する。
+        `_closed` を立てて RCVTIMEO で自然に抜けるのを join で待ち、**その後に**
+        socket を閉じる。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            thread, self._thread = self._thread, None
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                print(
+                    "[ZmqFrameSource] receive worker did not stop within 5s; "
+                    "socket close を見送る (abort 回避)",
+                    file=sys.stderr,
+                )
+                return
+        try:
+            self._sock.close(linger=0)
+        except Exception:
+            pass

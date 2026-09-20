@@ -37,6 +37,28 @@ G1_WEAK_JOINT_INDICES: frozenset[int] = frozenset(
 )
 G1_MOTION_ENABLE_SLOT = 29
 
+# Pinned G1 29-DoF URDF limits in the actuator's public ordering.  A single
+# symmetric clamp is incorrect: notably both elbows stop at -1.0472 rad while
+# shoulder/wrist ranges differ substantially.
+G1_WAIST_POSITION_LOWER_RAD = np.asarray((-2.618, -0.52, -0.52), dtype=np.float64)
+G1_WAIST_POSITION_UPPER_RAD = np.asarray((2.618, 0.52, 0.52), dtype=np.float64)
+G1_ARM_POSITION_LOWER_RAD = np.asarray(
+    (
+        -3.0892, -1.5882, -2.618, -1.0472, -1.972222054, -1.614429558,
+        -1.614429558, -3.0892, -2.2515, -2.618, -1.0472, -1.972222054,
+        -1.614429558, -1.614429558,
+    ),
+    dtype=np.float64,
+)
+G1_ARM_POSITION_UPPER_RAD = np.asarray(
+    (
+        2.6704, 2.2515, 2.618, 2.0944, 1.972222054, 1.614429558,
+        1.614429558, 2.6704, 1.5882, 2.618, 2.0944, 1.972222054,
+        1.614429558, 1.614429558,
+    ),
+    dtype=np.float64,
+)
+
 
 @dataclass(frozen=True)
 class ArmControlGains:
@@ -54,8 +76,21 @@ class ArmControlGains:
 class ArmSafetyLimits:
     """Bound policy targets and their rate of change before DDS publication."""
 
-    joint_max_abs: float = 1.5
+    # Non-None is retained only as an explicit legacy/test override. Production
+    # defaults to the joint-specific pinned URDF limits above.
+    joint_max_abs: float | None = None
     velocity_limit_rad_s: float = 20.0
+
+    def __post_init__(self) -> None:
+        if self.joint_max_abs is not None and (
+            not np.isfinite(self.joint_max_abs) or self.joint_max_abs <= 0.0
+        ):
+            raise ValueError("joint_max_abs must be finite and positive or None")
+        if (
+            not np.isfinite(self.velocity_limit_rad_s)
+            or self.velocity_limit_rad_s <= 0.0
+        ):
+            raise ValueError("velocity_limit_rad_s must be finite and positive")
 
 
 @dataclass
@@ -105,6 +140,8 @@ class G1ArmActuator:
         self._waist_target = _LatestWaistTarget()
         self._running = False
         self._motion_weight = 1.0
+        self._last_published_arm_positions: np.ndarray | None = None
+        self._last_published_waist_positions: np.ndarray | None = None
         self._lowstate_subscriber: Optional[object] = None
         if gravity_compensator is not None and not hasattr(
             gravity_compensator, "torque_nm"
@@ -263,13 +300,36 @@ class G1ArmActuator:
         """
         return self._current_arm_positions()
 
+    def read_last_published_targets(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return the most recent targets whose DDS write actually succeeded."""
+
+        with self._lock:
+            arm = (
+                None if self._last_published_arm_positions is None
+                else self._last_published_arm_positions.copy()
+            )
+            waist = (
+                None if self._last_published_waist_positions is None
+                else self._last_published_waist_positions.copy()
+            )
+        return arm, waist
+
     def send_action(self, positions: Sequence[float]) -> None:
         arr = np.asarray(positions, dtype=np.float64)
         if arr.shape != (G1_NUM_ARM_JOINTS,):
             raise ValueError(
                 f"positions must have shape ({G1_NUM_ARM_JOINTS},), got {arr.shape}"
             )
-        clamped = np.clip(arr, -self._limits.joint_max_abs, self._limits.joint_max_abs)
+        if not np.isfinite(arr).all():
+            raise ValueError("positions must contain only finite values")
+        if self._limits.joint_max_abs is None:
+            lower, upper = G1_ARM_POSITION_LOWER_RAD, G1_ARM_POSITION_UPPER_RAD
+        else:
+            bound = float(self._limits.joint_max_abs)
+            lower, upper = -bound, bound
+        clamped = np.clip(arr, lower, upper)
         with self._lock:
             self._target.positions = clamped
             self._target.received = True
@@ -279,8 +339,8 @@ class G1ArmActuator:
 
         Args:
             positions: length-3、G1_WAIST_JOINT_INDICES 順 (yaw, roll, pitch) [rad]。
-                       ArmSafetyLimits.joint_max_abs で clamp、velocity_limit_rad_s
-                       で rate limit (arm と同 limits を共有)。
+                       pinned URDF bounds (or explicit legacy override) で clamp、
+                       velocity_limit_rad_s で rate limit (arm と同 limits を共有)。
 
         呼び出し無し (受信前) の場合、waist joints は lowstate 初期値 (hold pose)
         で固定 = backward compat (前 tick までの arm-only 動作を壊さない)。
@@ -291,7 +351,14 @@ class G1ArmActuator:
                 f"waist positions must have shape ({G1_NUM_WAIST_JOINTS},), "
                 f"got {arr.shape}"
             )
-        clamped = np.clip(arr, -self._limits.joint_max_abs, self._limits.joint_max_abs)
+        if not np.isfinite(arr).all():
+            raise ValueError("waist positions must contain only finite values")
+        if self._limits.joint_max_abs is None:
+            lower, upper = G1_WAIST_POSITION_LOWER_RAD, G1_WAIST_POSITION_UPPER_RAD
+        else:
+            bound = float(self._limits.joint_max_abs)
+            lower, upper = -bound, bound
+        clamped = np.clip(arr, lower, upper)
         with self._lock:
             self._waist_target.positions = clamped
             self._waist_target.received = True
@@ -418,6 +485,14 @@ class G1ArmActuator:
             if self._crc_fn is not None and hasattr(self._crc_fn, "Crc"):
                 lowcmd.crc = self._crc_fn.Crc(lowcmd)  # type: ignore[attr-defined]
             self._publisher.Write(lowcmd)  # type: ignore[attr-defined]
+            # Update telemetry only after Write succeeds; otherwise a failed
+            # DDS command must not be represented as applied to the robot.
+            with self._lock:
+                self._last_published_arm_positions = rate_limited_arm.copy()
+                self._last_published_waist_positions = (
+                    None if rate_limited_waist is None
+                    else rate_limited_waist.copy()
+                )
         except Exception as exc:
             print(f"[G1ArmActuator] publish error: {exc!r}", file=sys.stderr)
 

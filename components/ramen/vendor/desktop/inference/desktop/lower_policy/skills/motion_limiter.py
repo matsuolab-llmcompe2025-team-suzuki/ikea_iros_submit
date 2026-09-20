@@ -7,8 +7,8 @@ Ported from issue-70-flip-table-data-augmentation branch
 
 # 3 段適用 pipeline
 
-1. **Position clip**: `lower <= target <= upper` (無効値検出 + hardware range 保護、
-   本 phase では実装 stub、Layer 2 で最終 clamp されるので緩めに設定可)
+1. **Position validation**: configured waist/arm violations reject the complete
+   upper-body target and HOLD; Dex1 endpoint overflow is clipped.
 2. **Velocity limit**: `|target - reference| / dt <= max_velocity` (per-dim)
 3. **Acceleration limit**: `|velocity - prev_velocity| / dt <= max_acceleration`
 
@@ -74,6 +74,7 @@ class MotionLimiter:
         control_hz: float,
         lower: Sequence[float] | None = None,
         upper: Sequence[float] | None = None,
+        reject_position_slice: slice | None = None,
     ) -> None:
         if not isinstance(dim, int) or dim <= 0:
             raise ValueError(f"dim must be positive int, got {dim!r}")
@@ -92,6 +93,7 @@ class MotionLimiter:
         self.control_hz = float(control_hz)
         self._arm_slice = arm_slice
         self._hand_slice = hand_slice
+        self._reject_position_slice = reject_position_slice
 
         # per-dim envelope を build。arm slice (=waist+arm) は arm limits、
         # hand slice は hand limits。issue-70 は 16D 固定 vector を外部から渡す
@@ -102,10 +104,8 @@ class MotionLimiter:
         self._max_acceleration = np.full(self.dim, hand_acceleration, dtype=np.float64)
         self._max_acceleration[arm_slice] = arm_acceleration
 
-        # Position clip (optional、default = clip 無効化した超保守的 ±100 rad)。
-        # 具体的な G1 joint 範囲は Layer 2 (ArmSafetyLimits.joint_max_abs=1.5)
-        # + hand actuator HAND_GRIP_MAX=5.4 で最終 clamp されるため、Layer 1 は
-        # 明示指定なければ実質 no-op で通過させる (safe default)。
+        # Position bounds are optional for generic/unit-test callers. Physical
+        # runners always inject pinned URDF waist/arm limits and Dex1 endpoints.
         if lower is None:
             self._lower = np.full(self.dim, -100.0, dtype=np.float64)
         else:
@@ -119,6 +119,10 @@ class MotionLimiter:
 
         self._previous_target: np.ndarray | None = None
         self._previous_velocity = np.zeros(self.dim, dtype=np.float64)
+        # Issue #137 diagnostics: position clip が効いた dim / 累積 tick 数。
+        self.last_position_violation_indices: tuple[int, ...] = ()
+        self.position_violation_ticks: int = 0
+        self.last_target_held = False
 
     def _require_dim(self, name: str, values: Sequence[float]) -> np.ndarray:
         array = np.asarray(values, dtype=np.float64)
@@ -138,6 +142,10 @@ class MotionLimiter:
         """
         self._previous_target = None
         self._previous_velocity.fill(0.0)
+        # Issue #137: 違反 counter は skill 単位で見たいので reset で戻す。
+        self.last_position_violation_indices = ()
+        self.position_violation_ticks = 0
+        self.last_target_held = False
 
     def apply(
         self,
@@ -156,20 +164,54 @@ class MotionLimiter:
             (dim,) float64、position/velocity/acceleration の全 envelope を通した
             safe target。
         """
-        requested = np.clip(
-            self._require_dim("target", target), self._lower, self._upper
-        )
+        raw_target = self._require_dim("target", target)
         measured_array = self._require_dim("measured", measured)
+        violations = np.flatnonzero(
+            (raw_target < self._lower) | (raw_target > self._upper)
+        )
+        self.last_position_violation_indices = tuple(int(i) for i in violations)
+        if self.last_position_violation_indices:
+            self.position_violation_ticks += 1
+        reject_indices = violations
+        if self._reject_position_slice is not None:
+            allowed = np.arange(self.dim)[self._reject_position_slice]
+            reject_indices = np.intersect1d(violations, allowed, assume_unique=True)
+        if reject_indices.size:
+            # Mechanical-limit violations invalidate the entire controlled
+            # upper-body target.  Joint-wise correction can distort a learned
+            # bimanual action into a different and unsafe motion; exact HOLD is
+            # the only truthful fallback until the next replan.
+            safe = (
+                measured_array.copy()
+                if self._previous_target is None
+                else self._previous_target.copy()
+            )
+            self._previous_target = safe.copy()
+            self._previous_velocity.fill(0.0)
+            self.last_target_held = True
+            return safe
+
+        requested = np.clip(raw_target, self._lower, self._upper)
+        self.last_target_held = False
         reference = (
             measured_array if self._previous_target is None else self._previous_target
         )
         dt = 1.0 / self.control_hz
 
-        # velocity clip: (target - reference) / dt を ±max_velocity で clamp
+        # Issue #137: 制動距離による速度上限。`v <= sqrt(2 * a * |残距離|)` を満たす
+        # 速度なら、加速度上限だけで目標に止まれる。これが無いと目標到達時点で速度が
+        # 残り、行き過ぎる (実測: insert 設定 vel 1.0 / acc 8.0 で step 0.05 rad に
+        # 対し overshoot 40%)。chunk 切替のたびに乗るため振動源になっていた。
+        # 台形速度プロファイルの標準形で、新規 tuning parameter は増やさない。
+        brake_velocity = np.sqrt(
+            2.0 * self._max_acceleration * np.abs(requested - reference)
+        )
+        velocity_cap = np.minimum(self._max_velocity, brake_velocity)
+        # velocity clip: (target - reference) / dt を ±velocity_cap で clamp
         desired_velocity = np.clip(
             (requested - reference) / dt,
-            -self._max_velocity,
-            self._max_velocity,
+            -velocity_cap,
+            velocity_cap,
         )
         # acceleration clip: 前 tick velocity からの delta を ±max_acc*dt で clamp
         velocity_delta = np.clip(

@@ -40,14 +40,26 @@ Batch key / dim / shape の唯一の真実:
 
 from __future__ import annotations
 
+import statistics
+import sys
+import threading
 import time
+from collections import deque
 
 import numpy as np
 
+from inference.desktop.lower_policy.rtc import (
+    AUTO_FROZEN_STEPS,
+    ChunkLeftoverBuffer,
+    DelayEstimator,
+    build_velocity_strength,
+    validate_rtc_against_chunk_len,
+)
 from inference.desktop.lower_policy.policies.base import (
     CameraKey,
     G1_UPPER_BODY_JOINT_DIM,
     G1_UPPER_BODY_JOINT_INDICES,
+    OVERLAY_JPEG_SUBSAMPLINGS,
     Observation,
     PolicyAction,
     PolicyConfig,
@@ -96,12 +108,28 @@ OVERLAY_TARGET_CAMS: tuple[CameraKey, ...] = (
     CameraKey.HEAD_RIGHT,
 )
 
-# RAMEN-Ori 4 cam layout (data_lerobot.py:default_camera_keys 順)
+# RAMEN-Ori 4 cam layout (Phase 2、data_lerobot.py:default_camera_keys 順)
 CAMERAS: tuple[CameraKey, ...] = (
     CameraKey.HEAD_LEFT,
     CameraKey.HEAD_RIGHT,
     CameraKey.WRIST_LEFT,
     CameraKey.WRIST_RIGHT,
+)
+
+# RAMEN-Ori 3 cam layout (Phase K = Issue #129 commit 652c31b、head_right 除外)。
+# GR00T と apples-to-apples 比較性 + vision backbone forward の compute -33% 目的。
+# Phase K 6 run (Run 5 winner 含む) はこの layout で学習、slot YAML で明示指定して
+# 4 cam default を override する。cam_id は 0..N-1 で割当 (build_batch_dict L572 arange)。
+CAMERAS_3CAM_PHASE_K: tuple[CameraKey, ...] = (
+    CameraKey.HEAD_LEFT,
+    CameraKey.WRIST_LEFT,
+    CameraKey.WRIST_RIGHT,
+)
+
+# RAMEN-Ori variant で許容する cam layout 集合 (validate_ramen_ori_config が使う)。
+VALID_CAM_LAYOUTS: tuple[tuple[CameraKey, ...], ...] = (
+    CAMERAS,
+    CAMERAS_3CAM_PHASE_K,
 )
 
 # ImageNet normalize (LingBot / DINOv2 系標準、data_lerobot.py:IMAGENET_MEAN/STD)
@@ -147,6 +175,61 @@ def _log_state_dict_load(
         print(f"  unexpected keys (first 10): {unexpected[:10]}", file=_sys.stderr)
 
 
+_COMPILE_PREFIX = "_orig_mod."
+
+
+def strip_compile_prefix(state_dict: dict) -> dict:
+    """`torch.compile` 由来の `_orig_mod.` prefix を key から除去する。
+
+    `train.py` は `torch.compile(model)` 後の `model.state_dict()` を保存するため、
+    `speedup.torch_compile=true` で学習した ckpt は全 key に `_orig_mod.` が付く
+    (Issue #137、Phase K R-6 全 6 run が該当)。prefix 付きのまま
+    `load_state_dict(strict=False)` すると **1 key も一致せず**、モデルは初期化の
+    まま残る (実測: 非 backbone param 374 個中 135 個が zero-init のまま)。
+
+    Issue #137 Phase B 以降の ckpt は保存側で正規化済なので no-op になる。
+    """
+    if not any(k.startswith(_COMPILE_PREFIX) for k in state_dict):
+        return state_dict
+    return {
+        k[len(_COMPILE_PREFIX):] if k.startswith(_COMPILE_PREFIX) else k: v
+        for k, v in state_dict.items()
+    }
+
+
+def ema_state_dict_is_stale(ema_state: dict, model_state: dict) -> bool:
+    """EMA shadow が一度も更新されていない ckpt かを判定する (Issue #137)。
+
+    `train.py` が EMA を `torch.compile` **前**に構築し、`update()` を compile
+    **後**の `named_parameters()` で回していたため、key が一致せず shadow が
+    step 0 の初期化値のまま保存されていた。この ckpt を推論で使うと
+    `action_expert.output_proj` が zero-init のままになり、Flow Matching の
+    `v_pred = 0` → `sample_action` が noise `x_0` をそのまま返す。
+
+    判定は「model 側が非ゼロなのに EMA 側が完全ゼロ」の key が 1 つでもあるか。
+    zero-init 層 (output_proj / AdaLN-Zero) は学習で必ず非ゼロになるので、
+    正常に更新された EMA でこの条件が立つことはない。閾値やヒューリスティックは
+    使わない。
+
+    Args:
+        ema_state / model_state: いずれも prefix 正規化済の state_dict。
+
+    Returns:
+        True なら shadow が未更新 = raw weights を使うべき。
+    """
+    for key, ema_tensor in ema_state.items():
+        model_tensor = model_state.get(key)
+        if model_tensor is None:
+            continue
+        if not (hasattr(ema_tensor, "numel") and hasattr(model_tensor, "numel")):
+            continue
+        if ema_tensor.numel() == 0 or ema_tensor.shape != model_tensor.shape:
+            continue
+        if float(ema_tensor.abs().max()) == 0.0 and float(model_tensor.abs().max()) != 0.0:
+            return True
+    return False
+
+
 def _validate_architecture_state_dict_load(
     missing: list[str],
     unexpected: list[str],
@@ -159,15 +242,26 @@ def _validate_architecture_state_dict_load(
     key, means the inference model was instantiated with a different architecture.
     Continuing in that state silently evaluates random modules instead of the named
     variant, so physical evaluation must fail closed.
+
+    Issue #134 Phase H-4: rel action model の `_relative_arms_mean/std` は EMA
+    state_dict に含まれない (buffer は EMA shadow の対象外)。init 時に
+    ``relative_stats`` から埋めるので、EMA path で missing 判定されても値は有効
+    → allow-list に加える。
     """
+    _ALLOWED_MISSING = frozenset({"_relative_arms_mean", "_relative_arms_std"})
     disallowed_missing = [
-        key for key in missing if not key.startswith("vision.backbone.")
+        key for key in missing
+        if not key.startswith("vision.backbone.") and key not in _ALLOWED_MISSING
     ]
-    if disallowed_missing or unexpected:
+    # Issue #137: `fk.*` は L4 FK anchor loss 用の学習専用 buffer
+    # (model/ramen_ori/fk.py:G1WristFKTorch)。inference model は FK を持たないので
+    # unexpected に出るが、action 出力には一切関与しない → 許容する。
+    disallowed_unexpected = [key for key in unexpected if not key.startswith("fk.")]
+    if disallowed_missing or disallowed_unexpected:
         raise RuntimeError(
             "RAMEN-Ori checkpoint architecture mismatch: "
             f"missing_non_backbone={len(disallowed_missing)} "
-            f"unexpected={len(unexpected)} checkpoint={ckpt_path!r}. "
+            f"unexpected={len(disallowed_unexpected)} checkpoint={ckpt_path!r}. "
             "Refusing to evaluate a partially loaded model."
         )
 
@@ -175,24 +269,160 @@ def _validate_architecture_state_dict_load(
 # ---- Preprocessing helpers (default env で testable、torch 不要) ---- #
 
 
+CONTRACT_STATE_VARIANT_V2 = 2
+# memory が見るカメラ (学習は `observation.images.cam_0` = head_left、
+# `model/ramen_ori/memory_features.py:MEMORY_CAMERA`)。
+_MEMORY_CAMERA_KEY = CameraKey.HEAD_LEFT
+# 学習の camera key (`observation.images.cam_N`) → 推論の CameraKey。
+# cam_0 head_left / cam_1 head_right / cam_2 左手首 / cam_3 右手首。
+_CONTRACT_CAM_INDEX_TO_KEY = {
+    0: CameraKey.HEAD_LEFT,
+    1: CameraKey.HEAD_RIGHT,
+    2: CameraKey.WRIST_LEFT,
+    3: CameraKey.WRIST_RIGHT,
+}
+
+
+def _contract_camera_keys(camera_keys) -> tuple[str, ...]:
+    """約束の camera key を推論の CameraKey の値に直す。並びも保つ。"""
+    resolved: list[str] = []
+    for key in camera_keys:
+        index = str(key).rsplit("cam_", 1)[-1]
+        if not index.isdigit() or int(index) not in _CONTRACT_CAM_INDEX_TO_KEY:
+            raise RuntimeError(f"ckpt contract has an unknown camera key: {key!r}")
+        resolved.append(_CONTRACT_CAM_INDEX_TO_KEY[int(index)].value)
+    return tuple(resolved)
+
+
+def validate_contract(contract: dict, cfg: PolicyConfig) -> None:
+    """ckpt の約束と推論の設定が合っているかを、重みを読む前に確かめる (Issue #141 P8-3)。
+
+    合っていなければここで止める。黙って違う入力で動かすと、実機で「なぜか下手」な
+    run を 1 本使ってしまう。
+
+    見るもの:
+        - slot の `skill_id` がその ckpt の学習した skill に含まれるか
+        - overlay を焼いた YOLO の `repo@revision` が `policy_config.yaml` と同じか
+        - overlay の conf と線の太さ (推論の描画と同じか)
+        - カメラの並び / 画像の大きさ / chunk の長さ / action の空間
+
+    Args:
+        contract: `ckpt["contract"]` (`model/ramen_ori/contract.py` が学習時に作る)。
+        cfg: 推論の slot の設定。
+    """
+    version = contract.get("version")
+    if version != 1:
+        raise RuntimeError(
+            f"ckpt contract version {version!r} is not supported by this inference "
+            "build (expected 1)"
+        )
+    problems: list[str] = []
+
+    skill_ids = {int(skill["id"]) for skill in contract.get("skills", [])}
+    if cfg.skill_id is None:
+        problems.append(
+            f"slot does not set skill_id; the ckpt was trained on {sorted(skill_ids)}"
+        )
+    elif int(cfg.skill_id) not in skill_ids:
+        problems.append(
+            f"slot skill_id={cfg.skill_id} is not in the ckpt's skills {sorted(skill_ids)}"
+        )
+
+    state = contract.get("state") or {}
+    state_shape = state.get("variant")
+    if state_shape is not None and str(state_shape) != "71d":
+        problems.append(
+            f"state layout: ckpt={state_shape!r} inference=71d (E-δ)"
+        )
+    state_version = state.get("version")
+    if state_version is not None and int(state_version) not in (1, 2):
+        problems.append(
+            f"state version {state_version} is not supported (inference knows 1 and 2)"
+        )
+
+    action = contract.get("action") or {}
+    if action.get("space") != cfg.action_space:
+        problems.append(
+            f"action space: ckpt={action.get('space')!r} slot={cfg.action_space!r}"
+        )
+
+    images = contract.get("images") or {}
+    ckpt_cams = _contract_camera_keys(images.get("camera_keys") or ())
+    slot_cams = tuple(cam.value for cam in cfg.cams)
+    if ckpt_cams and ckpt_cams != slot_cams:
+        problems.append(f"cameras: ckpt={list(ckpt_cams)} slot={list(slot_cams)}")
+    img_size = images.get("img_size")
+    if img_size is not None and int(img_size) != IMAGE_HW[0]:
+        problems.append(f"image size: ckpt={img_size} inference={IMAGE_HW[0]}")
+
+    overlay = images.get("overlay")
+    if overlay:
+        ckpt_yolo = overlay.get("yolo_ckpt")
+        if ckpt_yolo and cfg.yolo_ckpt_ref and ckpt_yolo != cfg.yolo_ckpt_ref:
+            problems.append(
+                f"overlay YOLO weight: ckpt={ckpt_yolo!r} policy_config={cfg.yolo_ckpt_ref!r}"
+            )
+        conf = overlay.get("conf")
+        if conf is not None and abs(float(conf) - DEFAULT_OVERLAY_CONF_THRESHOLD) > 1e-9:
+            problems.append(
+                f"overlay conf: ckpt={conf} inference={DEFAULT_OVERLAY_CONF_THRESHOLD}"
+            )
+        thickness = overlay.get("thickness")
+        if thickness is not None and int(thickness) != DEFAULT_OVERLAY_LINE_THICKNESS:
+            problems.append(
+                f"overlay line thickness: ckpt={thickness} inference={DEFAULT_OVERLAY_LINE_THICKNESS}"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "ckpt contract does not match the inference configuration:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+
 def validate_ramen_ori_config(cfg: PolicyConfig) -> None:
     """`PolicyConfig` が RAMEN-Ori の contract を満たすかを検証する。
 
-    - cams が 4 cam layout (HEAD_LEFT, HEAD_RIGHT, WRIST_LEFT, WRIST_RIGHT)
-      であること (data_lerobot.py:default_camera_keys 順、cam_id 割当と一致)
+    - cams が VALID_CAM_LAYOUTS のいずれかであること:
+        * 4 cam (CAMERAS) = Phase 2 5 variant (data_lerobot.py:default_camera_keys 順)
+        * 3 cam (CAMERAS_3CAM_PHASE_K) = Phase K 6 run (head_right 除外)
     - mode が "none" / "precomputed_token" / "overlay" のいずれか (base.py の
       PolicyConfig.__post_init__ でも validate されるが RAMEN-Ori は 3 mode 全対応)
     - dtype fp32 or bf16 (fp16 は非推奨)
     """
-    if tuple(cfg.cams) != CAMERAS:
+    if tuple(cfg.cams) not in VALID_CAM_LAYOUTS:
+        valid_str = "\n".join(
+            f"  - {tuple(c.value for c in layout)!r}" for layout in VALID_CAM_LAYOUTS
+        )
         raise ValueError(
-            f"RAMEN-Ori requires cams={tuple(c.value for c in CAMERAS)!r} "
-            f"(4 cam layout per data_lerobot.py:default_camera_keys), got "
-            f"{tuple(c.value for c in cfg.cams)!r}"
+            f"RAMEN-Ori cams layout {tuple(c.value for c in cfg.cams)!r} not "
+            f"supported. Valid layouts:\n{valid_str}"
+        )
+    if (
+        cfg.action_space == "rel"
+        and cfg.rtc.enabled
+        and not cfg.rtc.allow_experimental_relative_action
+    ):
+        raise ValueError(
+            "RAMEN-Ori RTC is not safe with action_space='rel': the RTC soft ramp "
+            "operates on normalized delta-q rows whose errors accumulate during "
+            "absolute-joint reconstruction. Use async replanning/temporal ensemble "
+            "with rtc.enabled=false."
+        )
+    if (
+        cfg.action_space == "rel"
+        and cfg.rtc.enabled
+        and cfg.rtc.allow_experimental_relative_action
+    ):
+        print(
+            "[ramen_ori] WARNING: experimental RTC on cumulative relative "
+            "delta-q is enabled. Issue #137 B-3 produced 827/899 safety HOLD "
+            "ticks; this setting is for the isolated B-4 comparison only.",
+            file=sys.stderr,
         )
 
 
-def build_state_from_raw(raw: RawRobotState) -> np.ndarray:
+def build_state_from_raw(raw: RawRobotState, *, state_variant: int = 1) -> np.ndarray:
     """Raw robot state → RAMEN-Ori 71D E-δ state。
 
     E-δ 71D layout (training-side state_derive.py:derive_state_71d docstring):
@@ -207,7 +437,9 @@ def build_state_from_raw(raw: RawRobotState) -> np.ndarray:
 
     Args:
         raw: orchestrator の RawRobotState (Orin 実データ layout)。
-             last_action_19d / joint_positions_prev は Phase A-4 まで未使用。
+        state_variant: state の定義の版 (`ckpt["contract"]["state"]["variant"]`)。
+            1 = Phase K まで。2 = Issue #141 の再学習 (tracking_err の腰 3 次元は 0。
+            腰の指令は出していないので、学習では常に 0 が入っている)。
 
     Returns:
         (71,) float32、E-δ layout の state。
@@ -241,6 +473,10 @@ def build_state_from_raw(raw: RawRobotState) -> np.ndarray:
                 f"last_action_19d must be (19,), got {raw.last_action_19d.shape}"
             )
         out[19:38] = raw.last_action_19d.astype(np.float32, copy=False) - joint_slice
+        if state_variant >= CONTRACT_STATE_VARIANT_V2:
+            # 腰は指令を出していない (action は腕 14 + hand 2)。学習の state は
+            # 腰の tracking_err を 0 で作っているので、推論も 0 にする (Issue #141 P8-4)。
+            out[19:22] = 0.0
 
     # [38:57] velocity = joint_slice - prev_joint_slice (19D)
     # 学習側と同じく、腕・腰とDex1を同じ前tick実測値から差分化する。
@@ -401,6 +637,40 @@ def overlay_obb_on_frame(
     return frame_bgr
 
 
+def match_training_jpeg(frame_bgr: np.ndarray, subsampling: str) -> np.ndarray:
+    """overlay 対象 cam の画像を、学習 overlay cache の jpg 保存と同じ設定で 1 回通す。
+
+    学習の overlay cache は box 描画後の画像を quality 90 で jpg 保存し、学習時は cv2 で
+    読んでいる。色差 (`subsampling`) は焼き込みの時期で違う:
+
+    - "4:4:4": Issue #139 の統合 cache (2026-09-12 以降)。GPU の nvJPEG は色差を間引かない
+    - "4:2:0": それより前 (GR00T #129 / RAMEN-Ori Phase K)。PIL の既定
+
+    2px の色線は 4:2:0 の間引きで色が滲むので、推論時にそのまま描いた線とは明確に違う
+    (box の線で平均 16/255、背景は 1/255 未満)。逆に 4:4:4 の cache で学習した ckpt に
+    4:2:0 を通すと、box の画素が平均 5.9/255 (上位 5% で 56/255) ずれる。box が 0 件の
+    frame も cache では同じ保存を通っているので、overlay mode では描画の有無にかかわらず通す。
+
+    WHY: 焼き込みの保存設定を変えた cache で学習した ckpt を使う時は、slot の
+    `overlay_jpeg_subsampling` を合わせる。
+    """
+    if subsampling not in OVERLAY_JPEG_SUBSAMPLINGS:
+        raise ValueError(
+            f"subsampling must be one of {tuple(OVERLAY_JPEG_SUBSAMPLINGS)}, got {subsampling!r}"
+        )
+    # lazy: env-isolated dependencies (Pillow / opencv は runtime env と推論 env のみ)
+    import io
+
+    import cv2
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(frame_bgr[..., ::-1])).save(
+        buffer, format="JPEG", quality=90, subsampling=OVERLAY_JPEG_SUBSAMPLINGS[subsampling]
+    )
+    return cv2.imdecode(np.frombuffer(buffer.getvalue(), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 def split_head_stereo(head_packed_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """480x1280 packed head stereo → (head_left 480x640, head_right 480x640)。
 
@@ -473,7 +743,13 @@ def preprocess_frame(frame_bgr: np.ndarray) -> np.ndarray:
     return tensor.numpy()
 
 
-def build_batch_dict(obs: Observation, mode: str) -> dict:
+def build_batch_dict(
+    obs: Observation,
+    mode: str,
+    cams: tuple[CameraKey, ...] = CAMERAS,
+    overlay_jpeg_subsampling: str | None = None,
+    with_prev_frames: bool = True,
+) -> dict:
     """Observation → RAMEN-Ori model.predict_action() が受け取る batch dict。
 
     Batch key layout (model.py 冒頭 docstring):
@@ -495,6 +771,10 @@ def build_batch_dict(obs: Observation, mode: str) -> dict:
         obs: Skill wrapper が assemble 済の Observation。
         mode: "none" のみ Phase 3 対応。"overlay" / "precomputed_token" は Phase
               5/6 で拡張。
+        cams: 使う cam layout。default は 4 cam (Phase 2 5 variant)、Phase K
+              Run 5 は 3 cam (CAMERAS_3CAM_PHASE_K) を渡す。
+        overlay_jpeg_subsampling: overlay 画像を通す jpg の色差 ("4:4:4" / "4:2:0")。
+              mode="overlay" では必須 (slot の PolicyConfig.overlay_jpeg_subsampling)。
 
     Returns:
         numpy dict、batch 次元 (B=1) 追加前。predict() 側で unsqueeze(0)。
@@ -503,6 +783,11 @@ def build_batch_dict(obs: Observation, mode: str) -> dict:
         raise ValueError(
             f"mode must be one of 'none' / 'precomputed_token' / 'overlay', "
             f"got {mode!r}"
+        )
+    if mode == "overlay" and overlay_jpeg_subsampling is None:
+        raise ValueError(
+            "mode='overlay' requires overlay_jpeg_subsampling (the training cache's "
+            "JPEG chroma subsampling)"
         )
 
     if obs.state.shape != (STATE_DIM,):
@@ -519,51 +804,57 @@ def build_batch_dict(obs: Observation, mode: str) -> dict:
         raise ValueError(
             f"skill_id must be in [0, {NUM_SKILLS}), got {obs.skill_id}"
         )
-    for cam in CAMERAS:
+    for cam in cams:
         if cam not in obs.frames_bgr:
             raise KeyError(
                 f"Observation.frames_bgr missing required cam {cam.value!r} "
-                f"(RAMEN-Ori needs {tuple(c.value for c in CAMERAS)!r})"
+                f"(RAMEN-Ori needs {tuple(c.value for c in cams)!r})"
             )
 
-    N = len(CAMERAS)
+    N = len(cams)
 
     # mode=overlay: 描画は raw resolution (480x640) の frames_bgr に対して行い、
     # その後 preprocess_frame (resize→normalize) を通す = training-side D-3 hook と
     # 同順 (post-decode hook → LeRobot Resize が antialias)。
     # ※ in-place で書き換わるため、caller の frames_bgr を汚染しないよう copy。
     def _maybe_overlay(cam: CameraKey, frame: np.ndarray) -> np.ndarray:
-        if mode != "overlay" or not obs.obb_detections:
-            return frame
-        if cam not in OVERLAY_TARGET_CAMS:
+        if mode != "overlay" or cam not in OVERLAY_TARGET_CAMS:
             # training-side cache に無い cam (wrist) は overlay 対象外
             return frame
-        # per-cam det list を dict から取得 (未提供 cam は overlay skip)
-        cam_dets = obs.obb_detections.get(cam)
-        if not cam_dets:
-            return frame
+        # per-cam det list を dict から取得 (未提供 cam は描画 skip)。
         # in-place 汚染回避のため copy してから描画
-        return overlay_obb_on_frame(frame.copy(), cam_dets)
+        cam_dets = (obs.obb_detections or {}).get(cam)
+        drawn = overlay_obb_on_frame(frame.copy(), cam_dets) if cam_dets else frame
+        return match_training_jpeg(drawn, overlay_jpeg_subsampling)
 
     # Current frames (I_t)
     images = np.stack(
         [
             preprocess_frame(_maybe_overlay(cam, obs.frames_bgr[cam]))
-            for cam in CAMERAS
+            for cam in cams
         ],
         axis=0,
     )  # (N, 3, 224, 224)
 
-    # Previous frames (I_{t-1})、None なら zeros (data_lerobot.py "先頭 frame は zeros" 追従)
-    if obs.frames_bgr_prev is None:
+    # Previous frames (I_{t-1})。
+    # 前の frame が無いとき (skill の 1 tick 目、reset の直後) は **今の frame をそのまま**
+    # 入れて差分を 0 にする (Issue #141 束 1-3 / INF-4)。学習も区間の頭では
+    # `images_prev = images.clone()` (data_lerobot.py の ep 境界) で差分 0 にしている。
+    # zeros を入れると「画像がまるごと現れた」差分になり、学習に無い入力で 1 tick 目を出すことになる。
+    # 画像差分を使わない ckpt (Issue #141 の再学習、`model.temporal: null`) では、
+    # 前処理そのものを飛ばす (overlay の描画と resize が 1 tick ぶん浮く、P8-5)。
+    if not with_prev_frames:
         images_prev = np.zeros_like(images)
+    elif obs.frames_bgr_prev is None:
+        images_prev = images.copy()
     else:
+        # 前の frame に無い cam も、その cam の差分だけ 0 にする (同上)。
         images_prev = np.stack(
             [
                 preprocess_frame(_maybe_overlay(cam, obs.frames_bgr_prev[cam]))
                 if cam in obs.frames_bgr_prev
-                else np.zeros((3, IMAGE_HW[0], IMAGE_HW[1]), dtype=np.float32)
-                for cam in CAMERAS
+                else images[index]
+                for index, cam in enumerate(cams)
             ],
             axis=0,
         )
@@ -576,7 +867,7 @@ def build_batch_dict(obs: Observation, mode: str) -> dict:
     # mode=precomputed_token では per-cam det を top_K 個 pack (conf desc)。
     if mode == "precomputed_token" and obs.obb_detections:
         obb_verts, obb_conf, obb_class_id, obb_valid_mask = pack_obb_tokens(
-            obs.obb_detections, cams=CAMERAS, top_k=TOP_K
+            obs.obb_detections, cams=cams, top_k=TOP_K
         )
     else:
         obb_verts = np.zeros((N, TOP_K, 8), dtype=np.float32)
@@ -626,21 +917,343 @@ class RamenOriPolicy:
     NUM_SKILLS = NUM_SKILLS
     SKILL_MOVE_TABLE_BASE = SKILL_MOVE_TABLE_BASE
     SKILL_ROTATE_TABLE_BASE = SKILL_ROTATE_TABLE_BASE
-    # VlaSkill only receives the common policy object.  Expose the canonical
-    # module-level mapper on the class so online and offline state assembly use
-    # the exact same 71D contract.
-    build_state_from_raw = staticmethod(build_state_from_raw)
+
 
     def __init__(
         self,
         cfg: PolicyConfig,
         _model=None,
         _device: str | None = None,
+        _contract: dict | None = None,
     ) -> None:
         validate_ramen_ori_config(cfg)
         self.cfg = cfg
         self._model = _model
         self._device = _device or cfg.device
+        # ckpt の約束 (Issue #141 P8)。Phase K までの ckpt では None で、
+        # state の版も入力の作り方も従来のまま。
+        self.contract = _contract
+        # 約束の `state` は 2 つ持つ: `variant` は state の形 ("71d" = E-δ / "73d" = E-β)、
+        # `version` は中身の定義の版 (2 = 腰の tracking_err を 0 にする)。P8-4 が見るのは版。
+        self._state_version = int(
+            ((_contract or {}).get("state") or {}).get("version", 1)
+        )
+        # Issue #141 P8-6: memory の token を持つ ckpt では、学習と同じ tracker を
+        # tick ごとに回す。skill の開始 (reset) で忘れる。
+        self._memory_tracker = None
+        self._memory_ticks = 0
+        # Issue #137 Phase C: async replanning + temporal ensemble。
+        # **cfg.replan_family=None (既定) なら一切使わず、毎 tick 同期推論して
+        # chunk 全体を返す従来動作のまま**。設定した時だけ GR00T と同じ
+        # 「policy 内部で pipeline + ensembler を持ち 1 行だけ返す」構造になる。
+        from model.subtask_policy_training.gr00t.temporal_ensemble import (
+            TargetTemporalEnsembler,
+        )
+        self._ensembler = TargetTemporalEnsembler(
+            dim=ACTION_DIM, decay_lambda=cfg.temporal_lambda
+        )
+        self._current_step: int = 0
+        self._pipeline = None
+        self._pipeline_lead_steps: int | None = None
+        self._pipeline_max_age_s: float | None = None
+        self._pending_submit_step: int | None = None
+        self._last_seen_obs: Observation | None = None
+        # Issue #137 Phase C-3: RTC。cfg.rtc.enabled=False (既定) なら buffer も
+        # 作らず prefix 経路に入らない = 従来動作と同一。
+        self._rtc_leftover = (
+            ChunkLeftoverBuffer(action_dim=ACTION_DIM) if cfg.rtc.enabled else None
+        )
+        self._rtc_delay = DelayEstimator()
+        self._rtc_tick_deltas: deque[float] = deque(maxlen=32)
+        self._rtc_last_tick_ns: int | None = None
+        self._rtc_disabled_after_error = False
+        self._last_rtc_metadata: dict = {}
+        # model の action 空間 (16=Phase K waist 除外 / 19)。prefix を model space に
+        # 戻すのに要るが ckpt を読むまで確定しないので初回 predict で確定させる。
+        self._model_action_dim: int | None = None
+        self._model_chunk_len: int | None = None
+        # predict は stateless (tick 間で持ち越す可変状態は無い) ので GR00T のような
+        # correctness 上の必要は無いが、async worker と sync_fallback が同時に
+        # forward すると VRAM ピークが倍になる。構造も GR00T と揃えて直列化する。
+        self._inference_lock = threading.Lock()
+
+    def _memory_enabled(self) -> bool:
+        """この ckpt が memory の token を使うか (Issue #141 P8-6)。"""
+        return getattr(self._model, "memory", None) is not None
+
+    def _memory_vector(self, obs: Observation) -> np.ndarray:
+        """1 tick ぶん memory を進めて (51,) を返す。
+
+        学習と同じ `MemoryTracker` を回す。入力は
+            - 検出: この tick の検出 (policy 用の filter の後、conf は tracker 側で 0.30 で切る)
+            - 手先: **前の tick に送った指令**を FK した左右の xyz (6)
+
+        前の指令は 71 次元の state から戻す (Issue #141 P8-6 の案 a):
+        `state[0:19] + state[19:38]` = joint + tracking_err = 前の tick の指令。
+        skill の最初の tick は指令が無いので None (学習の t=0 と同じ)。
+        """
+        # lazy: env-isolated dependencies (torch / model package は runtime env のみ)
+        import torch
+
+        if self._memory_tracker is None:
+            from model.ramen_ori.memory_features import MemoryTracker
+
+            self._memory_tracker = MemoryTracker()
+
+        camera = _MEMORY_CAMERA_KEY
+        detections = (obs.obb_detections or {}).get(camera) or []
+        if detections:
+            class_id = np.asarray([d.class_id for d in detections], dtype=np.int64)
+            conf = np.asarray([d.confidence for d in detections], dtype=np.float64)
+            verts = np.stack([np.asarray(d.verts, dtype=np.float64) for d in detections])
+        else:
+            class_id = np.zeros(0, dtype=np.int64)
+            conf = np.zeros(0, dtype=np.float64)
+            verts = np.zeros((0, 4, 2), dtype=np.float64)
+
+        hand_pos = None
+        if self._memory_ticks > 0:      # skill の最初の tick は学習の t=0 と同じで None
+            # この tick の state が持っているのが「前の tick に送った指令」なので、
+            # ここで戻す。控えて次の tick で使うと、学習より 1 tick (33 ms) 古くなる。
+            state = np.asarray(obs.state, dtype=np.float32)
+            fk = getattr(self._model, "fk", None)
+            if fk is None:
+                from model.ramen_ori.fk import G1WristFKTorch
+
+                fk = G1WristFKTorch.from_default_urdf()
+                self._model.fk = fk
+            command = torch.as_tensor(
+                state[0:19] + state[19:38], dtype=torch.float32
+            ).unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                detailed = fk.forward_detailed(command)
+            hand_pos = (
+                torch.cat([detailed["left_hand"], detailed["right_hand"]], dim=-1)
+                .squeeze(0)
+                .cpu()
+                .numpy()
+            )
+
+        memory = self._memory_tracker.update(class_id, conf, verts, hand_pos)
+        self._memory_ticks += 1
+        return np.asarray(memory, dtype=np.float32)
+
+    def _model_uses_prev_frames(self) -> bool:
+        """model が画像差分 (temporal) を持っているか (Issue #141 P8-5)。
+
+        持っていない ckpt では、前の frame の前処理を丸ごと飛ばせる。
+        """
+        return getattr(self._model, "temporal", None) is not None
+
+    def build_state_from_raw(self, raw: RawRobotState) -> np.ndarray:
+        """71 次元の state を組む。state の版は ckpt の約束から (Issue #141 P8-4)。
+
+        VlaSkill は policy の instance を通して呼ぶので、ckpt ごとに版が変わってよい。
+        約束の無い ckpt (Phase K まで) は版 1。
+        """
+        return build_state_from_raw(raw, state_variant=self._state_version)
+
+    # 自前で pipeline / ensembler を持ち VlaSkill には 1 行だけ返すため、
+    # VlaSkill 側の queue 経路 (EXECUTION_HORIZON > 1) は使わない。
+    EXECUTION_HORIZON = 1
+
+    def reset(self) -> None:
+        """Skill 遷移 / episode 開始時に呼ぶ (VlaSkill._on_start、optional protocol)。
+
+        前 skill の chunk が新 skill の blend / prefix に混入しないよう、
+        ensembler・step counter・async pipeline を初期化する。
+        """
+        self._ensembler.reset()
+        self._current_step = 0
+        if self._pipeline is not None:
+            try:
+                self._pipeline.close(timeout_s=0.5)
+            except Exception:
+                pass
+            self._pipeline = None
+        self._pending_submit_step = None
+        self._last_seen_obs = None
+        if self._rtc_leftover is not None:
+            self._rtc_leftover.reset()
+        self._rtc_delay.reset()
+        self._rtc_tick_deltas.clear()
+        self._rtc_last_tick_ns = None
+        # Issue #141 P8-6: memory は区間 (skill) ごとに作り直す。前の skill の
+        # 基準や EMA を持ち越すと、学習の「区間の頭で reset」と食い違う。
+        if self._memory_tracker is not None:
+            self._memory_tracker.reset()
+        self._memory_ticks = 0
+
+    def _rtc_tick_period_s(self) -> float | None:
+        """predict() の呼出間隔から実測した tick 周期 [s]。sample 不足なら None。"""
+        if len(self._rtc_tick_deltas) < 3:
+            return None
+        return float(statistics.median(self._rtc_tick_deltas))
+
+    def _build_rtc_prefix(self, torch_batch: dict, rtc_step: int | None) -> tuple[dict, dict]:
+        """RTC の prefix と velocity_strength を組んで predict_action の kwargs を返す。
+
+        `_in_process_predict_chunk_19d` の中から、**現 tick の state を組んだ後**に
+        呼ぶこと。prefix の起点となる `arms_current` をそこから取るため
+        (これが re-anchor そのもの)。
+
+        Returns:
+            (kwargs, metadata)。RTC を使わない tick では kwargs は空 dict。
+        """
+        if (
+            self._rtc_leftover is None
+            or rtc_step is None
+            or self._rtc_disabled_after_error
+            or self._model_action_dim is None
+            or self._model_chunk_len is None
+        ):
+            return {}, {"rtc_enabled": bool(self.cfg.rtc.enabled)}
+
+        chunk_len = int(self._model_chunk_len)
+        overlap = self.cfg.rtc.overlap_steps
+        if overlap is None:
+            overlap = self.cfg.execution_steps
+        overlap = max(0, min(int(overlap), chunk_len))
+
+        leftover = self._rtc_leftover.remaining(int(rtc_step))
+        if leftover is None or overlap < 1:
+            return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+        rows = min(int(leftover.shape[0]), overlap)
+        leftover = leftover[:rows]
+
+        tick_period_s = self._rtc_tick_period_s()
+        if self.cfg.replan_family is None:
+            # 同期実行では推論中ロボットが保持され、新 chunk から先行送信される
+            # action が無い。frozen は定義上 0 (詳細は rtc.py / groot.py と同じ)。
+            frozen = 0
+        elif self.cfg.rtc.frozen_steps == AUTO_FROZEN_STEPS:
+            if tick_period_s is None:
+                return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+            frozen = self._rtc_delay.frozen_steps(tick_period_s, cap=rows)
+            if frozen is None:
+                return {}, {"rtc_enabled": True, "rtc_prefix_rows": 0}
+        else:
+            frozen = max(0, min(int(self.cfg.rtc.frozen_steps), rows))
+
+        try:
+            prefix = self._encode_prefix_to_model_space(leftover, torch_batch)
+            strength = build_velocity_strength(
+                chunk_len=chunk_len,
+                frozen_steps=frozen,
+                overlap_steps=rows,
+                ramp_rate=self.cfg.rtc.ramp_rate,
+            )
+        except Exception as exc:  # noqa: BLE001 - 実機 slot を落とさない
+            self._rtc_disabled_after_error = True
+            print(
+                f"[ramen_ori] WARNING: RTC prefix build failed ({type(exc).__name__}: "
+                f"{exc}). Continuing with RTC disabled for this policy instance.",
+                file=sys.stderr,
+            )
+            return {}, {"rtc_enabled": False, "rtc_error": type(exc).__name__}
+
+        # lazy: env-isolated dependencies (torch は model env only)
+        import torch
+
+        metadata = {
+            "rtc_enabled": True,
+            "rtc_prefix_rows": int(rows),
+            "rtc_frozen_steps": int(frozen),
+            "rtc_overlap_steps": int(overlap),
+            "rtc_ramp_rate": float(self.cfg.rtc.ramp_rate),
+            "rtc_async_execution": self.cfg.replan_family is not None,
+            "rtc_tick_period_ms": (
+                None if tick_period_s is None else float(tick_period_s * 1000.0)
+            ),
+            "rtc_delay_max_ms": (
+                None
+                if self._rtc_delay.max_latency_s is None
+                else float(self._rtc_delay.max_latency_s * 1000.0)
+            ),
+        }
+        return (
+            {
+                "prefix": prefix,
+                "velocity_strength": torch.from_numpy(strength).to(self._device),
+            },
+            metadata,
+        )
+
+    def _encode_prefix_to_model_space(self, leftover_19d, torch_batch):
+        """絶対 19D leftover → model action space の prefix。
+
+        - `abs`: model 出力は絶対関節角そのもの (正規化なし) なので、waist pad を
+          落とすだけの恒等変換。
+        - `rel`: model 出力は正規化 Δq。`reconstruct_arms_abs_from_dq_norm`
+          (`arms_current + cumsum`) の逆で、**現 tick の `arms_current` を起点に
+          差分を取り直す**のが re-anchor そのもの。学習側と同じ
+          `compute_teacher_arms_dq` / `normalize_arms_dq` を使い、正規化の解釈が
+          学習とずれないようにする。
+        """
+        # lazy: env-isolated dependencies (torch / model.ramen_ori は model env only)
+        import torch
+
+        from model.ramen_ori.relative_action import (
+            compute_teacher_arms_dq,
+            normalize_arms_dq,
+        )
+
+        chunk = torch.from_numpy(np.ascontiguousarray(leftover_19d)).to(self._device)
+        if self._model_action_dim == 16:
+            chunk = chunk[:, 3:]          # waist pad を落とす
+            arms_slice = slice(0, 14)
+        elif self._model_action_dim == 19:
+            arms_slice = slice(3, 17)
+        else:
+            raise RuntimeError(
+                f"unexpected model action_dim {self._model_action_dim}, "
+                "expected 16 (Phase K) or 19 (Phase 1/2)"
+            )
+        if self.cfg.action_space == "rel":
+            arms_current = torch_batch["state"][0, 3:17]      # (14,) 現 tick の state
+            dq = compute_teacher_arms_dq(chunk[:, arms_slice], arms_current)
+            chunk = chunk.clone()
+            chunk[:, arms_slice] = normalize_arms_dq(
+                dq,
+                self._model._relative_arms_mean,
+                self._model._relative_arms_std,
+            )
+        return chunk
+
+    def _init_pipeline(self, seed_chunk_19d: np.ndarray) -> None:
+        """初回 sync seed chunk から AsyncActionChunkPipeline を build。"""
+        from inference.desktop.lower_policy.async_replanning import (
+            AsyncActionChunkPipeline,
+            family_replanning_schedule,
+        )
+
+        replan_after, max_age = family_replanning_schedule(
+            self.cfg.replan_family, self.cfg.execution_steps
+        )
+        chunk_len = int(seed_chunk_19d.shape[0])
+        if (
+            self.cfg.temporal_lambda is not None
+            and self.cfg.execution_steps >= chunk_len
+        ):
+            # 重なり = chunk_len - execution_steps。0 なら候補が常に 1 個で
+            # blend が一度も起きない (GR00T で実測した落とし穴と同じ)。
+            print(
+                f"[ramen_ori] WARNING: execution_steps={self.cfg.execution_steps} "
+                f">= chunk_len={chunk_len}: consecutive chunks never overlap, so "
+                f"the temporal ensemble (temporal_lambda={self.cfg.temporal_lambda}) "
+                "can never blend.",
+                file=sys.stderr,
+            )
+        self._pipeline_lead_steps = self.cfg.execution_steps - replan_after
+        self._pipeline_max_age_s = max_age
+        self._pipeline = AsyncActionChunkPipeline(
+            initial_actions=seed_chunk_19d.astype(np.float64),
+            execution_steps=self.cfg.execution_steps,
+            replan_after_steps=replan_after,
+            max_prediction_age_s=max_age,
+            thread_name_prefix="ramen-ori-replan",
+        )
+        self._pending_submit_step = None
 
     @classmethod
     def from_ckpt(
@@ -713,7 +1326,103 @@ class RamenOriPolicy:
                 overrides=list(cfg.hydra_overrides),
             )
 
-        # ---- 2. Model instantiate (train.py:_build_model と同手順) ----
+        # ---- 2. Ckpt path resolve + torch.load (Phase C で先出し) ----
+        # rel action の場合は state_dict の buffer `_relative_arms_mean/std` を
+        # 抽出して _NnModule init に渡す必要 = ckpt を model 生成前に load する。
+        ckpt_ref = cfg.ckpt_ref
+        if os.path.isfile(ckpt_ref):
+            ckpt_path = ckpt_ref
+        elif os.path.isdir(ckpt_ref):
+            # local dir 内で最新 step の ckpt を picking
+            step_files = sorted(
+                Path(ckpt_ref).glob("ckpt_step_*.pt"),
+                key=lambda p: int(p.stem.split("_")[-1]),
+            )
+            if not step_files:
+                raise FileNotFoundError(f"no ckpt_step_*.pt in {ckpt_ref}")
+            ckpt_path = str(step_files[-1])
+        else:
+            # HF repo: latest step ckpt auto pick or filename 指定。
+            # Issue #134: `@sha` pin syntax (Issue #132 Phase C+ で導入) を revision
+            # parameter に split。GR00T 側 `groot.py:355-374` と同 pattern、HF API の
+            # repo_id は `@` を含めない (HFValidationError 回避)。
+            if "@" in ckpt_ref:
+                repo_id, revision = ckpt_ref.rsplit("@", 1)
+                if not repo_id or not revision:
+                    raise ValueError(
+                        f"ckpt_ref must be a local file/dir, HF repo, or "
+                        f"HF-repo@revision; got {ckpt_ref!r}"
+                    )
+            else:
+                repo_id, revision = ckpt_ref, None
+            api = HfApi()
+            files = api.list_repo_files(repo_id=repo_id, revision=revision)
+            if ckpt_filename is None:
+                step_ckpts = sorted(
+                    [f for f in files if f.startswith("ckpt_step_") and f.endswith(".pt")],
+                    key=lambda f: int(f.replace("ckpt_step_", "").replace(".pt", "")),
+                )
+                if not step_ckpts:
+                    raise FileNotFoundError(
+                        f"no ckpt_step_*.pt in HF repo {ckpt_ref}"
+                    )
+                ckpt_filename = step_ckpts[-1]
+            ckpt_path = hf_hub_download(
+                repo_id=repo_id, filename=ckpt_filename, revision=revision
+            )
+
+        import sys as _sys
+
+        # ckpt は **CPU に**読む。file には optimizer の状態も入っていて (c32 の実測で
+        # file 3.3 GB)、GPU に読むとその分がそのまま VRAM を占める。重みは
+        # load_state_dict が CPU → GPU に写すので、GPU に置くのは model だけでよい
+        # (Issue #141 P8 の確認で、読み込み時の GPU の山が 4.36 → 1.49 GiB)。
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # ---- 2b. 約束つき ckpt (Issue #141 の再学習) は `ckpt["cfg"]` から組み立てる ----
+        # Phase K までの ckpt には `contract` が無いので、従来の経路 (base.yaml +
+        # slot の hydra_overrides) をそのまま通る。
+        contract = ckpt.get("contract")
+        if contract is not None:
+            return cls._from_contract_ckpt(
+                cfg, ckpt=ckpt, ckpt_path=ckpt_path, contract=contract, use_ema=use_ema
+            )
+
+        # ---- 3. Phase C: rel action の relative_stats を ckpt buffer から抽出 ----
+        # buffer は param ではないので EMA shadow_params に含まれない = 常に
+        # model_state_dict から取得。abs slot (default) では skip。
+        # Issue #134 Phase H-3 / #137: torch.compile 経由の ckpt は key に
+        # "_orig_mod." prefix が付く (Phase K R-6 全 6 run が該当)。#137 で
+        # `strip_compile_prefix` に一本化し、prefix 有無どちらも accept する。
+        relative_stats = None
+        if cfg.action_space == "rel":
+            msd = ckpt.get("model_state_dict")
+            if not isinstance(msd, dict):
+                raise RuntimeError(
+                    f"action_space='rel' expects model_state_dict dict in ckpt "
+                    f"{ckpt_path!r}, got {type(msd).__name__}."
+                )
+            msd = strip_compile_prefix(msd)
+            _mean_key = "_relative_arms_mean"
+            _std_key = "_relative_arms_std"
+            if _mean_key not in msd or _std_key not in msd:
+                raise RuntimeError(
+                    f"action_space='rel' expects buffers '_relative_arms_mean' / "
+                    f"'_relative_arms_std' (with optional '_orig_mod.' prefix from "
+                    f"torch.compile) in ckpt {ckpt_path!r} model_state_dict, "
+                    "but they were not found. This ckpt was likely trained with "
+                    "abs action space — verify action_space matches training recipe."
+                )
+            _mean = msd[_mean_key]
+            _std = msd[_std_key]
+            if tuple(_mean.shape) != (14,) or tuple(_std.shape) != (14,):
+                raise RuntimeError(
+                    f"relative_stats shape mismatch: mean={tuple(_mean.shape)}, "
+                    f"std={tuple(_std.shape)}, expected (14,) for both"
+                )
+            relative_stats = {"mean": _mean, "std": _std}
+
+        # ---- 4. Model instantiate (train.py:_build_model と同手順) ----
         import hydra as _hydra
 
         backbone, embed_dim = load_vision_backbone(
@@ -729,6 +1438,10 @@ class RamenOriPolicy:
         state = _hydra.utils.instantiate(hydra_cfg.model.state)
         skill = _hydra.utils.instantiate(hydra_cfg.model.skill)
         fusion = _hydra.utils.instantiate(hydra_cfg.model.fusion)
+        # 【Issue #137】RTC の overlap は chunk 長を超えられない。chunk_len は
+        # hydra config を読むまで確定しないので config_loader では検証できないが、
+        # ここは重み load の前なので設定ミスは即座に落ちる。
+        validate_rtc_against_chunk_len(cfg, int(hydra_cfg.model.chunk_len))
         action_expert = _hydra.utils.instantiate(hydra_cfg.model.action_expert)
         aux_head = None
         if hydra_cfg.model.get("aux_head") is not None:
@@ -749,41 +1462,36 @@ class RamenOriPolicy:
             chunk_len=hydra_cfg.model.chunk_len,
             action_dim=hydra_cfg.model.action_dim,
             sample_n_steps=hydra_cfg.model.sample_n_steps,
+            # Phase C: rel action space (RAMEN-Ori Phase K Run 3/5 対応)
+            use_relative_action=(cfg.action_space == "rel"),
+            relative_stats=relative_stats,
         )
         model = model.to(cfg.device)
 
-        # ---- 3. Ckpt DL + state_dict load ----
-        ckpt_ref = cfg.ckpt_ref
-        if os.path.isfile(ckpt_ref):
-            ckpt_path = ckpt_ref
-        elif os.path.isdir(ckpt_ref):
-            # local dir 内で最新 step の ckpt を picking
-            step_files = sorted(
-                Path(ckpt_ref).glob("ckpt_step_*.pt"),
-                key=lambda p: int(p.stem.split("_")[-1]),
+        # ---- 5. state_dict load (ckpt は §2 で load 済) ----
+        # Issue #137: `torch.compile` 経由の ckpt は全 key に `_orig_mod.` prefix が
+        # 付く。prefix 付きのままだと 1 key も一致せずモデルが初期化のまま残るので、
+        # EMA / raw 双方を load 前に正規化する。
+        raw_state = strip_compile_prefix(ckpt["model_state_dict"])
+        if use_ema and "ema_state_dict" in ckpt:
+            ckpt["ema_state_dict"] = strip_compile_prefix(ckpt["ema_state_dict"])
+        # Issue #137: EMA shadow が未更新な ckpt (Phase K R-6 全 6 run) は raw に
+        # フォールバックする。fail-fast にしないのは、既存 ckpt を再 upload せずに
+        # 正しい重みで評価できるようにするため。
+        if (
+            use_ema
+            and isinstance(ckpt.get("ema_state_dict"), dict)
+            and "shadow_params" not in ckpt["ema_state_dict"]
+            and ema_state_dict_is_stale(ckpt["ema_state_dict"], raw_state)
+        ):
+            print(
+                f"[RamenOriPolicy] WARNING: ema_state_dict in {ckpt_path!r} is at its "
+                "initialization (EMA was never updated — trained with "
+                "speedup.torch_compile=true before the Issue #137 fix). "
+                "Falling back to model_state_dict (raw training weights).",
+                file=_sys.stderr,
             )
-            if not step_files:
-                raise FileNotFoundError(f"no ckpt_step_*.pt in {ckpt_ref}")
-            ckpt_path = str(step_files[-1])
-        else:
-            # HF repo: latest step ckpt auto pick or filename 指定
-            api = HfApi()
-            files = api.list_repo_files(repo_id=ckpt_ref)
-            if ckpt_filename is None:
-                step_ckpts = sorted(
-                    [f for f in files if f.startswith("ckpt_step_") and f.endswith(".pt")],
-                    key=lambda f: int(f.replace("ckpt_step_", "").replace(".pt", "")),
-                )
-                if not step_ckpts:
-                    raise FileNotFoundError(
-                        f"no ckpt_step_*.pt in HF repo {ckpt_ref}"
-                    )
-                ckpt_filename = step_ckpts[-1]
-            ckpt_path = hf_hub_download(repo_id=ckpt_ref, filename=ckpt_filename)
-
-        import sys as _sys
-
-        ckpt = torch.load(ckpt_path, map_location=cfg.device, weights_only=False)
+            use_ema = False
         if use_ema and "ema_state_dict" in ckpt:
             # EMA state_dict を model に反映 (data_lerobot.py val flow と同じ)
             # ema_state_dict は EMA class の shadow weights を key で保持、
@@ -816,11 +1524,10 @@ class RamenOriPolicy:
                 _validate_architecture_state_dict_load(missing, unexpected, ckpt_path)
             del ema_state
         else:
-            missing, unexpected = model.load_state_dict(
-                ckpt["model_state_dict"], strict=False
-            )
+            missing, unexpected = model.load_state_dict(raw_state, strict=False)
             _log_state_dict_load("model_state_dict", missing, unexpected, ckpt_path)
             _validate_architecture_state_dict_load(missing, unexpected, ckpt_path)
+        del raw_state
 
         del ckpt  # free CPU memory
         model.eval()
@@ -832,6 +1539,86 @@ class RamenOriPolicy:
             model = model.to(torch.float16)
 
         return cls(cfg=cfg, _model=model, _device=cfg.device)
+
+    @classmethod
+    def _from_contract_ckpt(
+        cls,
+        cfg: PolicyConfig,
+        *,
+        ckpt: dict,
+        ckpt_path: str,
+        contract: dict,
+        use_ema: bool,
+    ) -> "RamenOriPolicy":
+        """約束 (`ckpt["contract"]`) つきの ckpt を読む (Issue #141 P8-1 / P8-2 / P8-3)。
+
+        - 組み立ては学習と同じ関数 (`model.ramen_ori.build.build_model`) に
+          `ckpt["cfg"]` をそのまま渡す。推論側で構造を組み直さない
+        - 重みは raw の `model_state_dict` を先に読む (正規化と FK の統計は buffer なので
+          raw にしかない)。その上から EMA の学習 param を重ねる
+        - 設定と食い違っていれば、重みを読む前に止める
+        """
+        import sys as _sys
+
+        from omegaconf import DictConfig, OmegaConf
+
+        validate_contract(contract, cfg)
+        if cfg.hydra_overrides:
+            raise RuntimeError(
+                "hydra_overrides cannot be used with a contract ckpt: the model is "
+                f"built from ckpt['cfg'] (got {list(cfg.hydra_overrides)})"
+            )
+        if cfg.dtype != "fp32":
+            # 正規化の統計まで bf16 になり、入力の縮尺が変わる (Issue #141 P8-7)。
+            raise RuntimeError(
+                f"contract ckpts must run in fp32 (slot dtype={cfg.dtype!r}); "
+                "the normalization statistics live in buffers and would be cast too"
+            )
+
+        hydra_cfg = ckpt.get("cfg")
+        if hydra_cfg is None:
+            raise RuntimeError(
+                f"ckpt {ckpt_path!r} has a contract but no 'cfg'; cannot rebuild the model"
+            )
+        if not isinstance(hydra_cfg, DictConfig):
+            hydra_cfg = OmegaConf.create(hydra_cfg)
+        validate_rtc_against_chunk_len(cfg, int(hydra_cfg.model.chunk_len))
+
+        from model.ramen_ori.build import build_model
+
+        model = build_model(hydra_cfg, cfg.device)
+
+        raw_state = strip_compile_prefix(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(raw_state, strict=False)
+        _log_state_dict_load("model_state_dict", missing, unexpected, ckpt_path)
+        _validate_architecture_state_dict_load(missing, unexpected, ckpt_path)
+
+        ema_state = ckpt.get("ema_state_dict")
+        if use_ema and isinstance(ema_state, dict) and "shadow_params" in ema_state:
+            shadow = ema_state["shadow_params"]
+            n_params = sum(1 for _ in model.named_parameters())
+            if len(shadow) != n_params:
+                raise RuntimeError(
+                    f"EMA shadow_params length mismatch: shadow={len(shadow)}, "
+                    f"model.named_parameters()={n_params}. ckpt {ckpt_path!r} "
+                    "may be from a different model architecture."
+                )
+            for (_name, param), value in zip(model.named_parameters(), shadow):
+                param.data.copy_(value)
+            print(
+                f"[RamenOriPolicy] loaded raw weights (buffers) + EMA shadow_params "
+                f"({n_params} params)",
+                file=_sys.stderr,
+            )
+        elif use_ema:
+            print(
+                f"[RamenOriPolicy] WARNING: no EMA shadow_params in {ckpt_path!r}; "
+                "using the raw training weights",
+                file=_sys.stderr,
+            )
+        del raw_state, ckpt
+        model.eval()
+        return cls(cfg=cfg, _model=model, _device=cfg.device, _contract=contract)
 
     def warmup(self, n_iter: int = 5) -> None:
         """cuDNN autotune + LingBot cache warm-up。
@@ -845,16 +1632,37 @@ class RamenOriPolicy:
         dummy_obs = self._make_dummy_observation()
         for _ in range(n_iter):
             self.predict(dummy_obs)
+        # 【Issue #137】warmup は dummy observation で、初回 JIT (~500ms-2s) も
+        # 含む。これを RTC の遅延推定 (window 内 max) に混ぜると d が過大評価され、
+        # overlap 全域が凍結されて応答性を失う (実測: 966ms の warmup latency で
+        # frozen が overlap と同値 8 になった)。dummy chunk が RTC prefix や
+        # temporal ensemble に流れ込むのも防ぐため、warmup 由来の状態は全て捨てる。
+        self.reset()
 
-    def predict(self, obs: Observation) -> PolicyAction:
-        """1 tick observation → RAMEN-Ori action chunk。
+    def _sync_predict_chunk_19d(
+        self, obs: Observation, *, rtc_step: int | None = None
+    ) -> tuple[np.ndarray, float]:
+        """`_in_process_predict_chunk_19d` を直列化して呼ぶ。
+
+        predict 自体は stateless なので GR00T のような correctness 上の必要は
+        無いが、async worker と sync_fallback が同時に forward すると VRAM
+        ピークが倍になる。構造も GR00T と揃える。
+        """
+        with self._inference_lock:
+            return self._in_process_predict_chunk_19d(obs, rtc_step=rtc_step)
+
+    def _in_process_predict_chunk_19d(
+        self, obs: Observation, *, rtc_step: int | None = None
+    ) -> tuple[np.ndarray, float]:
+        """1 tick observation → 19D absolute action chunk + latency [ms]。
 
         Pipeline:
             1. `build_batch_dict(obs, mode)` → numpy dict
             2. numpy → torch tensor、batch 次元追加 (B=1)
             3. `self._model.predict_action(batch)` → (1, 16, 19)
-            4. → PolicyAction wrap で return (denorm 無し = training が action 未
-               normalize 前提、Phase 4 で action stats 確認)
+            4. → PolicyAction wrap で return。**denorm はしない** (Issue #141 P8-7):
+               Phase K までの ckpt は action を正規化せずに学習しており、再学習の
+               ckpt は正規化を model の中に持つので、どちらも出力は実単位。
         """
         if self._model is None:
             raise RuntimeError(
@@ -864,7 +1672,15 @@ class RamenOriPolicy:
         import torch
 
         t0 = time.monotonic_ns()
-        raw_batch = build_batch_dict(obs, mode=self.cfg.mode)
+        raw_batch = build_batch_dict(
+            obs,
+            mode=self.cfg.mode,
+            cams=tuple(self.cfg.cams),
+            overlay_jpeg_subsampling=self.cfg.overlay_jpeg_subsampling,
+            with_prev_frames=self._model_uses_prev_frames(),
+        )
+        if self._memory_enabled():
+            raw_batch["memory"] = self._memory_vector(obs)
 
         # numpy → torch tensor、batch 次元追加 (B=1)
         torch_batch: dict = {}
@@ -873,23 +1689,195 @@ class RamenOriPolicy:
             torch_batch[key] = t.unsqueeze(0).to(self._device)
 
         with torch.inference_mode():
-            action_chunk = self._model.predict_action(torch_batch)
-        action_np = action_chunk[0].detach().cpu().numpy().astype(np.float32, copy=False)
+            rtc_kwargs, rtc_metadata = self._build_rtc_prefix(torch_batch, rtc_step)
+            action_chunk_t = self._model.predict_action(torch_batch, **rtc_kwargs)
+        # model の action 空間を確定 (prefix を model space に戻すのに要る)
+        self._model_chunk_len = int(action_chunk_t.shape[-2])
+        self._model_action_dim = int(action_chunk_t.shape[-1])
+
+        # ---- Phase C: rel action space の abs 復元 (Phase K Run 3/5 対応) ----
+        # model 出力の arms 14 dim は normalized Δq、hand 2 dim は abs pass-through。
+        # arms を `arms_current + cumsum(dq_norm*std + mean)` で abs に戻す。
+        # 学習側 action_dim = 16 (Phase K、waist 除外) or 19 (Phase 1/2、waist 込み) で
+        # arms slice 位置が異なる。
+        if self.cfg.action_space == "rel":
+            # lazy: env-isolated dependency (relative_action は model env only)
+            from model.ramen_ori.relative_action import (
+                reconstruct_arms_abs_from_dq_norm,
+            )
+            arms_current_t = torch_batch["state"][:, 3:17]  # (B=1, 14)
+            mean = self._model._relative_arms_mean  # (14,) tensor (buffer)
+            std = self._model._relative_arms_std    # (14,)
+            if action_chunk_t.shape[-1] == 16:
+                arms_slice = slice(0, 14)  # [arms 14, hand 2]
+            elif action_chunk_t.shape[-1] == 19:
+                arms_slice = slice(3, 17)  # [waist 3, arms 14, hand 2]
+            else:
+                raise RuntimeError(
+                    "rel reconstruction expects action_dim 16 or 19, "
+                    f"got {action_chunk_t.shape[-1]}"
+                )
+            dq_norm = action_chunk_t[..., arms_slice]  # (B, chunk, 14)
+            arms_abs = reconstruct_arms_abs_from_dq_norm(
+                dq_norm, arms_current_t, mean, std
+            )
+            action_chunk_t = action_chunk_t.clone()  # inference_mode でも clone 可
+            action_chunk_t[..., arms_slice] = arms_abs
+
+        action_np = action_chunk_t[0].detach().cpu().numpy().astype(np.float32, copy=False)
+
+        # ---- Phase C: 16D → 19D pad (vla_skill contract に合わせる) ----
+        # 学習側 (Phase K) が waist 3D を loss 圏外化して action_dim=16 にした結果、
+        # inference 出力も 16D。vla_skill は 19D chunk を expect するので pad 必須。
+        # skill_config で rotate_table_base.dispatch_waist=false 運用のため、pad 値は
+        # zeros で OK (waist chunk は vla_skill 側で drop、snap リスクなし)。
+        # Phase 1/2 5 variant (19D 学習) は if 分岐入らず現状挙動維持 (backward compat)。
+        if action_np.shape[1] == 16:
+            waist_pad = np.zeros((action_np.shape[0], 3), dtype=np.float32)
+            action_np = np.concatenate([waist_pad, action_np], axis=1)  # (chunk, 19)
+        elif action_np.shape[1] != 19:
+            raise RuntimeError(
+                f"unexpected action_dim {action_np.shape[1]}, "
+                "expected 16 (Phase K) or 19 (Phase 1/2)"
+            )
 
         latency_ms = (time.monotonic_ns() - t0) / 1e6
+        if self._rtc_leftover is not None and rtc_step is not None:
+            self._rtc_leftover.store(action_np, origin_step=int(rtc_step))
+        self._rtc_delay.add(latency_ms / 1000.0)
+        self._last_rtc_metadata = rtc_metadata
+        return action_np, latency_ms
+
+    def predict(self, obs: Observation) -> PolicyAction:
+        """1 tick observation → PolicyAction。
+
+        - **cfg.replan_family=None (既定)**: 毎 tick 同期推論して chunk 全体を
+          返す従来動作。VlaSkill が row 0 を使う。挙動は Phase C 以前と同一。
+        - **cfg.replan_family 設定時**: async pipeline + temporal ensemble。
+          GR00T と同じく policy 内部で chunk を合流させ、VlaSkill には blend 済み
+          1 行だけ返す (`EXECUTION_HORIZON = 1`)。command loop は毎 tick
+          non-blocking になり、学習と同じ 30Hz cadence を狙える。
+
+        学習データは 30fps だが、同期経路は毎 tick 推論 (実測 50.8ms) が cadence を
+        律速して 16.2Hz しか出ていない。async 化はそのズレを埋めるためのもの。
+        """
+        # RTC の d は latency ÷ tick 周期。周期は policy ごとに違うので実測する。
+        tick_now_ns = time.monotonic_ns()
+        if self._rtc_last_tick_ns is not None:
+            delta_s = (tick_now_ns - self._rtc_last_tick_ns) / 1e9
+            if 0.0 < delta_s < 1.0:  # 一時停止や skill 遷移の穴は捨てる
+                self._rtc_tick_deltas.append(delta_s)
+        self._rtc_last_tick_ns = tick_now_ns
+
+        base_metadata = {
+            "mode": self.cfg.mode,
+            "action_space": self.cfg.action_space,
+            "skill_id": obs.skill_id,
+        }
+        if self.cfg.replan_family is None:
+            chunk_19d, latency_ms = self._sync_predict_chunk_19d(
+                obs, rtc_step=self._current_step
+            )
+            self._current_step += 1
+            return PolicyAction(
+                action_chunk=chunk_19d,
+                latency_ms=latency_ms,
+                metadata={
+                    **base_metadata,
+                    "chunk_len": int(chunk_19d.shape[0]),
+                    "action_dim": int(chunk_19d.shape[1]),
+                    "chunk_source": "sync",
+                    "predict_latency_ms": float(latency_ms),
+                    **self._last_rtc_metadata,
+                },
+            )
+
+        self._last_seen_obs = obs
+        latency_ms = 0.0
+        pipeline_index: int | None = None
+        if self._pipeline is None:
+            seed_19d, latency_ms = self._sync_predict_chunk_19d(
+                obs, rtc_step=self._current_step
+            )
+            self._ensembler.add_chunk(
+                origin_step=self._current_step, absolute_targets=seed_19d
+            )
+            self._init_pipeline(seed_19d)
+            chunk_source = "sync"
+        else:
+            promoted = self._pipeline.promote_if_ready()
+            if promoted is not None and self._pending_submit_step is not None:
+                self._ensembler.add_chunk(
+                    origin_step=self._pending_submit_step,
+                    absolute_targets=promoted.actions.astype(np.float32),
+                )
+                self._pending_submit_step = None
+                chunk_source = "async_promoted"
+            else:
+                chunk_source = "async_none_this_tick"
+            _pipeline_action, pipeline_index = self._pipeline.next_action()
+            if self._pipeline.wants_prediction and self._pending_submit_step is None:
+                obs_snapshot = obs
+                submit_step = self._current_step
+
+                def predictor():
+                    chunk_19d, ms = self._sync_predict_chunk_19d(
+                        obs_snapshot, rtc_step=submit_step
+                    )
+                    return (
+                        chunk_19d.astype(np.float64),
+                        float(ms),
+                        {"submit_step": submit_step},
+                    )
+
+                self._pipeline.submit(predictor, anchor_generation=(submit_step,))
+                self._pending_submit_step = submit_step
+            if self._ensembler.candidate_count(self._current_step) == 0:
+                # inference 完了遅れ + seed chunk 使い切り。hard stall を避ける
+                # ため同期推論に落とす (GR00T と同じ fallback)。
+                chunk_19d, latency_ms = self._sync_predict_chunk_19d(
+                    obs, rtc_step=self._current_step
+                )
+                self._ensembler.add_chunk(
+                    origin_step=self._current_step, absolute_targets=chunk_19d
+                )
+                chunk_source = "sync_fallback"
+
+        blended_target = self._ensembler.target(step=self._current_step)
+        candidate_count = self._ensembler.candidate_count(self._current_step)
+        self._current_step += 1
         return PolicyAction(
-            action_chunk=action_np,
+            action_chunk=blended_target[None, :].astype(np.float32, copy=False),
             latency_ms=latency_ms,
             metadata={
-                "mode": self.cfg.mode,
-                "chunk_len": action_np.shape[0],
-                "action_dim": action_np.shape[1],
-                "skill_id": obs.skill_id,
+                **base_metadata,
+                "chunk_len": 1,
+                "action_dim": ACTION_DIM,
+                "blended_from_n_candidates": int(candidate_count),
+                "temporal_lambda": self.cfg.temporal_lambda,
+                "replan_family": self.cfg.replan_family,
+                "chunk_source": chunk_source,
+                "pipeline_index": pipeline_index,
+                "pending_submit_step": self._pending_submit_step,
+                "async_deadline_miss_ticks": int(self._pipeline.deadline_miss_ticks),
+                "async_stale_discard_count": int(self._pipeline.stale_discard_count),
+                "async_last_stale_discard_age_ms": (
+                    self._pipeline.last_stale_discard_age_ms
+                ),
+                "predict_latency_ms": float(latency_ms),
+                **self._last_rtc_metadata,
             },
         )
 
     def close(self) -> None:
         """GPU memory 解放 (long-running orchestrator の graceful shutdown)。"""
+        # 【Issue #137】async pipeline の daemon thread が生きたまま model を
+        # 落とすと、thread 側が保持する CUDA tensor の解放と競合して
+        # プロセス終了時に abort する (実測: 実 ckpt smoke で core dump)。
+        # GR00T と同じく bounded close で先に畳む。
+        if self._pipeline is not None:
+            self._pipeline.close(timeout_s=0.5)
+            self._pipeline = None
         try:
             import torch  # lazy: env-isolated
         except ImportError:
@@ -904,7 +1892,9 @@ class RamenOriPolicy:
     def _make_dummy_observation(self) -> Observation:
         H, W = 480, 640
         return Observation(
-            frames_bgr={cam: np.zeros((H, W, 3), dtype=np.uint8) for cam in CAMERAS},
+            frames_bgr={
+                cam: np.zeros((H, W, 3), dtype=np.uint8) for cam in self.cfg.cams
+            },
             frames_bgr_prev=None,
             state=np.zeros(STATE_DIM, dtype=np.float32),
             skill_id=SKILL_MOVE_TABLE_BASE,
