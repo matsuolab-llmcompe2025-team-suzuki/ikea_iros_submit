@@ -1,0 +1,86 @@
+### 提出 image (Thor / GR00T) を CI で焼いて GHCR へ push する。
+#
+# なぜ要るか:
+#   この image は 2026-09-20 時点で **特定の Mac 1 台でしかビルドできない**
+#   (Apple Silicon = arm64 native)。vendor を更新するたびその 1 台が要るので、
+#   大会 (09-27 接続テスト / 09-28-30 本番) の直前にその 1 台が使えないと詰む。
+#
+#   ubuntu-24.04-arm runner でネイティブに焼けることを probe で確認済み
+#   (ディスクは掃除前 109GB 空き、ベース展開後も 102GB 残る = 余裕)。
+#
+# 認証:
+#   - nvcr.io : NGC_API_KEY (ベース image の pull。public image でも login 必須)
+#   - ghcr.io : GHCR_PAT    (org の default workflow permissions が read 固定で、
+#               workflow 側で packages:write を明示しても
+#               "denied: permission_denied: write_package" になるため。
+#               PAT は write:packages だけに絞ること)
+
+name: build thor image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GHCR の tag (例 20260920-ci)"
+        required: true
+        type: string
+      push:
+        description: GHCR に push するか (false ならビルドのみ)
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 提出 image は linux/arm64。Thor が aarch64 なのでネイティブ runner で焼く。
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ディスクの空きを確保
+        run: |
+          # probe では掃除前でも 109GB 空いていたが、ベース展開 (約20GB) と
+          # pip 層 (約7GB) を通すので念のため落としておく。
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell || true
+          df -h / | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: nvcr.io にログイン
+        run: |
+          echo '${{ secrets.NGC_API_KEY }}' \
+            | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: ghcr.io にログイン
+        if: inputs.push
+        run: |
+          echo '${{ secrets.GHCR_PAT }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: ビルド (+ push)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.thor.groot
+          platforms: linux/arm64
+          push: ${{ inputs.push }}
+          tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ inputs.tag }}
+          provenance: false # 提出物の manifest を素の index に保つ
+
+      - name: digest を記録 (manifest.groot.yaml に書く値)
+        if: inputs.push
+        run: |
+          {
+            echo "## 提出 manifest に記入する値"
+            echo '```'
+            echo "repo_tag: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ inputs.tag }}"
+            echo "digest:   ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "⚠️ manifest.groot.yaml の digest を手で更新すること。"
+          } >> "$GITHUB_STEP_SUMMARY"
