@@ -29,9 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: GITHUB_TOKEN で ghcr.io にログイン
+      - name: GHCR_PAT で ghcr.io にログイン
         run: |
-          echo '${{ secrets.GITHUB_TOKEN }}' \
+          # GITHUB_TOKEN は org policy で write_package が denied になることを確認済み。
+          # GHCR_PAT (write:packages) で通るかを見る。
+          echo '${{ secrets.GHCR_PAT }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
       - name: 極小の image を既存 package へ push
@@ -45,7 +47,7 @@ jobs:
           docker build -t "$TAG" /tmp/ctx
           # login は read だけでも通るので、**push の成否**で判定する。
           docker push "$TAG"
-          echo "✅ GITHUB_TOKEN だけで push できた。PAT は不要。" \
+          echo "✅ GHCR_PAT で push できた。本ビルドを CI に載せられる。" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: 捨て tag を消す
@@ -61,4 +63,4 @@ jobs:
                 && echo "削除: version $id"
             done || echo "削除できず (手で消すこと: ci-push-probe)"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
