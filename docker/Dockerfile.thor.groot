@@ -188,6 +188,88 @@ PY
 # --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
 COPY . ./
 
+# --- worker の起動可能性を build 時に確かめる ---
+#
+# model の重みは runtime に HF から取るので build 中に推論はできないが、worker が
+# **spawn された直後に落ちる**類の事故 (deps 欠落 / import path ずれ / lerobot 版
+# 違い) はここで全部出せる。image が緑なのに会場で worker だけ死ぬ、を防ぐ。
+# --help は argparse が即 SystemExit(0) するので module 直下の import だけを通す。
+#
+# 1) pick (38D) worker: system python3 = lerobot 0.6.0。worker 自身が
+#    `importlib.metadata.version("lerobot") != LEROBOT_VERSION` で落ちる契約。
+#    accelerate / safetensors は _load_model の遅延 import なので別途 import する。
+RUN python3 /app/components/ramen/vendor/model/subtask_policy_training/deployment/real_groot_n17_worker.py \
+      --help > /dev/null \
+    && cd /app/components/ramen/vendor \
+    && python3 - <<'PY'
+import importlib.metadata as md
+
+import accelerate  # noqa: F401  (worker の _load_model が遅延 import する)
+import safetensors  # noqa: F401
+
+from inference.desktop.upper_policy.groot_pick_leg_contract import LEROBOT_VERSION
+
+got = md.version("lerobot")
+assert got == LEROBOT_VERSION, f"pick worker requires lerobot {LEROBOT_VERSION}, got {got}"
+print(f"[build] pick worker OK (lerobot {got} + accelerate + safetensors)")
+PY
+
+# 2) 53D worker: /opt/venv-groot53 = lerobot 0.6.1。vendor/desktop を repo root と
+#    して -m で起動されるので、同じ形で import できることを確かめる。
+RUN cd /app/components/ramen/vendor/desktop \
+    && /opt/venv-groot53/bin/python -m inference.desktop.lower_policy.policies.groot_worker \
+         --help > /dev/null \
+    && echo "[build] 53D worker OK (lerobot 0.6.1 env から -m で起動できる)"
+
+# 3) orchestrator が pick worker の runtime を解決できること。vendor tree は
+#    desktop/ が 1 段挟まるので、上流の parents[4] だけでは model/ を見失う
+#    (tools/vendor_patches.py がこれを直している)。Popen の直前まで実際に走らせる。
+RUN cd /app/components/ramen/vendor/desktop \
+    && python3 - <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/app/components/ramen/vendor/desktop")
+from inference.desktop.lower_policy.policies import groot_pick_legs as m
+from inference.desktop.lower_policy.policies.base import PolicyConfig
+
+
+class Spawned(Exception):
+    pass
+
+
+captured = {}
+
+
+def fake_popen(cmd, **kw):
+    captured["cmd"] = list(cmd)
+    raise Spawned
+
+
+m.subprocess.Popen = fake_popen
+# ckpt は HF に取りに行かせない。実在 directory を渡すと存在チェックだけになる。
+ckpt = Path("/tmp/_ckpt_probe")
+ckpt.mkdir(exist_ok=True)
+for name in ("config.json", "processor_config.json", "statistics.json",
+             "embodiment_id.json", "model.safetensors.index.json"):
+    (ckpt / name).touch()
+try:
+    m._PickLegsWorkerClient(PolicyConfig(mode="none", ckpt_ref=str(ckpt)))
+except Spawned:
+    pass
+finally:
+    for p in ckpt.iterdir():
+        p.unlink()
+    ckpt.rmdir()
+
+py, script = captured["cmd"][0], captured["cmd"][1]
+assert Path(py).is_file(), f"worker python が無い: {py}"
+assert Path(script).is_file(), f"worker script が無い: {script}"
+print(f"[build] orchestrator pick worker OK ({py} {script})")
+PY
+
 # 既定は pick (RAMEN_POLICY=groot_pick_real, worker=同 env python3=lerobot0.6.0)。
 # 53D skill に切替える時は run 時に -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>。
 # 53D worker は別 env python (RAMEN_WORKER_PYTHON_53D=0.6.1 venv) を使う。
