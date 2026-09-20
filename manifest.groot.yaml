@@ -12,14 +12,25 @@ platform: linux/arm64
 
 images:
   thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
-    # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、onboarding tag は温存)。
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260912-groot-orch-fkfix"
+    # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-vendorsync-sdk"
     # image index digest (arm64 host で arm64 manifest に解決)。
-    # cfgfix = numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
-    #   GrootConfig + FurnitureGrootRuntimeConfig type strip (base registry) + GPU overhead env 化
-    #   + 53D FK を CWD 非依存 path (assets/) に修正 (全 53D skill 起動可)。
-    # build 時 from_numpy bridge assert 両 env 通過済。
-    digest: "sha256:eeeeef583e1b47b7fa6a9db649ab43de88a43b4aea68372ade3811a6b1301f1a"
+    #   linux/arm64 manifest = sha256:f98c5d891ee54681bb75ad06b13f6d5cc90d276a4061b71dd7485385e3406ad9
+    #
+    # vendorsync-sdk (2026-09-20、Issue #1) = 旧 20260912-groot-orch-fkfix からの変更:
+    #   1. components/ramen/vendor/desktop/ を iros_2026_ramen@7b453fa へ全面同期
+    #      (77 files。約 3 週間のドリフト解消。YOLO warmup 欠落の修正 = 初回推論 1.8s が
+    #       CAMERA_STALE_TIMEOUT_S=0.5 を超えて毎回 safety-stop していたバグを含む)
+    #   2. 自前経路 (inference/desktop/entrypoint.py) を image に同梱
+    #   3. CycloneDDS 0.10.2 + unitree_sdk2py@65691c8 を同梱 (自前経路の rt/arm_sdk / LocoClient 用)
+    #   4. base を index digest で pin (可変 tag の入れ替わり防止)
+    #
+    # build 時 assert 通過: torch 2.7-2.11 / numpy==2.2.6 / from_numpy bridge (両 env) /
+    #   lerobot 0.6.0 (main) / 0.6.1 (venv-groot53) / cyclonedds 0.10.2 /
+    #   LOCO_SERVICE_NAME=="sport" / CRC() 初期化。
+    # image 内検証 (2026-09-20): conformance.py --lane decoupled が
+    #   RAMEN_POLICY=stub / groot_pick の両方で PASS (40 accepted / 0 rejected)。
+    digest: "sha256:8a10496cc0056dd78f2546ff71be650024b777eb802391aab2e5a6f6569fcfe2"
     # numpy 2.x ABI torch (25.08 は numpy 1.x で from_numpy が壊れる)。
     # 可変 tag なので Dockerfile では index digest で pin している (2026-09-20 解決)。
     base_image: "nvcr.io/nvidia/pytorch@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8"
