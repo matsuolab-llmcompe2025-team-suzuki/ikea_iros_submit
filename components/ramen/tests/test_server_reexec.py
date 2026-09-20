@@ -13,9 +13,10 @@ interpreter を張り替えると **-u が落ちる**。stdout が block buffer 
 client を繋ぐな」と指示しており、先に繋ぐと accept rate が near-zero になる。
 しかも症状が「Thor を PC2 より先に起動した」場合と同じで切り分けできない。
 
-re-exec するのは `RAMEN_POLICY=groot_orchestrator` = **大会当日の構成だけ**なので、
-ここが壊れていても手元の pick/53D 単独 skill では気付けない (2026-09-20、実 image
-を載せた RunPod pod で実測)。
+re-exec するのは 53D を **親プロセス**で読む policy だけ
+(`groot_orchestrator` / `groot_53d_real`)。pick(38D) は worker を別 process に
+出すので 0.6.0 の親のままでよい。つまり pick だけ試しても踏まない
+(2026-09-20 / 21、実 image を載せた RunPod pod で実測)。
 
 ## やり方
 
@@ -123,6 +124,28 @@ def test_reexec_marks_itself_to_avoid_a_loop(monkeypatch, fake_interp):
     _run_reexec_head(monkeypatch, _orchestrator_env(fake_interp), fake_interp)
 
     assert os.environ.get("RAMEN_SERVER_REEXECED") == "1"
+
+
+def test_reexec_also_covers_groot_53d_real(monkeypatch, fake_interp):
+    """53D 単体経路も **親プロセス**で 53D を読むので 0.6.1 が要る。
+
+    manifest / venue_runbook が「53D 単体」として案内している経路。ここが
+    0.6.0 のままだと flip (Stage 5 の唯一の skill) を含めて全 53D variant が
+    `draccus.utils.DecodingError` で落ちる。実 image を載せた pod で
+    `FurnitureGrootRuntimeConfig` の DecodingError を実測した (2026-09-21)。
+    """
+    captured = _run_reexec_head(
+        monkeypatch,
+        {
+            "RAMEN_POLICY": "groot_53d_real",
+            "RAMEN_VARIANT": "groot_flip_table_n17_2_baseline",
+            "RAMEN_WORKER_PYTHON_53D": str(fake_interp),
+        },
+        fake_interp,
+    )
+
+    assert captured, "groot_53d_real で re-exec が発火していない"
+    assert captured["argv"][:2] == [str(fake_interp), "-u"], captured["argv"]
 
 
 def test_no_reexec_for_the_pick_policy(monkeypatch, fake_interp):

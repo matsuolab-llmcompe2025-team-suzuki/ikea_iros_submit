@@ -49,15 +49,25 @@ from pathlib import Path
 #
 # → 必要なときだけ 0.6.1 の interpreter へ張り替えて同じ引数で入り直す。
 #   (pick(38D) は 0.6.0 の親で動くので既定は変えない)
+# 53D checkpoint を **この process 内**に読む RAMEN_POLICY。
+#   groot_orchestrator … expert を assembly.load_policy で読む
+#   groot_53d_real     … RAMEN_VARIANT の 53D を直接読む
+# どちらも lerobot 0.6.1 でないと draccus が config.json を弾く。実測のエラーは
+# checkpoint の型で変わる (GrootConfig / FurnitureGrootRuntimeConfig) が同じ原因。
+# pick(38D) は worker を別 process に出すので 0.6.0 の親のままでよい。
+_POLICIES_NEEDING_LEROBOT_061 = frozenset({"groot_orchestrator", "groot_53d_real"})
+
+
 def _reexec_into_groot53_if_needed() -> None:
     if os.environ.get("RAMEN_SERVER_REEXECED") == "1":
         return  # 二重 exec 防止
-    if os.environ.get("RAMEN_POLICY", "").strip().lower() != "groot_orchestrator":
+    policy = os.environ.get("RAMEN_POLICY", "").strip().lower()
+    if policy not in _POLICIES_NEEDING_LEROBOT_061:
         return
     interp = os.environ.get("RAMEN_WORKER_PYTHON_53D", "")
     if not interp or not Path(interp).is_file():
         print(
-            "[server] WARNING: RAMEN_POLICY=groot_orchestrator は lerobot 0.6.1 の "
+            f"[server] WARNING: RAMEN_POLICY={policy} は lerobot 0.6.1 の "
             "interpreter を要するが RAMEN_WORKER_PYTHON_53D が使えない "
             f"(={interp!r})。53D expert の load は失敗する見込み。",
             file=sys.stderr,
@@ -81,7 +91,7 @@ def _reexec_into_groot53_if_needed() -> None:
     # (後者は spawn される worker にも伝わる)。
     os.environ["PYTHONUNBUFFERED"] = "1"
     print(
-        f"[server] re-exec into {interp} (groot_orchestrator は lerobot 0.6.1 が要る)",
+        f"[server] re-exec into {interp} ({policy} は lerobot 0.6.1 が要る)",
         file=sys.stderr,
     )
     os.execv(interp, [interp, "-u", os.path.abspath(__file__), *sys.argv[1:]])
