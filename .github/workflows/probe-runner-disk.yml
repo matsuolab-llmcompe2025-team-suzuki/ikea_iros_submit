@@ -13,7 +13,12 @@
 
 name: probe runner disk
 
+# workflow_dispatch は **default branch (main) にファイルが無いと選択肢に出ない**。
+# main はまだ触りたくないので、この branch への push で走らせる。
 on:
+  push:
+    branches: [issue/1-vendor-sync-and-sdk-layer]
+    paths: [.github/workflows/probe-runner-disk.yml]
   workflow_dispatch:
     inputs:
       runner:
@@ -30,7 +35,8 @@ permissions:
 
 jobs:
   probe:
-    runs-on: ${{ inputs.runner }}
+    # push 起動時は inputs が空なので、本命の arm64 に倒す。
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04-arm' }}
     timeout-minutes: 45
     steps:
       - name: 掃除前のディスク
