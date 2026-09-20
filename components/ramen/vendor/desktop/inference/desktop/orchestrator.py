@@ -52,14 +52,15 @@ from inference.desktop.skill_planner.state import SkillState
 TIMEOUT_ACTIONS = ("advance", "stop")
 
 DEFAULT_TRANSITIONS: dict[str, list[str]] = {
-    "setup":                 ["move_to_table"],  # Issue #81 Phase 3: 腕 pre-motion
-    "move_to_table":         ["move_table_base"],
-    "move_table_base":       ["pick_table_leg"],
-    "pick_table_leg":        ["insert_table_leg"],
-    "insert_table_leg":      ["rotate_leg_to_tighten"],
+    "setup": ["move_to_table"],  # Issue #81 Phase 3: 腕 pre-motion
+    "move_to_table": ["move_table_base"],
+    "move_table_base": ["pick_table_leg"],
+    "pick_table_leg": ["insert_table_leg"],
+    "insert_table_leg": ["rotate_leg_to_tighten"],
     "rotate_leg_to_tighten": ["flip_table", "move_table_base"],  # ★ priority = list 順
-    "flip_table":            [],
+    "flip_table": [],
 }
+
 
 def enter_never(dets: list[OBBDetection], state: SkillState) -> bool:
     """timer (max_dwell_sec) のみで進む skill 用の enter_check。YOLO 検出では fire しない。
@@ -72,12 +73,12 @@ def enter_never(dets: list[OBBDetection], state: SkillState) -> bool:
 
 
 DEFAULT_ENTER_CHECK: dict[str, Callable[[list[OBBDetection], SkillState], bool]] = {
-    "move_to_table":         enter_never,   # dwell (max_dwell_sec) のみで move_table_base へ
-    "move_table_base":       enter_move_table_base,
-    "pick_table_leg":        enter_pick_table_leg,
-    "insert_table_leg":      enter_insert_table_leg,
+    "move_to_table": enter_never,  # dwell (max_dwell_sec) のみで move_table_base へ
+    "move_table_base": enter_move_table_base,
+    "pick_table_leg": enter_pick_table_leg,
+    "insert_table_leg": enter_insert_table_leg,
     "rotate_leg_to_tighten": enter_rotate_leg_to_tighten,
-    "flip_table":            enter_flip_table,
+    "flip_table": enter_flip_table,
 }
 
 
@@ -107,12 +108,24 @@ STAGE_SKILL_SEQUENCES: dict[int, list[str]] = {
     # are specific to the stage itself.
     0: ["setup", "move_to_table", "post_walk_settle"],
     1: ["pick_table_leg", "insert_table_leg", "rotate_leg_to_tighten"],
-    2: ["rotate_table_base", "pick_table_leg", "insert_table_leg",
-        "rotate_leg_to_tighten"],
-    3: ["rotate_table_base", "pick_table_leg", "insert_table_leg",
-        "rotate_leg_to_tighten"],
-    4: ["rotate_table_base", "pick_table_leg", "insert_table_leg",
-        "rotate_leg_to_tighten"],
+    2: [
+        "rotate_table_base",
+        "pick_table_leg",
+        "insert_table_leg",
+        "rotate_leg_to_tighten",
+    ],
+    3: [
+        "rotate_table_base",
+        "pick_table_leg",
+        "insert_table_leg",
+        "rotate_leg_to_tighten",
+    ],
+    4: [
+        "rotate_table_base",
+        "pick_table_leg",
+        "insert_table_leg",
+        "rotate_leg_to_tighten",
+    ],
     5: ["flip_table"],
 }
 # どの skill の開始姿勢へ向けて頭の手順を入れるか (Issue #141 D2 / D7-1)。
@@ -235,7 +248,7 @@ class TickResult:
     current_skill: str
     fire_transition_to: Optional[str]  # transition 起きたら新 skill 名、無ければ None
     cleaned: Optional[list[OBBDetection]]
-    action: Optional[np.ndarray]        # dispatcher.step の返り値 (Type B の action tensor)
+    action: Optional[np.ndarray]  # dispatcher.step の返り値 (Type B の action tensor)
     policy_cleaned: Optional[list[OBBDetection]] = None
     detection_refreshed: bool = True
 
@@ -405,6 +418,7 @@ class Orchestrator:
             top = _table_top_verts(planner_cleaned)
             if top is not None:
                 self._table_top_ring.append(top)
+            self._seed_base_rotation_reference_if_needed()
             self.state.update(planner_cleaned)
             prev_skill = self.state.current_skill
             for cand in self.transitions.get(self.state.current_skill, []):
@@ -456,14 +470,14 @@ class Orchestrator:
             obs, require_wrist=require_wrist, max_age_s=self.camera_stale_timeout_s
         )
         if stale:
-            detail = ", ".join(f"{role}={age:.3f}s" for role, age in sorted(stale.items()))
+            detail = ", ".join(
+                f"{role}={age:.3f}s" for role, age in sorted(stale.items())
+            )
             raise LiveSourceSafetyError(
                 f"camera frames are stale (> {self.camera_stale_timeout_s:g}s): {detail}"
             )
 
-    def run(
-        self, source: FrameSource, hz: Optional[float] = 30.0
-    ) -> None:
+    def run(self, source: FrameSource, hz: Optional[float] = 30.0) -> None:
         """FrameSource から pull で loop。ep 終端 (source.get() → None) で自動終了。
 
         Args:
@@ -514,9 +528,7 @@ class Orchestrator:
         if hz <= 0:
             raise ValueError(f"hz must be > 0 for live source, got {hz}")
         if startup_timeout <= 0:
-            raise ValueError(
-                f"startup_timeout must be > 0, got {startup_timeout}"
-            )
+            raise ValueError(f"startup_timeout must be > 0, got {startup_timeout}")
         if frame_timeout <= 0:
             raise ValueError(f"frame_timeout must be > 0, got {frame_timeout}")
         if (stop_after_skill is None) != (stop_after_s is None):
@@ -745,6 +757,45 @@ class Orchestrator:
                 next_deadline = time.monotonic() + dt
 
     # ---- 内部 helpers ----
+    def _seed_base_rotation_reference_if_needed(self) -> None:
+        """初期 skill が天板を回す skill のとき、基準を 1 度だけ seed する。
+
+        `enter_pick_table_leg` は `state.base_rotation_start_table_top_verts` が
+        `None` なら**必ず False を返す**。この基準は `state.transition()` の ctx
+        経由でしか入らず、それを作る `_build_transition_ctx` は遷移のときしか
+        走らない。
+
+        ところが `rotate_table_base` が **initial_skill** の場合、tick() 冒頭の
+        auto start は `dispatcher.start()` を直接呼ぶので `state.transition()` を
+        通らない。結果、基準が一度も入らず **orchestrator は rotate_table_base
+        から永久に出られない**。
+
+        これは大会経路そのもの:
+          - boundary の `OrchestratorDriver` は `initial_skill="rotate_table_base"`
+          - 自前経路の `--stage 1`〜`4` も先頭 skill が `rotate_table_base`
+        実 image を載せた pod で、実フレームを 57.5° 回しても
+        (threshold は 18°) 遷移が 0 回であることを確認した (2026-09-21)。
+
+        遷移経由の基準は「天板を回し始める直前の姿勢」なので、initial の場合の
+        等価物は「この run が始まった時点の姿勢」。ring が満ちた最初の tick で
+        取る (`pick_leg_ref_n_avg_frames` frame の平均、30Hz なら 0.1 秒以内)。
+        """
+        if self.state.base_rotation_start_table_top_verts is not None:
+            return
+        if self.state.current_skill not in ("move_table_base", "rotate_table_base"):
+            return
+        if len(self._table_top_ring) < (self._table_top_ring.maxlen or 1):
+            return
+        self.state.base_rotation_start_table_top_verts = mean_verts_pivot_aligned(
+            list(self._table_top_ring)
+        )
+        print(
+            "[orch] seeded base rotation reference for the initial skill "
+            f"{self.state.current_skill!r} "
+            f"({len(self._table_top_ring)} frame の平均)",
+            file=sys.stderr,
+        )
+
     def _build_transition_ctx(self, next_skill: str) -> Optional[dict]:
         """transition() に渡す ctx。天板を回す skill に入るとき、その直前の table_top
         verts の N-frame pivot-aligned mean を基準として渡す。
@@ -754,7 +805,10 @@ class Orchestrator:
         rotate に入るときも記録しないと基準が一度も入らず、pick へ永久に進まない
         (Issue #141 束 1-6 / INF-7)。
         """
-        if next_skill in ("move_table_base", "rotate_table_base") and self._table_top_ring:
+        if (
+            next_skill in ("move_table_base", "rotate_table_base")
+            and self._table_top_ring
+        ):
             return {
                 "base_rotation_start_table_top_verts": mean_verts_pivot_aligned(
                     list(self._table_top_ring)
@@ -804,9 +858,7 @@ class Orchestrator:
                 None if result.policy_cleaned is None else len(result.policy_cleaned)
             ),
             "action_shape": (
-                list(result.action.shape)
-                if result.action is not None
-                else None
+                list(result.action.shape) if result.action is not None else None
             ),
         }
         self.log_sink.write(json.dumps(payload) + "\n")  # type: ignore[union-attr]
