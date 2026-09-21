@@ -26,6 +26,8 @@ latency (raw_T を push してから、その raw に対応する cleaned が em
 
 from __future__ import annotations
 
+import sys
+
 from collections import deque
 from typing import Optional
 
@@ -33,6 +35,7 @@ from inference.desktop.perception.cleaner import (
     _median_single_frame,
     clean_frame,
     load_cleanup_config,
+    resolve_median_match_params,
 )
 from inference.desktop.perception.yolo_obb import OBBDetection
 
@@ -50,10 +53,24 @@ class DetectionStream:
             config = load_cleanup_config()
         self._max_count: dict[str, int] = dict(config["max_count"])
         self._over_max: float = float(config["over_max_continue_iou"])
+        # Issue #141 束 1-9: max 超えの扱い (keep_continuing = 従来、fill_by_conf = conf 降順で max まで埋める)
+        self._over_max_mode: str = str(config.get("over_max_mode", "keep_continuing"))
         self._under_max: float = float(config["under_max_similar_iou"])
         mf_config = config.get("median_filter", {})
         self._median_enabled: bool = bool(mf_config.get("enabled", False))
         self._median_iou: float = float(mf_config.get("iou_match_min", 0.5))
+        # Issue #140: 振動対策の centroid fallback params (env override 可、既定は無効)。
+        self._match_max_dist: float
+        self._match_ambiguity: float
+        self._match_max_dist, self._match_ambiguity = resolve_median_match_params(
+            mf_config
+        )
+        if self._match_max_dist > 0.0:
+            print(
+                f"[cleaner] median の重心 fallback: max_centroid_dist="
+                f"{self._match_max_dist:g} ambiguity_ratio={self._match_ambiguity:g}",
+                file=sys.stderr,
+            )
 
         # Step 1 用 ring:
         # raw_curr: 直前 push で受け取った raw (次 push 時に次_raw を得て clean 対象になる)
@@ -85,6 +102,7 @@ class DetectionStream:
                 self._max_count,
                 self._over_max,
                 self._under_max,
+                self._over_max_mode,
             )
             self._cleaned_prev = cleaned
         self._raw_curr = raw
@@ -105,6 +123,8 @@ class DetectionStream:
             self._median_ring[1],
             self._median_ring[2],
             self._median_iou,
+            self._match_max_dist,
+            self._match_ambiguity,
         )
 
     def flush(self) -> list[list[OBBDetection]]:
@@ -146,6 +166,8 @@ class DetectionStream:
                     self._median_ring[1],
                     self._median_ring[2],
                     self._median_iou,
+                    self._match_max_dist,
+                    self._match_ambiguity,
                 )
             )
         # 注: size < 3 の残り frame (ep が 2 frame 以下等の極端 case) は端 frame 扱いで drop。

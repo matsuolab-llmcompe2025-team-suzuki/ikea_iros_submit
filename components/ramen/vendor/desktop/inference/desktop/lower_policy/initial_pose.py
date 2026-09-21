@@ -67,7 +67,7 @@ class SkillInitialPose:
 
 
 def load_initial_pose(skill_config_path: Path, skill_name: str) -> SkillInitialPose:
-    """skill_config.yaml から skill_name の initial_pose を SkillInitialPose に組み立てる。
+    """skill_config.yaml (path) から skill_name の initial_pose を読む。
 
     Raises:
         FileNotFoundError: skill_config.yaml が無い
@@ -76,6 +76,18 @@ def load_initial_pose(skill_config_path: Path, skill_name: str) -> SkillInitialP
     """
     with open(skill_config_path) as f:
         cfg = yaml.safe_load(f)
+    return initial_pose_from_config(cfg, skill_name, source=str(skill_config_path))
+
+
+def initial_pose_from_config(
+    cfg: dict, skill_name: str, *, source: str = "skill_config"
+) -> SkillInitialPose:
+    """読み込み済みの skill_config から initial_pose を組み立てる。
+
+    yaml を何度も読まずに済むよう、path 版と中身を分けてある (Issue #141 の頭の手順の
+    skill は、orchestrator が持っている dict から作る)。
+    """
+    skill_config_path = source
     if not cfg or "skills" not in cfg:
         raise KeyError(f"skill_config.yaml missing 'skills' section: {skill_config_path}")
     skill_cfg = cfg["skills"].get(skill_name)

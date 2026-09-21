@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from inference.desktop.lower_policy.policies.base import CameraKey, Observation, PolicyConfig
+from inference.desktop.lower_policy.rtc import AUTO_FROZEN_STEPS, RtcConfig
 from inference.desktop.lower_policy.policies.groot import CAMERAS, STATE_DIM, Gr00tPolicy
 from inference.desktop.lower_policy.policies.groot_worker_protocol import (
     receive_archive,
@@ -88,21 +89,42 @@ def serve(policy: Gr00tPolicy, socket_path: Path) -> None:
                                 obb_detections=None,
                                 timestamp_ns=int(np.asarray(request["timestamp_ns"]).reshape(-1)[0]),
                             )
+                            rtc_step_value = int(
+                                np.asarray(request.get("rtc_step", [-1])).reshape(-1)[0]
+                            )
+                            rtc_step = None if rtc_step_value < 0 else rtc_step_value
+                            rtc_tick_period_value = float(
+                                np.asarray(
+                                    request.get("rtc_tick_period_s", [np.nan])
+                                ).reshape(-1)[0]
+                            )
+                            rtc_tick_period_s = (
+                                rtc_tick_period_value
+                                if np.isfinite(rtc_tick_period_value)
+                                and rtc_tick_period_value > 0.0
+                                else None
+                            )
                             # Return the complete decoded chunk.  Temporal
                             # ensembling and async replanning belong to the
                             # parent DDS runtime so there is exactly one state
                             # machine and one control-step clock.
                             chunk, latency_ms, raw_chunk = (
-                                policy._sync_predict_chunk_19d(observation)
+                                policy._in_process_predict_chunk_19d(
+                                    observation,
+                                    rtc_step=rtc_step,
+                                    rtc_tick_period_s=rtc_tick_period_s,
+                                )
                             )
+                            metadata = {
+                                **policy._last_sync_metadata,
+                                "raw_action_shape_53d": list(raw_chunk.shape),
+                            }
                             send_archive(
                                 connection,
                                 ok=np.asarray([1], dtype=np.uint8),
                                 action_chunk=chunk,
                                 latency_ms=np.asarray([latency_ms], dtype=np.float64),
-                                metadata_json=np.asarray(json.dumps({
-                                    "raw_action_shape_53d": list(raw_chunk.shape),
-                                })),
+                                metadata_json=np.asarray(json.dumps(metadata)),
                             )
                         elif kind == "close":
                             send_archive(connection, ok=np.asarray([1], dtype=np.uint8))
@@ -129,7 +151,18 @@ def main() -> None:
     parser.add_argument("--checkpoint-subdir")
     parser.add_argument("--device", required=True)
     parser.add_argument("--dtype", required=True)
+    parser.add_argument("--replan-family")
+    parser.add_argument("--execution-steps", type=int, default=10)
+    parser.add_argument("--rtc-enabled", action="store_true")
+    parser.add_argument("--rtc-frozen-steps", default=AUTO_FROZEN_STEPS)
+    parser.add_argument("--rtc-overlap-steps", type=int)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=6.0)
     args = parser.parse_args()
+    frozen_steps = (
+        AUTO_FROZEN_STEPS
+        if args.rtc_frozen_steps == AUTO_FROZEN_STEPS
+        else int(args.rtc_frozen_steps)
+    )
     _terminate_with_parent()
     cfg = PolicyConfig(
         mode=args.mode,
@@ -138,6 +171,14 @@ def main() -> None:
         device=args.device,
         dtype=args.dtype,
         cams=CAMERAS,
+        replan_family=args.replan_family,
+        execution_steps=args.execution_steps,
+        rtc=RtcConfig(
+            enabled=args.rtc_enabled,
+            frozen_steps=frozen_steps,
+            overlap_steps=args.rtc_overlap_steps,
+            ramp_rate=args.rtc_ramp_rate,
+        ),
     )
     serve(Gr00tPolicy.from_ckpt(cfg), args.socket)
 

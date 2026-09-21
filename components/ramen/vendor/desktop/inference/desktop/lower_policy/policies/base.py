@@ -47,6 +47,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from inference.desktop.lower_policy.rtc import RtcConfig
 from inference.desktop.perception.yolo_obb import OBBDetection
 
 
@@ -222,6 +223,10 @@ class PolicyAction:
     metadata: dict = field(default_factory=dict)
 
 
+# overlay 画像を通す jpg の色差 → PIL の `subsampling` 値 (PolicyConfig.overlay_jpeg_subsampling)。
+OVERLAY_JPEG_SUBSAMPLINGS: dict[str, int] = {"4:4:4": 0, "4:2:0": 2}
+
+
 @dataclass(frozen=True)
 class PolicyConfig:
     """Policy 実装共通の config。
@@ -258,11 +263,47 @@ class PolicyConfig:
             async replan 無効化 (Phase 2 sync 動作、per-tick predict)。GR00T
             task_5+7 (relative_eef) には "groot_relative_eef_v1" 推奨。
         execution_steps: async pipeline が 1 chunk を消費する tick 数 (Phase 4)。
-            issue-70 の flip_table 検証値 VALID_EXECUTION_STEPS={5, 10, 20} の
-            うち default 10 (333ms cadence @ 30Hz、chunk_len=16 に対して 6 tick
-            の replan 予備を確保)。replan_family が None の時は無視される。
+            model native horizon 以下で指定する。default 10 (333ms cadence @
+            30Hz)。例えばH16 GR00Tの4/8/16比較は、checkpoint契約を変えずに
+            replacement chunkをpromoteする周期だけを比較する。
+            replan_family が None の時は無視される。
         hydra_overrides: RAMEN-Oriの学習時model構造を再現するHydra override。
             architecture variant（G-3 fusion等）だけが指定し、通常variantは空。
+        language_prompt: GR00T 系 policy が受け取る natural language prompt を
+            per-variant で明示指定する (Issue #132 Phase A)。None なら VlaSkill が
+            自分の class-level `LANGUAGE` (subtask_training.json:<subtask>.task と
+            一致した既定値) を使う。rotate_table_base の GR00T variant が
+            combined_task5_7 用と rotate specialist 用で prompt を切替える必要が
+            あるため、config swap で完結できるようにする。
+        yolo_ckpt_ref: overlay を焼いた YOLO の `repo@revision` (`policy_config.yaml` の
+            `yolo.ckpt_ref`)。ckpt の約束 (`ckpt["contract"]`) との照合に使う
+            (Issue #141 P8-3)。両経路とも config_loader が入れる。
+        skill_id: ckpt が学習した skill_id を per-variant で明示する (Issue #141
+            1-2 / INF-3)。None なら VlaSkill の class-level `SKILL_ID` を使う。
+            Phase K の rotate_table_base の ckpt は skill_id 0 で学習しており
+            (class は 4)、古い ckpt を評価するときはここで 0 を指定する。
+        action_space: model output の action space (Issue #132 Phase C)。
+            - "abs" (default): 絶対 joint q target (arms 14D + hand 2D 全て abs)。
+               従来経路、既存 slot 全部に適用。
+            - "rel": arms 14D は normalized Δq、hand 2D は abs pass-through
+               (RAMEN-Ori Phase K Run 3/5 = rel action space 学習に対応)。
+               inference 側で `arms_current + cumsum(dq_norm*std + mean)` で abs
+                復元、relative_stats (mean, std) は ckpt state_dict の buffer
+               `_relative_arms_mean` / `_relative_arms_std` から自動抽出
+               (別 stats file 不要)。
+            GR00T では "rel" 未対応 (config_loader で reject)。
+        rtc: Real-Time Chunking 設定 (Issue #137 Phase A)。既定は
+            `RtcConfig()` = `enabled=False` で従来経路そのまま。chunk 境界での
+            予測不一致 (実機 1.5-2.0Hz の手先振動) を、denoising 速度場の
+            step 別スケールで抑える手法。`overlap_steps=None` の時は
+            `execution_steps` を流用するため、両者は対で意味を持つ。
+            詳細は `inference/desktop/lower_policy/rtc.py` の module docstring。
+        overlay_jpeg_subsampling: overlay mode で box を描いた画像を通す jpg の色差
+            (Issue #139)。学習 cache の保存形式に合わせる (`match_training_jpeg`)。
+            - "4:4:4" (default): Issue #139 の統合 cache (2026-09-12 以降の焼き込み)。
+              GPU の nvJPEG で保存しており、色差を間引かない。
+            - "4:2:0": それより前の焼き込み (GR00T #129 / RAMEN-Ori Phase K)。PIL の既定。
+            overlay mode 以外では使わない。
     """
 
     mode: str
@@ -280,6 +321,12 @@ class PolicyConfig:
     replan_family: str | None = None
     execution_steps: int = 10
     hydra_overrides: tuple[str, ...] = ()
+    language_prompt: str | None = None
+    yolo_ckpt_ref: str | None = None
+    skill_id: int | None = None
+    action_space: str = "abs"
+    rtc: RtcConfig = RtcConfig()
+    overlay_jpeg_subsampling: str = "4:4:4"
 
     def __post_init__(self) -> None:
         # mode の有効値制約 (実装が誤 mode で silent fail するのを防ぐ)。
@@ -322,6 +369,32 @@ class PolicyConfig:
             )
         if not all(isinstance(value, str) and value for value in self.hydra_overrides):
             raise ValueError("hydra_overrides must contain non-empty strings")
+        # language_prompt: 指定時は non-empty str (空文字は GR00T embed で NaN 原因、
+        # config で明示指定した意図と誤解釈される trap を避ける)。None は許容。
+        if self.language_prompt is not None:
+            if not isinstance(self.language_prompt, str) or not self.language_prompt:
+                raise ValueError(
+                    "language_prompt must be a non-empty string or None, "
+                    f"got {self.language_prompt!r}"
+                )
+        # action_space: "abs" (default) or "rel" (Issue #132 Phase C、RAMEN-Ori のみ)。
+        # abs と rel は排他 (共存しない)、policy_type との組み合わせ制約は config_loader
+        # 側で verify (base dataclass は type/value 制約のみ)。
+        if self.action_space not in ("abs", "rel"):
+            raise ValueError(
+                f"action_space must be 'abs' or 'rel', got {self.action_space!r}"
+            )
+        # rtc: 値域制約は RtcConfig 自身が持つ。ここは差し替え漏れ (dict をそのまま
+        # 渡す等) を起動時に落とすための型チェックのみ。
+        if not isinstance(self.rtc, RtcConfig):
+            raise TypeError(
+                f"rtc must be an RtcConfig, got {type(self.rtc).__name__}"
+            )
+        if self.overlay_jpeg_subsampling not in OVERLAY_JPEG_SUBSAMPLINGS:
+            raise ValueError(
+                f"overlay_jpeg_subsampling must be one of {tuple(OVERLAY_JPEG_SUBSAMPLINGS)}, "
+                f"got {self.overlay_jpeg_subsampling!r}"
+            )
 
 
 @runtime_checkable

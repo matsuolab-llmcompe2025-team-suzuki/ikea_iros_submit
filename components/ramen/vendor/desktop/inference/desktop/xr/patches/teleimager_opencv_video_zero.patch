@@ -1,0 +1,13 @@
+diff --git a/src/teleimager/image_server.py b/src/teleimager/image_server.py
+index 8cd455f..f1de1b2 100644
+--- a/src/teleimager/image_server.py
++++ b/src/teleimager/image_server.py
+@@ -1161,7 +1161,7 @@ class ImageServer:
+                 img_shape = cam_cfg.get("image_shape", None)
+                 fps = cam_cfg.get("fps", 30)
+                 video_id = cam_cfg.get("video_id", "0")
+-                video_path = f"/dev/video{video_id}" if video_id else None
++                video_path = f"/dev/video{video_id}" if video_id is not None else None
+                 physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
+                 serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
+ 

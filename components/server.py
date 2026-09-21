@@ -34,7 +34,69 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
+
+# --- 53D checkpoint は lerobot 0.6.1 の **親プロセス** でないと読めない -----------
+#
+# 53D を **この process 内**に読む RAMEN_POLICY は 2 つ:
+#   groot_orchestrator … expert を assembly.load_policy で読む
+#   groot_53d_real     … RAMEN_VARIANT の 53D を直接読む
+#
+# どちらも lerobot 0.6.0 だと draccus が checkpoint の config.json を弾く。
+# エラー文言は checkpoint の型で変わるが原因は同じ (RunPod の A100 で実測):
+#     DecodingError: The fields `type` are not valid for GrootConfig
+#     DecodingError: The fields `type` are not valid for FurnitureGrootRuntimeConfig
+#
+# RAMEN_WORKER_PYTHON_53D は **worker にしか渡らない**ので親には効かない。
+# image の CMD は 0.6.0 の python なので、放っておくと推奨経路が丸ごと死ぬ。
+# しかも warmup の例外は下で握りつぶされるため **起動したように見える**。
+#
+# → 必要なときだけ 0.6.1 の interpreter へ張り替えて同じ引数で入り直す。
+#   pick(38D) は worker を別 process に出すので 0.6.0 の親のままでよい。
+_POLICIES_NEEDING_LEROBOT_061 = frozenset({"groot_orchestrator", "groot_53d_real"})
+
+
+def _reexec_into_groot53_if_needed() -> None:
+    if os.environ.get("RAMEN_SERVER_REEXECED") == "1":
+        return  # 二重 exec 防止
+    policy = os.environ.get("RAMEN_POLICY", "").strip().lower()
+    if policy not in _POLICIES_NEEDING_LEROBOT_061:
+        return
+    interp = os.environ.get("RAMEN_WORKER_PYTHON_53D", "")
+    if not interp or not Path(interp).is_file():
+        print(
+            f"[server] WARNING: RAMEN_POLICY={policy} は lerobot 0.6.1 の "
+            "interpreter を要するが RAMEN_WORKER_PYTHON_53D が使えない "
+            f"(={interp!r})。53D expert の load は失敗する見込み。",
+            file=sys.stderr,
+        )
+        return
+    # ⚠️ ここで `.resolve()` してはいけない。venv の bin/python は system python への
+    # symlink なので、resolve すると venv の区別が消えて常に「同じ」に見える
+    # (2026-09-20 に実際これで re-exec が発火しなかった)。
+    # venv を見分けたいので **解決前の絶対 path** で比べる。
+    if os.path.abspath(interp) == os.path.abspath(sys.executable):
+        return  # 既に 0.6.1 の venv で動いている
+    os.environ["RAMEN_SERVER_REEXECED"] = "1"
+    # ⚠️ image の CMD は `python3 -u` だが、exec し直すと **-u が落ちる**。
+    # stdout が block buffer になり
+    #     [serve] policy server listening on ws://0.0.0.0:8765
+    # が 4KB 溜まるまで出てこない。手順書 (venue_runbook §2-4b) は
+    # **この行が出るまで client を繋ぐな**と指示しており、先に繋ぐと accept rate が
+    # near-zero になる (症状が「Thor を先に起動した」場合と同じで切り分け不能)。
+    # re-exec するのは groot_orchestrator = 大会当日の構成だけなので、ここを外すと
+    # 会場でだけ踏む。-u と PYTHONUNBUFFERED の両方を効かせる
+    # (後者は spawn される worker にも伝わる)。
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    print(
+        f"[server] re-exec into {interp} ({policy} は lerobot 0.6.1 が要る)",
+        file=sys.stderr,
+    )
+    os.execv(interp, [interp, "-u", os.path.abspath(__file__), *sys.argv[1:]])
+
+
+_reexec_into_groot53_if_needed()
+
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -50,8 +112,8 @@ class Policy:
     ``reset`` — because ``client.py`` calls exactly those.
     """
 
-    ACTION_CHUNK = 16     # rows returned per inference
-    OBS_CHUNK = 1         # frames of history we want per observation
+    ACTION_CHUNK = 16  # rows returned per inference
+    OBS_CHUNK = 1  # frames of history we want per observation
 
     def __init__(self, lane: str, delay_ms: float = 0.0):
         if lane not in LANES:
@@ -93,7 +155,7 @@ class Policy:
         self._steps += 1
         T = self.ACTION_CHUNK
         if self._delay_s:
-            time.sleep(self._delay_s)   # stand-in for real inference time
+            time.sleep(self._delay_s)  # stand-in for real inference time
 
         # >>> our inference goes here <<<
         # images = obs["images"]["ego_view"]      # (480, 640, 3) uint8 RGB
@@ -110,8 +172,8 @@ class Policy:
         # Task-space: zeros everywhere except the quaternions, which must be
         # unit length or boundary/actions.py rejects the chunk.
         actions = np.zeros((T, 25), dtype=np.float32)
-        actions[:, 7] = 1.0     # left  end-effector quat w
-        actions[:, 14] = 1.0    # right end-effector quat w
+        actions[:, 7] = 1.0  # left  end-effector quat w
+        actions[:, 14] = 1.0  # right end-effector quat w
         return {"actions": actions}
 
     def reset(self) -> dict:
@@ -161,10 +223,14 @@ def _build_policy(lane: str, delay_ms: float):
         return GrootPickTaskspacePolicy(lane=lane, backend=backend)
     if choice == "groot_orchestrator":
         if lane != "decoupled":
-            raise SystemExit("RAMEN_POLICY=groot_orchestrator requires --lane decoupled")
+            raise SystemExit(
+                "RAMEN_POLICY=groot_orchestrator requires --lane decoupled"
+            )
         from components.ramen.policy import OrchestratorTaskspacePolicy
 
-        print("[server] using OrchestratorTaskspacePolicy (full orchestrator, YOLO+5 skill)")
+        print(
+            "[server] using OrchestratorTaskspacePolicy (full orchestrator, YOLO+5 skill)"
+        )
         return OrchestratorTaskspacePolicy(lane=lane)
     raise SystemExit(
         f"unknown RAMEN_POLICY={choice!r}; expected stub / groot_pick / "
@@ -203,20 +269,50 @@ def _warmup_policy(policy, label: str, iters: int = 2) -> None:
             policy.act(dummy)
         reset = getattr(policy, "reset", None)
         if callable(reset):
-            reset()   # warmup tick の state を捨てて本番を綺麗に始める
+            reset()  # warmup tick の state を捨てて本番を綺麗に始める
         print(f"[server] warmup done ({label}, {iters} iters, {time.time() - t0:.1f}s)")
-    except Exception as exc:   # noqa: BLE001 — warmup 失敗で serve を止めない
+    except Exception as exc:  # noqa: BLE001 — warmup 失敗で serve を止めない
+        # ⚠️ **ここで握りつぶすと「起動したのに中身が無い」状態になる。**
+        # 2026-09-20 に groot_orchestrator の 53D load が lerobot 版違いで失敗して
+        # いたのを、この except が 1 行の warning に落としていたため、起動ログ上は
+        # 正常に見えていた (会場でこれを踏むと切り分けに時間を取られる)。
+        #
+        # warmup が「落ちて当然」なケースと、model が読めていないケースを区別する:
+        #   - overlay policy は検出ゼロのダミー画像を拒否する = 設計どおりで無害
+        #   - それ以外は model が使えない可能性が高いので、traceback を必ず出す
+        benign = "requires live YOLO-OBB detections" in str(exc)
         print(f"[server] warmup skipped ({label}): {type(exc).__name__}: {exc}")
+        if benign:
+            print(
+                "[server]   ^ overlay checkpoint がダミー画像を拒否しただけ "
+                "(設計どおり)。実フレームが来れば動く。"
+            )
+        else:
+            import traceback
+
+            print(
+                "[server]   ^ 🔴 model が使えていない可能性が高い。"
+                "このまま serve すると『起動しているのに動かない』状態になる。",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--lane", choices=LANES,
-                        default=os.environ.get("PEVAL_LANE", "sonic"),
-                        help="Action space. Must match our manifest.")
-    parser.add_argument("--delay-ms", type=float, default=0.0,
-                        help="Fake inference time. Use it to see how our client "
-                             "behaves at realistic latency before our model exists.")
+    parser.add_argument(
+        "--lane",
+        choices=LANES,
+        default=os.environ.get("PEVAL_LANE", "sonic"),
+        help="Action space. Must match our manifest.",
+    )
+    parser.add_argument(
+        "--delay-ms",
+        type=float,
+        default=0.0,
+        help="Fake inference time. Use it to see how our client "
+        "behaves at realistic latency before our model exists.",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

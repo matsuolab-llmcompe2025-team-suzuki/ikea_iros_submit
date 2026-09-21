@@ -40,6 +40,7 @@ Thor `192.168.100.1` / Orin `192.168.100.2`、両者は ethernet 直結。
 docker run --rm --runtime nvidia --network host \
   -e NVIDIA_DISABLE_REQUIRE=1 \
   -e HF_TOKEN=<token-if-gated> \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   <registry>/ramen-thor@sha256:<digest>
 # → components/server.py --lane decoupled --host 0.0.0.0 --port 8765
 
@@ -51,6 +52,26 @@ docker run --rm --runtime nvidia --network host \
 - `--network host`: boundary の ZeroMQ 3 endpoint（cameras:5555 / state:5557 / actions:5556、Orin 上）と Thor↔Orin WebSocket:8765 のため。
 - `--runtime nvidia`: GPU アクセス。Orin は CUDA/driver userspace が host mount。
 - **`-e NVIDIA_DISABLE_REQUIRE=1`(Thor のみ、必須)**: base の `cuda:13.0.0-devel-ubuntu24.04` は driver-compat gate を焼き込んでおり、運営 Thor(driver 595.78)では `--runtime nvidia` だけだと GPU が全く渡らない(`nvidia-smi` が container 内で失敗)。このフラグで解消(運営 onboarding Finding 1 で確認済)。無いと RAMEN-Ori が CPU-only load or crash する。
+- **`-v ~/.cache/huggingface:/root/.cache/huggingface`(Thor、強く推奨)**: weights は image に焼かず runtime に `huggingface_hub.snapshot_download` で取る設計のため、mount が無いと**毎回空キャッシュから 8.90 GB を落とし直す**。準備時間は 1 スロット 20 分しかない。事前に host 側へ pull しておけば起動が即時になる。
+
+## 自前経路（same image、大会経路とは別プロセス）
+グリッパは `(T,25)` の `[0:2]`/`[2:4]` を運営 adapter が relay する大会経路でしか動かないが、
+歩行（Stage 0）と腕は `rt/arm_sdk` 直の自前経路の方が確実（運営 IK を通らないので EE frame の
+不確定性を受けない）。同じ image から起動できる:
+
+```bash
+docker run --rm --runtime nvidia --network host \
+  -e NVIDIA_DISABLE_REQUIRE=1 \
+  -e HF_TOKEN=<token-if-gated> \
+  -e PYTHONPATH=/app/components/ramen/vendor/desktop \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  <registry>/ramen-thor@sha256:<digest> \
+  python3 -m inference.desktop.entrypoint \
+    --head-source zmq --synthetic-hand-state --action-sink boundary
+```
+- `--head-source zmq`: 会場は ROS2 カメラを publish しない（boundary の `:5555` から取る）。
+- `--synthetic-hand-state`: 会場は hand state を publish しない（Dex1-1、`boundary/states.py` に「usually absent, synthesize whatever your model expects」と明記）。
+- `--action-sink boundary`: `(T,25)` を運営 adapter へ出す。外すと `rt/arm_sdk` へ直接出す（DDS 経路、CycloneDDS + `unitree_sdk2py` を image に同梱済み）。
 
 ## 提出時に添えるもの（運営チェックリスト、2026-08 訂正）
 1. Git repo link（無改変 `boundary/` + 各コンテナの Dockerfile）

@@ -1,0 +1,169 @@
+### 提出 image (Thor / GR00T) を CI で焼いて GHCR へ push する。
+#
+# なぜ要るか:
+#   この image は 2026-09-20 時点で **特定の Mac 1 台でしかビルドできない**
+#   (Apple Silicon = arm64 native)。vendor を更新するたびその 1 台が要るので、
+#   大会 (09-27 接続テスト / 09-28-30 本番) の直前にその 1 台が使えないと詰む。
+#
+#   ubuntu-24.04-arm runner でネイティブに焼けることを probe で確認済み
+#   (ディスクは掃除前 109GB 空き、ベース展開後も 102GB 残る = 余裕)。
+#
+# 認証:
+#   - nvcr.io : NGC_API_KEY (ベース image の pull。public image でも login 必須)
+#   - ghcr.io : GHCR_PAT    (org の default workflow permissions が read 固定で、
+#               workflow 側で packages:write を明示しても
+#               "denied: permission_denied: write_package" になるため。
+#               PAT は write:packages だけに絞ること)
+
+name: build thor image
+
+on:
+  # ⚠️ workflow_dispatch は **default branch (main) に workflow が無いと呼べない**。
+  # main には .github/workflows 自体が無く、提出まわりが全部終わるまで PR も切らない
+  # 方針なので、それまではこの branch への push で起動する。
+  # ビルド条件 (tag / push / platform) は workflow_dispatch の inputs が使えない分、
+  # `.github/ci-build-request.env` に書いて push する。main に入ったらこの push
+  # trigger と env ファイルは落とし、workflow_dispatch だけにしてよい。
+  push:
+    branches: [issue/1-vendor-sync-and-sdk-layer]
+    paths:
+      - .github/workflows/build-thor-image.yml
+      - .github/ci-build-request.env
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GHCR の tag (例 20260920-ci)"
+        required: true
+        type: string
+      push:
+        description: GHCR に push するか (false ならビルドのみ)
+        required: true
+        default: true
+        type: boolean
+      platform:
+        # 提出物は arm64。amd64 は **検証専用** — RunPod が x86 しか貸さないので、
+        # 「image をそのまま pod の image にして orchestrator を通す」ために焼く。
+        # pip が引く wheel は arch ごとに違うので提出 image と byte 同一ではないが、
+        # 確かめたいのは vendor tree の中身と expert の load 可否 = arch 非依存。
+        description: ビルドする platform (提出は linux/arm64)
+        required: false
+        default: linux/arm64
+        type: choice
+        options: [linux/arm64, linux/amd64]
+
+permissions:
+  contents: read
+
+jobs:
+  # runs-on は job 開始前に決まる必要があり、同じ job の step 出力は参照できない。
+  # そのため platform の解決だけ別 job に切り出す。
+  params:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      push: ${{ steps.resolve.outputs.push }}
+      platform: ${{ steps.resolve.outputs.platform }}
+      runner: ${{ steps.resolve.outputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_PUSH: ${{ inputs.push }}
+          IN_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          REQ=.github/ci-build-request.env
+          # push 起動には inputs が無いので env ファイルを読む。
+          # workflow_dispatch のときは読まない — inputs を空にしたのに前回の
+          # ファイルの値が生き返ると、意図しない tag へ push しかねない。
+          if [ "$EVENT" = "push" ] && [ -f "$REQ" ]; then
+            # shellcheck disable=SC1090
+            . "$REQ"
+          fi
+          TAG="${IN_TAG:-${TAG:-}}"
+          PUSH="${IN_PUSH:-${PUSH:-false}}"
+          PLATFORM="${IN_PLATFORM:-${PLATFORM:-linux/arm64}}"
+
+          # tag 未指定は「ビルドだけ確かめたい」= GHCR を汚さない。
+          if [ -z "$TAG" ]; then
+            TAG=ci-dryrun
+            PUSH=false
+          fi
+          case "$PLATFORM" in
+            linux/amd64) RUNNER=ubuntu-24.04 ;;
+            linux/arm64) RUNNER=ubuntu-24.04-arm ;;
+            *) echo "::error::未知の platform: $PLATFORM"; exit 1 ;;
+          esac
+
+          {
+            echo "tag=$TAG"
+            echo "push=$PUSH"
+            echo "platform=$PLATFORM"
+            echo "runner=$RUNNER"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: params
+    # platform に合わせてネイティブ runner を選ぶ (QEMU だと数時間かかる)。
+    runs-on: ${{ needs.params.outputs.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ディスクの空きを確保
+        run: |
+          # arm runner は掃除前でも 109GB 空いていたが、x86 runner は 20GB 台しか
+          # 無い。ベース展開 (約20GB) + pip 層 (約7GB) が通らないので、x86 では
+          # hostedtoolcache/swift まで落とす。
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/share/swift /opt/hostedtoolcache \
+                      /usr/local/.ghcup || true
+          df -h / | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: nvcr.io にログイン
+        run: |
+          echo '${{ secrets.NGC_API_KEY }}' \
+            | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: ghcr.io にログイン
+        if: ${{ needs.params.outputs.push == 'true' }}
+        run: |
+          echo '${{ secrets.GHCR_PAT }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: ビルド (+ push)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.thor.groot
+          platforms: ${{ needs.params.outputs.platform }}
+          push: ${{ needs.params.outputs.push == 'true' }}
+          tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ needs.params.outputs.tag }}
+          provenance: false # 提出物の manifest を素の index に保つ
+
+      - name: digest を記録 (manifest.groot.yaml に書く値)
+        if: ${{ needs.params.outputs.push == 'true' }}
+        env:
+          PLATFORM: ${{ needs.params.outputs.platform }}
+          TAG: ${{ needs.params.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## 焼けた image"
+            echo '```'
+            echo "platform: $PLATFORM"
+            echo "repo_tag: ghcr.io/${{ github.repository_owner }}/ikea-thor:$TAG"
+            echo "digest:   $DIGEST"
+            echo '```'
+            if [ "$PLATFORM" = "linux/arm64" ]; then
+              echo "⚠️ manifest.groot.yaml の digest を手で更新すること。"
+            else
+              echo "⚠️ **amd64 は検証専用。manifest.groot.yaml に書かないこと** (Thor は aarch64)。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

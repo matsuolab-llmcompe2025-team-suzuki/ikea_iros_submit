@@ -1,0 +1,62 @@
+# RAMEN-Ori Phase K β task 用 top-level config (Issue #129 Phase K、2026-09-01)。
+# α (real_multi_task5_7) と同 recipe、data group を real_multi_task5_7_0 に差替。
+# task0 (insert、combined_task0 = 34 chunks merge 済) を追加した 3-sub multi wrapper。
+#
+# 使用例 (Run 4、overlay + abs + β):
+#   pixi run --frozen python -m model.ramen_ori.train \
+#     --config-name=real_multi_task5_7_0 \
+#     data.frame_cache_mode=baked_overlay \
+#     data.sub_datasets.0.frame_cache_root_baked=/nvme/rotate_table_base/frame_cache_v2/overlay \
+#     data.sub_datasets.1.frame_cache_root_baked=/nvme/task7/frame_cache_v2/overlay \
+#     data.sub_datasets.2.frame_cache_root_baked=/nvme/merged_sources/combined_task0/frame_cache_v2/overlay \
+#     data.frame_cache_num_variants=10 \
+#     training.max_steps=100000 \
+#     training.ckpt_dir=/nvme/train_outputs/phasek_run4_overlay_abs_beta \
+#     wandb.run_name=r6_run4_overlay_abs_beta
+
+defaults:
+  - base
+  - override /data: real_multi_task5_7_0
+  - _self_
+
+speedup:
+  torch_compile: true
+  torch_compile_mode: reduce-overhead
+
+training:
+  batch_size: 32
+  num_workers: 20
+  prefetch_factor: 4
+  max_steps: 100000
+  log_every: 100
+  ckpt_every: 5000
+  ckpt_dir: outputs/ramen_ori_phase_k
+  seed: 42
+  # β task は task0 が frame 87% を占めるため balancing 必須 (uniform sampling では task0 dominance)。
+  balancing:
+    enabled: true
+    strategy: task_uniform
+  hf_autopush:
+    enabled: false
+    repo_id: null
+    every_n_ckpt: 2
+    private: true
+
+lr_schedule:
+  enabled: true
+
+ema:
+  enabled: true
+
+augmentation:
+  enabled: true
+
+val:
+  enabled: true
+  split_json: null
+
+wandb:
+  enabled: true
+  project: ramen_ori
+  entity: ken05-matuo-llm-88_llm_2025_suzuki
+  run_name: null

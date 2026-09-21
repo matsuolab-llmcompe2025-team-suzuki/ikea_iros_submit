@@ -39,6 +39,18 @@ FAMILY_REPLANNING_PROFILES = MappingProxyType({
     "groot_relative_eef_v1": ReplanningProfile(4, 0.35),
     "diffusion_chunk_relative_v1": ReplanningProfile(2, 0.20),
     "diffusion_absolute_v1": ReplanningProfile(2, 0.20),
+    # Issue #137: RAMEN-Ori (flow matching chunk policy)。実機実測 latency は
+    # median 50.8ms / max 79.8ms で、30Hz なら 1.5-2.4 tick。lead 2 (66ms) だと
+    # p90 で間に合わないので 3 (100ms)。max_age 0.25s = 7.5 tick。
+    "ramen_ori_flow_v1": ReplanningProfile(3, 0.25),
+    # Issue #139: ACT / Diffusion Policy (rotate_table_base、19D absolute)。実機
+    # Desktop では未計測で、開発 PC (RTX 3060 Ti) の worker 往復 (ACT max 48ms /
+    # DP max 158ms) に RAMEN-Ori の実機 / 開発 PC 比 0.62 を掛けて見積もった
+    # (ACT max ~30ms / DP max ~98ms)。RAMEN-Ori と同じく lead は max + 20ms 以上、
+    # max_age は lead + 150ms を 0.05s 単位で切り上げ。overlay 画像の jpg 合わせ
+    # (1 枚 ~3.5ms、DP は 2 枚) を足しても lead に収まる。
+    "act": ReplanningProfile(2, 0.25),
+    "diffusion": ReplanningProfile(4, 0.30),
 })
 
 
@@ -294,16 +306,9 @@ class AsyncActionChunkPipeline:
             self.deadline_miss_ticks += 1
             return None
         if not self._pending.done():
-            submitted_ns = self._pending_submitted_monotonic_ns
-            if (
-                submitted_ns is not None
-                and time.monotonic_ns() - submitted_ns
-                > self._max_prediction_age_ns
-            ):
-                raise TimeoutError(
-                    "asynchronous model request exceeded its observation-age "
-                    "budget before producing a usable chunk"
-                )
+            # A late neural-network request must never block or throw from the
+            # physical command loop.  Keep holding the last target; once the
+            # request completes the age check below will discard it.
             self.deadline_miss_ticks += 1
             return None
         completed = self._pending.result()
@@ -319,6 +324,21 @@ class AsyncActionChunkPipeline:
         self._index = 0
         self.completed_chunks += 1
         return completed
+
+    def skip_consumed_prefix(self, steps: int) -> None:
+        """Align a promoted chunk with elapsed physical control ticks.
+
+        A replacement is anchored at submission time, but it can only be
+        promoted several ticks later.  Those prefix rows describe time that
+        has already passed.  Keeping ``_index`` at zero would delay the next
+        prefetch and eventually recreate a boundary stall.
+        """
+
+        if self._closed:
+            raise RuntimeError("asynchronous replanning pipeline is closed")
+        if not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative int")
+        self._index = min(steps, self._execution_steps)
 
     def next_action(self) -> tuple[np.ndarray, int | None]:
         """Return the next model step, or the last step while inference is late."""

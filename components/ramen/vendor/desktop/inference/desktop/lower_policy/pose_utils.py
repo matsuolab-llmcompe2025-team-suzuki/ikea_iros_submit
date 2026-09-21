@@ -59,6 +59,48 @@ def densify_pose(
     return dense
 
 
+# ROS2 `/joint_states` の joint 名 (G1 29-DoF、orin 側 joint_mapping.G1_JOINT_NAMES)
+# → 14-D 腕 pose の index。obs["joint_state"] から腕だけ抜くのに使う。
+# index ではなく **名前で引く** ことで、publish 側の順序変更に黙って壊れないようにする。
+ROS_ARM_JOINT_NAMES: tuple[str, ...] = (
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint",
+    "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+)
+
+
+def arm_positions_from_joint_state(
+    names: "tuple[str, ...]", positions: np.ndarray, context: str = ""
+) -> np.ndarray:
+    """`/joint_states` の (name, position) から 14-D 腕 pose を抽出する。
+
+    Args:
+        names: joint 名列 (G1 は 29 entries)。
+        positions: 同順の関節位置 [rad]。
+        context: error message 用の hint。
+
+    Raises:
+        ValueError: 腕 joint が 1 つでも欠けている場合 (黙って 0 で埋めない)。
+    """
+    pos = np.asarray(positions, dtype=np.float64).reshape(-1)
+    if len(names) != pos.shape[0]:
+        raise ValueError(
+            f"joint_state{f' ({context})' if context else ''}: "
+            f"name/position length mismatch ({len(names)} vs {pos.shape[0]})"
+        )
+    index = {n: i for i, n in enumerate(names)}
+    missing = [n for n in ROS_ARM_JOINT_NAMES if n not in index]
+    if missing:
+        raise ValueError(
+            f"joint_state{f' ({context})' if context else ''}: "
+            f"missing arm joint(s) {missing}"
+        )
+    return np.array([pos[index[n]] for n in ROS_ARM_JOINT_NAMES], dtype=np.float64)
+
+
 def validate_pose_bounds(pose: np.ndarray, context: str = "") -> None:
     """pose が NaN/Inf を含まず、±POSE_ABS_LIMIT_RAD 以内であることを assert する。
 

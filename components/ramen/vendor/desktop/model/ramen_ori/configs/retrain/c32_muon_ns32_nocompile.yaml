@@ -1,0 +1,20 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: c32_muon の回し直し用 (段取りの 3 番目)
+# 起動: pixi run train --config-name=retrain/c32_muon_ns32_nocompile
+#
+# c32_muon_ns32 に加えて torch.compile を切る (compile した forward / backward の kernel が関わっているかを分けるため)。
+# 1 step は約 3 割遅くなる (compile なし 131 ms / あり 100 ms、Issue #141 Phase 9 の計測)
+defaults:
+  - /retrain/c32_muon_ns32
+  - _self_
+
+speedup:
+  torch_compile: false
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c32_muon_ns32_nocompile
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_muon_ns32_nocompile
+
+wandb:
+  run_name: ramen_ori_141_c32_muon_ns32_nocompile

@@ -1,0 +1,14 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: 土台 32 (共通設定のまま、chunk 32)
+# 起動: pixi run train --config-name=retrain/c32
+defaults:
+  - /retrain/common
+  - _self_
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c32
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32
+
+wandb:
+  run_name: ramen_ori_141_c32

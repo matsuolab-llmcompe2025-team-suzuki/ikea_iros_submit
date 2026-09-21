@@ -1,0 +1,27 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: 32 + memory の入力 (監査 doc §2「変種の候補 1」)
+# 起動: pixi run train --config-name=retrain/c32_memory
+#
+# 天板や手が区間の開始時からどれだけ動いたか (head_left の YOLO-OBB) と、自分の手先の動きの移動平均を 51 個の数にして
+# token 1 個で渡す (memory_features.py)。起動時に sub ごとに memory の表を作り、切り詰めの範囲と統計を計算する
+defaults:
+  - /retrain/common
+  - _self_
+
+data:
+  memory: true
+
+model:
+  memory:
+    _target_: model.ramen_ori.memory.MemoryEncoder
+    memory_dim: 51
+    d_model: ${model.d_model}
+    motion_dropout: 0.3   # 自分の動きの 18 個をまとめて隠す確率 (隠した印を 1 個足す)
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c32_memory
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_memory
+
+wandb:
+  run_name: ramen_ori_141_c32_memory

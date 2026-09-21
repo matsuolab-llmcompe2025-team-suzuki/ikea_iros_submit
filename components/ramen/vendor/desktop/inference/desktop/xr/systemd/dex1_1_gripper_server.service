@@ -1,0 +1,13 @@
+[Unit]
+Description=Unitree Dex1-1 serial-to-DDS service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/unitree/dex1_1_service/bin/dex1_1_gripper_server --network eth0
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

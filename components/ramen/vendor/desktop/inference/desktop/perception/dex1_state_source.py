@@ -124,3 +124,121 @@ class Dex1StateSource:
         for subscriber in (left, right):
             if subscriber is not None:
                 subscriber.Close()
+
+
+class SyntheticDex1StateSource:
+    """hand state が配信されないリグ向けの、指令エコー型の合成 source。
+
+    # なぜ要るか
+
+    大会会場では Dex1 の state が **どこからも来ない**。運営の contract がそう決めている:
+
+        boundary/states.py:
+          "HAND STATE IS USUALLY ABSENT. The competition G1 carries Dex1-1 two-finger
+           grippers, not Dex3 hands ... synthesize whatever your model expects if it
+           needs a hand vector."
+
+    `rt/dex1/*`（`Dex1StateSource` が読む方）は Orin 上の serial↔DDS 中継
+    (`dex1_1_gripper_server`) が要る **ラボ専用構成**で、会場には無い。
+    それでも `hand_state` は policy の state ベクトル (38D/49D/59D) の必須要素なので、
+    こちらで作って入れるしかない。
+
+    # なぜ定数ではいけないか
+
+    提出側 (`components/ramen/orchestrator_io.py`) は `(1.0, 1.0)` = 常に全開 4.5 rad の
+    定数を入れている。`pick_table_leg` / `rotate_table_base` のように開いた状態から
+    始まる skill では正しいが、`skill_config.yaml` で
+    ``requires_separate_hand_initialization: true`` の skill（`insert_table_leg` /
+    `rotate_leg_to_tighten` ほか）は **脚を掴んだ状態が frame 0** なので、
+    「掴んでいるのに開いていると policy に伝える」ことになる。
+
+    # 何をするか
+
+    - **seed**: run の開始 skill の frame-0 hand 値
+      (`SkillInitialPose.dex1_target_rad`、dataset の開き割合 × 4.5 rad)
+    - **以降**: policy が出した hand 指令をそのままエコーする (open-loop)
+
+    実センサが無い以上、滑りや把持失敗は見えない。**定数よりは確実に正しい**、
+    というのがこの class の位置づけであって、実 state の代替ではない。
+
+    Args:
+        initial_position_rad: seed する (left, right) [rad]。
+        command_source: `latest` 属性で直近の hand 指令 `(left, right)` を返すもの
+            (`MockHandActuator` 等)。`bind_command_source()` で後から繋いでもよい。
+    """
+
+    def __init__(
+        self,
+        initial_position_rad: tuple[float, float],
+        *,
+        command_source: Optional[object] = None,
+    ) -> None:
+        self._initial = self._clamp(initial_position_rad)
+        self._commanded: Optional[tuple[float, float]] = None
+        self._command_source = command_source
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @staticmethod
+    def _clamp(position_rad) -> tuple[float, float]:
+        # Layer 2 の hardware range に合わせる (actuator 側と同じ [0, 5.4])。
+        from inference.desktop.lower_policy.actuators.hand import (
+            HAND_GRIP_MAX,
+            HAND_GRIP_MIN,
+        )
+
+        arr = tuple(float(v) for v in position_rad)
+        if len(arr) != 2:
+            raise ValueError(f"position_rad must have length 2, got {len(arr)}")
+        if not all(math.isfinite(v) for v in arr):
+            raise ValueError(f"position_rad must be finite, got {arr}")
+        return tuple(max(HAND_GRIP_MIN, min(HAND_GRIP_MAX, v)) for v in arr)
+
+    def bind_command_source(self, command_source: object) -> None:
+        """`latest` で直近 hand 指令を返すものを後から繋ぐ。"""
+
+        with self._lock:
+            self._command_source = command_source
+
+    def update(self, position_rad) -> None:
+        """policy が出した hand 指令を state として取り込む。"""
+
+        clamped = self._clamp(position_rad)
+        with self._lock:
+            self._commanded = clamped
+
+    def get(self) -> Dex1StateData | None:
+        """指令があればそれ、無ければ seed した frame-0 値を返す。
+
+        `Dex1StateSource` と違い **None を返さない**。合成なので「まだ来ていない」
+        という状態が存在せず、preflight も素通りする。
+        """
+
+        with self._lock:
+            if self._closed:
+                return None
+            commanded = self._commanded
+            source = self._command_source
+            initial = self._initial
+
+        # 繋がれた actuator の方が live なので優先する。update() は actuator を
+        # 繋がない配線 (test / 別経路) のための口。
+        if source is not None:
+            latest = getattr(source, "latest", None)
+            if latest is not None:
+                commanded = self._clamp(latest)
+
+        position = commanded if commanded is not None else initial
+        now_monotonic = time.monotonic_ns()
+        return Dex1StateData(
+            position_rad=np.asarray(position, dtype=np.float64),
+            left_received_monotonic_ns=now_monotonic,
+            right_received_monotonic_ns=now_monotonic,
+            t=time.time_ns(),
+        )
+
+    def close(self) -> None:
+        """`Dex1StateSource` と同じ形。冪等。"""
+
+        with self._lock:
+            self._closed = True

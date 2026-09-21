@@ -1,0 +1,59 @@
+# Apple Vision Pro teleoperation image-server configuration.
+#
+# This is intentionally head-camera-only.  Keep the wrist-camera entries even
+# when disabled: the official ImageClient expects all three top-level keys.
+# The last verified G1 head-camera node was /dev/video6. USB /dev/videoN
+# numbering can change after a reboot or reconnect. The Orin launcher verifies
+# the configured 1280x480 source every time; if its number changed and exactly
+# one matching source exists, it updates video_id automatically. When there are
+# multiple candidates, explicitly verify it and start with
+# G1_HEAD_CAMERA_VIDEO_ID=N. Although the physical USB path below is stable,
+# the official v1.5 OpenCV resolver probes every V4L device when a physical path
+# is supplied. That stalls on the attached D405 cameras, so this configuration
+# deliberately uses a verified video_id instead.
+head_camera:
+  enable_zmq: true
+  zmq_port: 55555
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+  type: opencv
+  # The USB device delivers a single side-by-side frame.  Keep its *full*
+  # shape here: the official TeleVuer binocular path splits columns [0:640]
+  # to the left eye and [640:1280] to the right eye, then declares the
+  # WebRTC layout as `stereo-left-right` for Apple Vision Pro.  Do not change
+  # this to [480, 640], which would make the source appear monocular/cropped.
+  image_shape: [480, 1280]
+  binocular: true
+  fps: 30
+  video_id: 6
+  serial_number: null
+  physical_path: null
+
+left_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55556
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+  type: opencv
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: null
+  physical_path: null
+
+right_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55557
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+  type: opencv
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: null
+  physical_path: null

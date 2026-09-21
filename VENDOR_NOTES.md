@@ -12,6 +12,56 @@
 - 編集するのは `components/`（特に `server.py` の `Policy`）と、追加した
   `docker/` `manifest.yaml` `INSTRUCTIONS.md` のみ。
 
+## 🔴 `components/ramen/vendor/desktop/` の同期は必ず script で（Issue #1、2026-09-20）
+
+推論コードの本体は **`iros_2026_ramen`** 側にあり、ここはそのコピー。提出 image は
+`COPY . ./` でこの repo を丸ごと焼くので、**vendor が古いとその古いコードが image に入る**。
+
+手でコピーしていた結果、2026-09-20 時点で約 3 週間ぶんドリフトしていた（20 files が古い /
+38 files が欠落、`ramen_ori.py` は 914 行 → 1904 行）。以後は必ずこれを使う:
+
+```bash
+IROS_RAMEN_REPO=~/work/iros/iros_2026_ramen ./tools/sync_vendor_desktop.sh
+python3 conformance.py --lane decoupled          # PASS を確認
+python3 -m pytest components/ramen/tests -q
+```
+
+- 同期元の commit は `components/ramen/vendor/desktop/VENDOR_SOURCE.txt` に記録される。
+- 除外: `tests/` `__pycache__/` `*.pyc` `.pytest_cache/` `pixi.toml` `pixi.lock`。
+- **G1 URDF も `inference/orin/.../unitree_g1/` に置く**。`perception/g1_urdf_fk.py` と
+  `lower_policy/gravity_compensation.py` が URDF を **repo root 相対**
+  （`Path(__file__).parents[3]` / `parents[4]`）で探し、vendor tree がその repo root を
+  兼ねるため。置き忘れると 53D / orchestrator が全部 `FileNotFoundError` で落ちる。
+  script がやるので手で消さないこと。
+- 本体に無く vendor にだけ要る空の `__init__.py`（`inference/desktop/` と各 `configs/`）も
+  script が復元する。本体は namespace package で動くが、vendor は `sys.path` 直挿しのため。
+
+### 自作パッチは `tools/vendor_patches.py` に置く
+行番号つきの diff は近傍が 1 行動いただけで当たらなくなり、しかも気付かずに image を
+焼く事故になる。完全一致のアンカー文字列で置換し、**見つからなければ同期を失敗させる**。
+
+現在 1 件:
+- `lower_policy/policies/groot.py` — GR00T 53D worker を `RAMEN_WORKER_PYTHON_53D`
+  （lerobot 0.6.1 の python）で直接起動する。container に pixi は無いので本家の
+  `pixi run` 経路は fallback に回す。`Dockerfile.thor.groot` の同名 ENV と対。
+
+> ⚠️ `components/` 直下の自作パッチ（`transport.py` / `client.py` / `README.md`）は
+> **この script の対象外**（vendor/desktop の外）。下記「upstream 追従」節のとおり手で守る。
+
+## Unitree SDK / CycloneDDS を image に同梱（Issue #1、2026-09-20）
+
+`docker/Dockerfile.thor.groot` は大会経路（`components/server.py`、ZMQ のみ）に加えて
+**自前経路（`inference/desktop/entrypoint.py`、`rt/arm_sdk` 直 + LocoClient）**も同じ image で
+動かせるようにしてある。会場で持つ image を 1 個にするため。
+
+- CycloneDDS は source build → `/usr/local`、`ENV CYCLONEDDS_HOME=/usr/local` を焼く。
+- `unitree_sdk2py` は **pip install しない**。`setup.py` が `find_packages()` だけで
+  `package_data` を宣言せず、wheel に `utils/lib/crc_aarch64.so` 等が入らないため
+  （実機で 21〜25 ファイル不足）。ソースを `/opt/unitree_sdk2_python` に置き `.pth` で通す。
+- **ref は `65691c8` に固定**。運営 vendor 版（`GR00T-WholeBodyControl/
+  external_dependencies`）は `LOCO_SERVICE_NAME="loco"` で robot と話せず**全 RPC が 3102**
+  になる。robot が publish しているのは `rt/api/sport/*`。build 時 assert が毎回確認する。
+
 ## upstream 追従 / 意図的な乖離（2026-08、再同期時 要注意）
 - upstream 最新 = **`2ae4eeb`**（vendored 元 `7a4f071` から 2 commit 先）:
   - `9f770d2` stereo ego_view 追加（`boundary/cameras.py` の CAMERA_KEYS、README camera 表、`mock_orin.py --stereo-ego`）
