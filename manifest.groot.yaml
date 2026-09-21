@@ -12,7 +12,7 @@ lane: decoupled
 platform: linux/arm64
 
 images:
-  thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
+  thor:                       # policy server / RAMEN-Ori(rotate) + GR00T(pick/insert/rotate_leg/flip) + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
@@ -280,8 +280,20 @@ images:
 
 thor_orin_port: 8765
 
-# GR00T pick weights (ver2-lora, private Team-RAMEN)。image に焼かず runtime に HF 取得。
+# weights は image に焼かず runtime に HF 取得 (private Team-RAMEN)。
 #   docker run 時に -e HF_TOKEN=<token> を渡すこと (private repo pull に必須)。
+#
+# ⚠️ **準備スロットは 20 分しかない。** 下の 4 つは host の
+# ~/.cache/huggingface へ事前に pull しておくこと (mount する前提)。
+# orchestrator は 1 脚で 4 つとも通る:
+#   rotate_table_base     hf://Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b
+#                         (RAMEN-Ori。2026-09-21 に GR00T overlay から差し替え)
+#   pick_table_leg        下の weights_uri と同じ
+#   insert_table_leg      hf://Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k@0f0927bcc1aed6927fb26b82c017009961ee3d35
+#   rotate_leg_to_tighten hf://Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26
+# Stage 5 の flip は RAMEN_POLICY=groot_53d_real 側:
+#   hf://Team-RAMEN/... (policy_config.yaml の groot_flip_table_n17_2_baseline)
+# pick を hybrid にするなら Qwen/Qwen3-VL-8B-Instruct も (INSTRUCTIONS.md)。
 weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1"
 
 # Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。

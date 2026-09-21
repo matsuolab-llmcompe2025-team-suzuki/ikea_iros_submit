@@ -5,7 +5,7 @@ orchestrator_io のアダプタに差し替え、boundary act(obs) 毎に tick �
 (T,25) を返す。skill 遷移 (perception[YOLO]+dwell+is_complete) は原さんの実装のまま。
 
 skill→variant (leg round):
-  rotate_table_base = groot_overlay (53D) / pick = groot_pick_legs_v2 (38D) /
+  rotate_table_base = RAMEN-Ori 141_c32_state_dropout / pick = groot_pick_legs_v2 (38D) /
   insert = groot_insert_leg_200k (53D) / rotate_leg = groot_rotate_leg_200k (53D)
 
 worker env: pick=RAMEN_WORKER_PYTHON (lerobot0.6.0) / 53D=RAMEN_WORKER_PYTHON_53D (0.6.1)。
@@ -44,8 +44,19 @@ from .taskspace_adapter import groot_chunk_to_taskspace
 _VENDOR_DESKTOP = str(Path(__file__).resolve().parent / "vendor" / "desktop")
 
 # leg round の skill → (VlaSkill class 名, policy_config variant)
+#
+# rotate_table_base は **RAMEN-Ori に確定** (2026-09-21)。GR00T の overlay 版は
+# 会場では使わない。
+#
+# この variant は `cams: [head_left, wrist_left, wrist_right]` の 3 カメラ版なので、
+# boundary が単一 head を複製する件 (4 cam 版だと HEAD_RIGHT が HEAD_LEFT と
+# 同じ画像になる) には当たらない。
 _STAGE_SKILLS = (
-    ("rotate_table_base", "RotateTableBaseVlaSkill", "groot_overlay"),
+    (
+        "rotate_table_base",
+        "RotateTableBaseVlaSkill",
+        "rotate_table_base_ramen_ori_141_c32_state_dropout",
+    ),
     ("pick_table_leg", "PickTableLegVlaSkill", "groot_pick_legs_v2"),
     ("insert_table_leg", "InsertTableLegVlaSkill", "groot_insert_leg_200k"),
     ("rotate_leg_to_tighten", "RotateLegToTightenVlaSkill", "groot_rotate_leg_200k"),
@@ -81,14 +92,14 @@ def _variant_override(skill_name: str, default: str) -> str:
     """`RAMEN_VARIANT_<SKILL>` で variant を差し替える。
 
     会場で image を焼き直さずに expert を入れ替えられるようにする。例えば
-    `rotate_table_base` を GR00T ではなく RAMEN-Ori で回したいとき:
+    `rotate_table_base` を同じ RAMEN-Ori の別 run に振り替えたいとき:
 
         -e RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32
 
     policy_type が違っても `assembly.build_vla_skill` が
-    `resolve_policy_class` 経由で正しい class を選ぶので、名前を変えるだけでよい
-    (RAMEN-Ori は state 71D / 4 cam、GR00T は 49D / 3 cam。どちらも policy 自身が
-    `CAMERAS` と `build_state_from_raw` を持ち、VlaSkill はそれを使う)。
+    `resolve_policy_class` 経由で正しい class を選ぶので、名前を変えるだけでよい。
+    state の次元も使うカメラも policy 自身が `CAMERAS` と `build_state_from_raw`
+    で持っていて、VlaSkill はそれを使う。
     """
     key = f"RAMEN_VARIANT_{skill_name.upper()}"
     override = os.environ.get(key, "").strip()
