@@ -61,7 +61,10 @@ python3 -m pytest components/ramen/tests -q
   無いと conformance は**我々の fallback 経路（mono 複製・合成 hand state）しか
   通らず**、本命の経路が end-to-end で 1 度も走らない。
 - `conformance.py` — `--full-rig`。上の 2 つを立てて mock を起動する。
-- `components/client.py` — `:5557` の 2 本目 SUB（`gripper_q`）。
+- `components/client.py` — `:5557` の 2 本目 SUB（`gripper_q`）と、`:5555` を
+  **JPEG のまま**運ぶ `RawCameraStream`（生 RGB だと 4.61 MB/step = 1 GbE で 45.6 ms）。
+- `components/server.py` — `_JpegObsPolicy` が `policy.act()` の直前で JPEG を展開する。
+  ここを外すと全 policy が `obs["images"]` を受け取れなくなる。
 
 ## Unitree SDK / CycloneDDS を image に同梱（Issue #1、2026-09-20）
 
