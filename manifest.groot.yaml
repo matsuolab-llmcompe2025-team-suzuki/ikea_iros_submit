@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-advance-backup"
-    digest: "sha256:8e6d54b3e92d1da6d17ea4e36c7b70bbf233a47339192633c6eb465db99390ef"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-parity"
+    digest: "sha256:ee665394e579174ee379408a081e29ab11ac0b4ec3b2234cee2bb8b481ed1047"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -119,8 +119,33 @@ images:
     #        まま insert へ進む可能性は残る。YOLO が主で、これは止まり続けるより
     #        マシという位置づけ
     #
+    #  15. 🔴 **大会経路が自前経路と違う組み立てになっていたのを揃えた (10 箇所)。**
+    #      driver が `assembly.build_vla_skill` を通さず `VlaCls(...)` を直接
+    #      呼んでいたため、assembly が入れる 6 項目が丸ごと抜けていた:
+    #        language_override  rotate_table_base は variant が specialist 用の
+    #                           'rotate table base' なのに class の
+    #                           "rotate and move table base (combined 5+7)" で推論
+    #        dispatch_waist     rotate_table_base は config が False なのに腰を出す
+    #        motion_limiter     速度・加速度の包絡 + 位置の限界が無い
+    #        teacher_range      4 skill 全てに設定があるのに効かない
+    #        wrist FK (skill別) rotate_table_base の独自 offset が効かず 4.4cm ずれる
+    #        progress_monitor   rotate_table_base で on になる設定が効かない
+    #      加えて 4 つ:
+    #        policy_filter      policy が見る検出が planner 用の遅れた出力だった
+    #        on_tick            ModelResidency 未接続 = skill 切替で act() が
+    #                           25〜92 秒ブロック (実測 pick 24.7 / insert 92 /
+    #                           rotate_leg 69 秒)
+    #        log_sink           JSONL が出ず、手順書の「taskspace_25 を見る」が不能
+    #        4 脚ループ          rotate_leg_to_tighten が終端で 1 脚しか回らなかった
+    #  16. **`groot_53d_real` の prompt と腰も揃えた。**
+    #      VlaSkill を通さない薄い経路なので、prompt が運営の obs 任せ、腰は
+    #      常時出す、になっていた。flip は Stage 5 の唯一の skill で
+    #      **大会経路ではこの backend でしか動かせない**
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260921-stage-dds-fix       … 上記 14 が無い。**YOLO が落ちると止まったまま**
+    #      20260921-advance-backup      … 上記 15-16 が無い。**別 prompt で推論し、
+    #        skill 切替のたびに 25〜92 秒止まり、脚が 1 本しか回らない**
+    #      20260921-stage-dds-fix       … 上記 14-16 が無い。**YOLO が落ちると止まったまま**
     #      20260921-orch-seedfix        … 上記 12-14 が無い。**自前経路が起動しない**
     #      20260920-pickfix-unbuffered  … 上記 10-13 が無い。**orchestrator が
     #        rotate_table_base から進めず、flip も起動しない**
