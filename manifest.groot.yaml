@@ -16,12 +16,22 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-venuefix"
-    digest: "sha256:59221f60c9be2456771850a59c5e804c8ecad120063d8c8f0d46eeb38715d5f6"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-venuefix2"
+    digest: "sha256:249e504251dd7537410199f724e06348b72a746b09b0cf94e486c6b25a6e6ebb"
     #   単一 platform (linux/arm64) の manifest。index ではないので digest はこれ 1 本。
     #   GHCR 上で mediaType=manifest.v2+json / manifests キー無し / layers 102 を確認済み。
     #   (buildx は既定で attestation を付けて index 化するので --provenance=false --sbom=false)
-    #   旧 tag 20260921-reset (sha256:5c204079...) は温存。
+    #   旧 tag 20260921-reset / 20260921-venuefix は温存。
+    #
+    # --- venuefix2 (レビュー指摘の修正) ---------------------------------------
+    #   a. Dex1 の staleness 判定が原理的に発火していなかった。`poll()` が古い値を
+    #      無期限に返すので `measured_is_fresh` が恒久的に True。bridge (:5557) が
+    #      落ちても凍結値を「実測」として渡し続けていた (ログも「実測を使う」のまま)
+    #   b. base_height のガードが大会経路に届いていなかった。driver は submit 自身の
+    #      taskspace_adapter を import するので、本体 repo 側だけ直しても効かない
+    #   c. `_taskspace` が `act()` の try の外だった。例外が出ると serve_policy が
+    #      接続を切る = run の終わり。HOLD + 直前の行を返す形にした
+    #   d. :5555 の SUB 二重張り解消 / _JpegObsPolicy に close() を追加
     #
     # --- 2026-09-21 venuefix で入ったもの (運営 interface package 2026.09.21 対応) ---
     #   1. base_height_cmd の既定を 0.0 -> 0.74。運営 adapter は col[21] を WBC へ
@@ -290,10 +300,12 @@ images:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
   orin:                       # policy client (model 非依存の relay、RAMEN-Ori track と共通)
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:20260921-venuefix"
-    digest: "sha256:66a615aef99465bf3fde53f46c16f58cf76bf7cf0255efa5c486869ac1348121"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:20260921-venuefix2"
+    digest: "sha256:b5e61a0dc502cf0b1fe225392bff42bf60812fc91034f7643d8da183b9b257da"
     base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"
     #   単一 platform (linux/arm64) の manifest、layers 26。GHCR 上で確認済み。
+    #   venuefix2: gripper_q の staleness を実際に発火させる (poll() 自身に期限)。
+    #   live 判定後に CameraStream を閉じる (同じ frame の二重配信をやめる)。
     #   base tag は device の L4T (JetPack 5.1.1 / R35.3.1) に完全一致させること。
     #   旧 tag onboarding (sha256:a7a64488...) は温存。
     #
