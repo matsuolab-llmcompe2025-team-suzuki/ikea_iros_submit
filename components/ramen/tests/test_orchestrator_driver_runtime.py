@@ -35,12 +35,19 @@ class _StubPolicy:
         self.name = name
         self.prepared = 0
         self.closed = 0
+        self.loaded = False
+
+    @property
+    def is_loaded(self) -> bool:
+        return self.loaded
 
     def prepare(self) -> None:
         self.prepared += 1
+        self.loaded = True
 
     def close(self) -> None:
         self.closed += 1
+        self.loaded = False
 
 
 def _drain(residency) -> None:
@@ -55,11 +62,12 @@ def _drain(residency) -> None:
     raise AssertionError("先読み worker が終わらない")
 
 
-def test_residency_preloads_every_expert(monkeypatch):
-    """`resident` を既定 (=全部) にすると 4 expert 全てが先読みされること。
+def test_residency_preloads_the_next_expert(monkeypatch):
+    """既定で「今 + 次」が載ること。
 
     これが無いと skill 切替のたびに act() が model load でブロックする
-    (実測 pick 24.7s / insert 92s / rotate_leg 69s)。
+    (実測 pick 24.7s / insert 92s / rotate_leg 69s)。全部載せる必要は無い:
+    読み込み 約 8 秒 < 各 skill の 21〜58 秒 なので、次の 1 つで間に合う。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
     policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
@@ -67,14 +75,16 @@ def test_residency_preloads_every_expert(monkeypatch):
     residency = OrchestratorDriver._build_residency(None, policies)
 
     assert residency is not None
-    assert residency.resident == len(policies)
+    assert residency.resident == 2  # 全部載せると 53D×4 + pick で約 26 GiB
     residency.on_skill_started("rotate_table_base")
     _drain(residency)
 
-    assert all(p.prepared >= 1 for p in policies.values()), {
-        n: p.prepared for n, p in policies.items()
-    }
-    residency.close()
+    try:
+        assert policies["rotate_table_base"].prepared >= 1
+        assert policies["pick_table_leg"].prepared >= 1, "次が先読みされていない"
+        assert policies["insert_table_leg"].prepared == 0, "2 つより多く載せている"
+    finally:
+        residency.close()
 
 
 def test_residency_respects_the_env_override(monkeypatch):
@@ -297,26 +307,34 @@ def test_residency_keeps_every_expert_at_every_point_of_the_leg(monkeypatch):
         for name in policies:
             index = residency._order.index(name)
             keep = set(residency._order[index : index + residency.resident])
-            assert keep == set(policies), (
-                f"{name} に居るとき keep が {sorted(keep)} しか無い"
+            assert len(keep) == residency.resident, (
+                f"{name} に居るとき keep が {sorted(keep)}"
             )
+            assert name in keep
     finally:
         residency.close()
 
 
-def test_a_full_leg_never_releases_a_model(monkeypatch):
-    """1 脚まわしても close() が呼ばれないこと (解放 = 読み直しのコスト)。"""
+def test_the_next_skill_is_always_ready_before_it_starts(monkeypatch):
+    """脚を 2 周しても、次に入る skill は毎回すでに読めていること。
+
+    これが「切替が 8 秒止まらない」の中身。`resident=2` では窓から外れたものが
+    解放されるのは **設計どおり**なので、守るべきは「解放されたかどうか」では
+    なく「必要になった時点で載っているか」。
+    """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    names = [name for name, _c, _v in _STAGE_SKILLS]
+    policies = {name: _StubPolicy(name) for name in names}
     residency = OrchestratorDriver._build_residency(None, policies)
 
     try:
-        for _ in range(2):  # 2 脚ぶん回す
-            for name, _c, _v in _STAGE_SKILLS:
+        for leg in range(2):
+            for i, name in enumerate(names):
                 residency.on_skill_started(name)
                 _drain(residency)
-        assert all(p.closed == 0 for p in policies.values()), {
-            n: p.closed for n, p in policies.items()
-        }
+                nxt = names[(i + 1) % len(names)]
+                assert policies[nxt].loaded, (
+                    f"leg {leg}: {name} の次 ({nxt}) が読めていない"
+                )
     finally:
         residency.close()

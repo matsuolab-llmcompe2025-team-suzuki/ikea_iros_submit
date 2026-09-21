@@ -79,6 +79,9 @@ _DEFAULT_LOG_DIR: Path = Path("outputs") / "orch_logs"
 
 HEAD_CAMERA_STEREO_VIEW = "packed"
 HEAD_PERCEPTION_VIEW = "left"
+
+# GPU に置く model の既定数 (--gpu-models で上書き)。「今 + 次」で切替が隠れる。
+DEFAULT_RESIDENT_MODELS = 2
 PHASE1_11_POLICY_VARIANT = "ramen_ori_default"
 PHASE1_11_SETUP_SECONDS = 4.0
 
@@ -1949,7 +1952,16 @@ def main() -> None:
                 return None
             from inference.desktop.lower_policy.policies.residency import ModelResidency
 
-            resident = len(policies) if gpu_models is None else gpu_models
+            # 既定は「今の skill + 次の 1 つ」。切替を隠すのにこれで足りる
+            # (読み込み 約 8 秒 < 各 skill の 21〜58 秒)。**全部載せる必要は無い。**
+            #
+            # 以前の既定は len(policies) = 全部だったが、residency の帳簿がずれて
+            # 実際には 1 つしか載っていなかったため表面化していなかった
+            # (VlaSkill._on_stop が residency を通さず解放していた、2026-09-21)。
+            # そのズレを直した今、既定を全部のままにすると 53D×4 + pick で
+            # 約 26 GiB を本当に載せに行く。機体によっては入らない。
+            # 増やしたいときは --gpu-models で明示する。
+            resident = DEFAULT_RESIDENT_MODELS if gpu_models is None else gpu_models
             print(
                 f"[init] gpu models resident={resident} of {len(policies)} "
                 f"({', '.join(policies)})",

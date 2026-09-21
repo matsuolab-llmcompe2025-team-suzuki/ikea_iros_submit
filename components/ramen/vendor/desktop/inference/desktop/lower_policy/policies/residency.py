@@ -92,7 +92,15 @@ class ModelResidency:
         keep = self._order[index : index + self._resident]
         with self._lock:
             release = [name for name in self._loaded if name not in keep]
-            missing = [name for name in keep if name not in self._loaded]
+            # ⚠️ 自分の集合だけを信じない。`VlaSkill._on_stop()` が skill 停止時に
+            # `release_after_skill()` を呼び、**ここを通らずに解放する**ので、
+            # 「読んだつもりで実は無い」が起きる。そうなると先読みが積まれず、
+            # 次に要るときその場で読む (実測 8 秒)。policy が言える場合は実体を聞く。
+            missing = [
+                name
+                for name in keep
+                if name not in self._loaded or not self._is_loaded(name)
+            ]
             # 先に「読んだ」ことにしておく (同じ model を 2 度積まない)。
             self._loaded.update(missing)
         for name in release:
@@ -102,6 +110,11 @@ class ModelResidency:
         self._ensure_worker()
         for name in missing:
             self._queue.put(name)
+
+    def _is_loaded(self, name: str) -> bool:
+        """policy が `is_loaded` を持つならそれを、無ければ集合を信じる。"""
+        loaded = getattr(self._policies[name], "is_loaded", None)
+        return bool(loaded) if isinstance(loaded, bool) else True
 
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():

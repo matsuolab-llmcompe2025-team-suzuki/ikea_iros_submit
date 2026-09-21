@@ -54,6 +54,9 @@ _TRANSITIONS = {
 }
 # 1 脚の skill 数 x 4。ModelResidency に渡す順序 (先読みの範囲を決める)。
 _LEGS = 4
+# GPU に置く model の既定数 (RAMEN_GPU_MODELS で上書き)。自前経路の
+# entrypoint.DEFAULT_RESIDENT_MODELS と揃える。
+_DEFAULT_RESIDENT_MODELS = 2
 
 
 def _load_skill_config(vendor_desktop: str) -> dict:
@@ -269,8 +272,11 @@ class OrchestratorDriver:
         if not loadable:
             print("[orch-driver] 先読み対象の policy が無い", file=sys.stderr)
             return None
+        # 既定は「今の skill + 次の 1 つ」。切替を隠すのにこれで足りる
+        # (読み込み 約 8 秒 < 各 skill の 21〜58 秒)。全部載せると 53D×4 + pick で
+        # 約 26 GiB になり、機体によっては入らない。増やすときは env で明示する。
         raw = os.environ.get("RAMEN_GPU_MODELS", "").strip()
-        resident = int(raw) if raw else len(loadable)
+        resident = int(raw) if raw else _DEFAULT_RESIDENT_MODELS
         # ⚠️ ModelResidency は order を **直線**として扱う (`order[i:i+resident]` を
         # 保ち、外れたものを解放する)。1 脚ぶんの列だけを渡すと、脚の末尾
         # (rotate_leg_to_tighten、index 3) で keep が自分 1 つだけになり、

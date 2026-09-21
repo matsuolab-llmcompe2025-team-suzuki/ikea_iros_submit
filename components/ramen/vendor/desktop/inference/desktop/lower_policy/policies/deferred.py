@@ -49,6 +49,20 @@ class DeferredPolicy:
         """
         return self._load().build_state_from_raw(raw)
 
+    @property
+    def is_loaded(self) -> bool:
+        """今 GPU に載っているか。
+
+        `ModelResidency` が使う。residency は自分が読んだものを集合で覚えているが、
+        `VlaSkill._on_stop()` が skill 停止時に `release_after_skill()` を呼んで
+        **residency の預かり知らぬところで解放する**ので、その集合だけを信じると
+        「載っているつもりで実は無い」状態になる。そうなると先読みが積まれず、
+        次に必要になった tick でその場で読むことになる
+        (実測 8 秒、2026-09-21 に実 image で確認)。
+        """
+        with self._lock:
+            return self._inner is not None
+
     def _load(self) -> Any:
         with self._lock:
             if self._inner is None:
