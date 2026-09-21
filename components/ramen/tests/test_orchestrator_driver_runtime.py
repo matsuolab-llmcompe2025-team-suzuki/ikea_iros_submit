@@ -20,6 +20,7 @@ for _p in (str(_VENDOR_DESKTOP), str(_ROOT)):
         sys.path.insert(0, _p)
 
 from components.ramen.orchestrator_driver import (  # noqa: E402
+    _INITIAL_SKILL,
     _LEGS,
     _STAGE_SKILLS,
     _TRANSITIONS,
@@ -405,7 +406,7 @@ def test_reset_clears_the_halt_and_the_leg_counter(built_driver):
 
     assert built_driver._advance_halted is False
     assert built_driver._orch.state.n_legs_completed == 0
-    assert built_driver._orch.state.current_skill == "rotate_table_base"
+    assert built_driver._orch.state.current_skill == _INITIAL_SKILL
     assert built_driver._orch.dispatcher.active_skill_name is None
 
 
@@ -428,3 +429,54 @@ def test_enter_check_fails_loudly_on_an_unregistered_skill():
         assert c in _YOLO_FREE_ENTRY or c in DEFAULT_ENTER_CHECK, c
     # 明示リストは実在の遷移先だけであること (typo 検出)
     assert _YOLO_FREE_ENTRY <= candidates
+
+
+# ---------------------------------------------------- 1 本目は卓を回さない
+def test_the_first_leg_does_not_rotate_the_table(built_driver):
+    """開始 skill が pick であること (自前経路の STAGE_SKILL_SEQUENCES[1] と同じ)。
+
+    元は `rotate_table_base` 始まりで、4 脚に対して回転が 4 回あった。学習データの
+    1 本目とは違う卓の向きから掴みにいくうえ、頭で 30 秒を余分に使う。
+    """
+    assert _INITIAL_SKILL == "pick_table_leg"
+    assert built_driver._orch.state.current_skill == "pick_table_leg"
+
+
+def test_the_loop_matches_the_self_path_stage_sequences():
+    """ループを 1 周すると自前経路の stage 2..4 と同じ並びになること。"""
+    from inference.desktop.orchestrator import STAGE_SKILL_SEQUENCES
+
+    def _walk(start: str, steps: int) -> list[str]:
+        path = [start]
+        for _ in range(steps):
+            path.append(_TRANSITIONS[path[-1]][0])
+        return path
+
+    # 1 本目: pick -> insert -> rotate_leg、その次が 2 本目の頭の rotate。
+    first = _walk(_INITIAL_SKILL, len(STAGE_SKILL_SEQUENCES[1]) - 1)
+    assert first == STAGE_SKILL_SEQUENCES[1]
+    assert _TRANSITIONS[first[-1]][0] == "rotate_table_base"
+
+    # 2 本目以降: rotate -> pick -> insert -> rotate_leg。
+    second = _walk("rotate_table_base", len(STAGE_SKILL_SEQUENCES[2]) - 1)
+    assert second == STAGE_SKILL_SEQUENCES[2]
+
+
+def test_the_preload_order_starts_at_the_initial_skill(monkeypatch):
+    """先読みの列が実際の実行順で始まること。
+
+    `_STAGE_SKILLS` の並び (rotate_table_base 始まり) のままだと、構築時の
+    `order[0:resident]` が「1 本目に使わない rotate」を読んで「次に要る insert」を
+    読まない = 最初の切替で丸ごとブロックする。
+    """
+    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
+    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+
+    residency = OrchestratorDriver._build_residency(None, policies)
+    try:
+        assert residency._order[0] == _INITIAL_SKILL
+        assert residency._order[1] == _TRANSITIONS[_INITIAL_SKILL][0]
+        # 4 脚ぶんに伸ばしてあること (1 脚だけだと末尾で毎周回解放する)
+        assert len(residency._order) == len(_STAGE_SKILLS) * _LEGS
+    finally:
+        residency.close()

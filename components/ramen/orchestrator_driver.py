@@ -73,6 +73,16 @@ _TRANSITIONS = {
     "insert_table_leg": ["rotate_leg_to_tighten"],
     "rotate_leg_to_tighten": ["rotate_table_base"],
 }
+# **1 本目は卓を回さない。** 自前経路の `STAGE_SKILL_SEQUENCES` と同じ:
+#   stage 1     pick -> insert -> rotate_leg
+#   stage 2..4  rotate_table_base -> pick -> insert -> rotate_leg
+# 上のループを `pick_table_leg` から始めれば、ちょうどこの順になる (回転は 3 回)。
+#
+# 元は `rotate_table_base` 始まりで、4 脚に対して回転が 4 回あった。学習データの
+# 1 本目とは違う卓の向きから掴みにいくうえ、頭で `max_seconds_hard` の 30 秒を
+# 余分に使う。#1 の 15 で「自前経路と揃える」と言いながら、開始 skill だけ
+# 揃っていなかった (2026-09-21 に修正)。
+_INITIAL_SKILL = "pick_table_leg"
 # 1 脚の skill 数 x 4。ModelResidency に渡す順序 (先読みの範囲を決める)。
 _LEGS = 4
 # YOLO の enter 条件を持たない遷移先。`rotate_table_base` は自前経路では stage の
@@ -437,7 +447,7 @@ class OrchestratorDriver:
             perception,
             cleaner,
             dispatcher,
-            initial_skill="rotate_table_base",
+            initial_skill=_INITIAL_SKILL,
             transitions=_TRANSITIONS,
             enter_check=enter_check,
             actuator_send_fn=self._arm.send_action,
@@ -490,7 +500,14 @@ class OrchestratorDriver:
         # 8.5 秒のスパイクが出ていた (2026-09-21、pod 実測)。
         # 列を 4 脚ぶんに伸ばすと、どの skill に居ても keep が 4 つを覆う
         # (`_order.index()` は先頭の一致を返すので index は 0..3 のまま)。
-        order = [name for name, _cls, _v in _STAGE_SKILLS] * _LEGS
+        #
+        # ⚠️ 列は **`_INITIAL_SKILL` から**並べる。ModelResidency は構築時に
+        # `order[0:resident]` を先読みするので、`_STAGE_SKILLS` の並び順
+        # (rotate_table_base 始まり) のままだと「1 本目に使わない rotate」を
+        # 読んで「次に要る insert」を読まない = 最初の切替で丸ごとブロックする。
+        names = [name for name, _cls, _v in _STAGE_SKILLS]
+        start = names.index(_INITIAL_SKILL)
+        order = (names[start:] + names[:start]) * _LEGS
         print(
             f"[orch-driver] gpu models resident={resident} of {len(loadable)} "
             f"({', '.join(order)})",
