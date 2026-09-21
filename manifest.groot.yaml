@@ -290,9 +290,21 @@ images:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
   orin:                       # policy client (model 非依存の relay、RAMEN-Ori track と共通)
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
-    digest: "sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:20260921-venuefix"
+    digest: "sha256:66a615aef99465bf3fde53f46c16f58cf76bf7cf0255efa5c486869ac1348121"
     base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"
+    #   単一 platform (linux/arm64) の manifest、layers 26。GHCR 上で確認済み。
+    #   base tag は device の L4T (JetPack 5.1.1 / R35.3.1) に完全一致させること。
+    #   旧 tag onboarding (sha256:a7a64488...) は温存。
+    #
+    # --- 2026-09-21 venuefix で入ったもの --------------------------------------
+    #   **client 側の変更はこの image にしか入らない。** Thor だけ焼き直しても効かない。
+    #   1. :5557 に 2 本目の SUB を張り、Dex1 の実測開度 gripper_q を obs に載せる
+    #      (boundary/states.py は REQUIRED/OPTIONAL の 4 キーしか decode しない)
+    #   2. カメラを **JPEG のまま**運ぶ。以前は Orin で decode して生 RGB を送っていた。
+    #      実シーンで 4.61MB -> 0.338MB / 45.6ms -> 3.35ms (1 GbE 実効 101MB/s 実測)
+    #      再エンコードしないので server が展開したピクセルは以前と byte-identical
+    #   Python 3.8 (JetPack 5.1.1 の既定) での実行まで確認済み。
     entrypoint:
       ["python3", "-u", "components/client.py",
        "--lane", "decoupled", "--thor", "192.168.100.1", "--orin", "192.168.100.2"]
