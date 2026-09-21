@@ -48,6 +48,36 @@ _TRANSITIONS = {
 }
 
 
+def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
+    """`skill_config.yaml` の `max_seconds_hard` / `on_timeout` を読む。
+
+    `tick()` は YOLO の `enter_check` しか見ない。自前経路 (`run_live`) はこれを
+    受け皿として持っているのに、boundary 経路には渡っていなかったため、YOLO が
+    落とすと `rotate_table_base` から永久に出られなかった (2026-09-21 に実 image で
+    実測)。同じ YAML を同じ規約で読んで渡す。
+    """
+    import yaml  # vendor の config_loader と同じく safe_load で読む
+
+    cfg_path = os.path.join(
+        vendor_desktop, "inference/desktop/lower_policy/configs/skill_config.yaml"
+    )
+    with open(cfg_path, encoding="utf-8") as fh:
+        skills = (yaml.safe_load(fh) or {}).get("skills") or {}
+
+    hard: dict[str, float] = {}
+    actions: dict[str, str] = {}
+    for skill_name, _cls, _variant in _STAGE_SKILLS:
+        section = skills.get(skill_name) or {}
+        if "max_seconds_hard" not in section:
+            continue
+        timeout_s = float(section["max_seconds_hard"])
+        if timeout_s <= 0:
+            raise ValueError(f"skills.{skill_name}.max_seconds_hard must be > 0")
+        hard[skill_name] = timeout_s
+        actions[skill_name] = str(section.get("on_timeout", "advance"))
+    return hard, actions
+
+
 class OrchestratorDriver:
     """boundary act(obs) → orchestrator.tick → (T,25)。full skill 遷移を再利用。"""
 
@@ -60,7 +90,11 @@ class OrchestratorDriver:
     ):
         if _VENDOR_DESKTOP not in sys.path:
             sys.path.insert(0, _VENDOR_DESKTOP)
-        from inference.desktop.orchestrator import Orchestrator, DEFAULT_ENTER_CHECK
+        from inference.desktop.orchestrator import (
+            Orchestrator,
+            DEFAULT_ENTER_CHECK,
+            LiveSourceSafetyError,
+        )
         from inference.desktop.lower_policy.dispatcher import SkillDispatchLowerPolicy
         from inference.desktop import assembly as _assembly
         from inference.desktop.lower_policy.policies.config_loader import (
@@ -84,6 +118,10 @@ class OrchestratorDriver:
         self._fk = G1WristFK.from_urdf()
         self._ee_frame_transform = ee_frame_transform
         self._t = 0
+        self._advance_halted = False
+        # vendor tree は __init__ で sys.path に入れるので module 直下では import
+        # できない。act() から使う例外クラスをここで捕まえておく。
+        self._LiveSourceSafetyError = LiveSourceSafetyError
 
         # I/O adapters
         self._joint_src = BoundaryJointStateSource()
@@ -123,6 +161,7 @@ class OrchestratorDriver:
                 motion_limiter=None,
             )
         dispatcher = SkillDispatchLowerPolicy(registry)
+        hard_timeouts, timeout_actions = _load_stage_timeouts(_VENDOR_DESKTOP)
         # enter_check は「候補(遷移先)skill」で引かれるので、_TRANSITIONS の values を key に。
         _candidates = {c for cands in _TRANSITIONS.values() for c in cands}
         enter_check = {c: DEFAULT_ENTER_CHECK[c] for c in _candidates}
@@ -140,6 +179,12 @@ class OrchestratorDriver:
             wrist_left_source=self._wrist_l,
             wrist_right_source=self._wrist_r,
             head_perception_view="left",  # boundary は単一 head を packed で複製
+            hard_timeout_by_skill=hard_timeouts,
+            timeout_action_by_skill=timeout_actions,
+        )
+        print(
+            f"[orch-driver] hard timeouts={hard_timeouts} actions={timeout_actions}",
+            file=sys.stderr,
         )
 
     @staticmethod
@@ -198,6 +243,18 @@ class OrchestratorDriver:
         self._waist.reset()
         self._hand.reset()
         result = self._orch.tick(frame)
+        # tick() は YOLO の enter_check しか見ない。is_complete / max_seconds_hard /
+        # max_dwell_sec の受け皿を自前経路と同じ method で回す。
+        # 会場は学習データと違うシーンなので、YOLO が落としたときにここが無いと
+        # skill が進まないまま stage が終わる。
+        try:
+            self._orch.advance_finished_skill()
+        except self._LiveSourceSafetyError as exc:
+            # server は運営に (T,25) を返し続ける必要があるので落とさない。
+            # 以後は最後の skill を保持したまま進まなくなる (= `on_timeout: stop`)。
+            if not self._advance_halted:
+                self._advance_halted = True
+                print(f"[orch-driver] advance halted: {exc}", file=sys.stderr)
         arms14 = (
             result.action
             if (result is not None and result.action is not None)

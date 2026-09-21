@@ -253,6 +253,22 @@ class TickResult:
     detection_refreshed: bool = True
 
 
+@dataclass
+class SkillAdvance:
+    """`advance_finished_skill()` の結果。
+
+    Attributes:
+        fired_to: 遷移した先の skill 名。遷移しなければ None。
+        reason: "complete" / "timeout" / "dwell" のどれで進んだか。
+        stage_finished: 終端 skill が完了 or 時間切れした。呼び出し側が
+            stage を畳む (`run_live` は return、boundary は以後進めない)。
+    """
+
+    fired_to: Optional[str] = None
+    reason: Optional[str] = None
+    stage_finished: bool = False
+
+
 class LiveSourceSafetyError(RuntimeError):
     """Live source の startup / freshness / initial skill timeout。"""
 
@@ -364,6 +380,12 @@ class Orchestrator:
             )
         self.on_tick = on_tick
         self._policy_cleaned: Optional[list[OBBDetection]] = None
+        # active skill の経過時間追跡。`advance_finished_skill()` が使う。
+        # run_live() の局所変数だったものを instance に上げた: boundary の driver は
+        # tick() を直接回すので、局所変数のままだと **大会経路だけ受け皿を失う**。
+        self._active_skill_name: Optional[str] = None
+        self._active_skill_started_at: Optional[float] = None
+        self._active_skill_dwell_fired = False
         self.hard_timeout_by_skill = dict(hard_timeout_by_skill or {})
         # Issue #141 D4: 時間切れの動き。既定は「次の skill へ進む」。
         self.timeout_action_by_skill = dict(timeout_action_by_skill or {})
@@ -544,11 +566,6 @@ class Orchestrator:
         next_deadline = time.monotonic()
         wait_started_at = time.monotonic()
         last_fresh_frame_at: Optional[float] = None
-        # active skill の chain-aware dwell 追跡: skill 名が変化したら
-        # started_at をリセットし、dwell_fired は False に戻る。
-        active_skill_name: Optional[str] = None
-        active_skill_started_at: Optional[float] = None
-        active_skill_dwell_fired: bool = False
         # 区切り (stop_on_skills) 用に「どの skill まで判定したか」を別に持つ。
         # dwell の追跡とは別にしないと、tick の中で起きた遷移を取りこぼす。
         boundary_seen: Optional[str] = None
@@ -606,29 +623,11 @@ class Orchestrator:
                 if is_new_frame:
                     last_fresh_frame_at = now
 
-            # active skill 変化検出 → dwell timer リセット。tick 内の fire dispatch や
-            # auto-transition で dispatcher.active_skill_name が変わった時に捕捉する。
+            # active skill の変化検出 / 経過時間追跡は advance_finished_skill() が持つ。
             active_skill_obj = self.dispatcher.active_skill
             current_active = (
                 active_skill_obj.name if active_skill_obj is not None else None
             )
-            if current_active != active_skill_name:
-                active_skill_name = current_active
-                active_skill_started_at = now if current_active is not None else None
-                active_skill_dwell_fired = False
-
-            if (
-                current_active == stop_after_skill
-                and active_skill_started_at is not None
-                and stop_after_s is not None
-                and now - active_skill_started_at >= stop_after_s
-            ):
-                print(
-                    f"[orch] operator stop boundary reached: {current_active} ran "
-                    f"{stop_after_s:g}s; stopping",
-                    file=sys.stderr,
-                )
-                return
 
             # Finite rule-based skills retain their last safe target when an
             # IK/grasp/stage check fails.  Surface that latched failure here so
@@ -645,109 +644,26 @@ class Orchestrator:
                     f"safe target: {failure_reason}"
                 )
 
-            # Observation-driven finite skills (notably the collision-aware
-            # post-walk arm path) transition only after their measured target
-            # converges.  This must run before max_dwell handling so a timeout
-            # can never be mistaken for successful completion.
+            # is_complete / max_seconds_hard / max_dwell_sec。boundary の driver も
+            # 同じ method を呼ぶ (片方にしか無いと大会経路だけ受け皿を失う)。
+            advance = self.advance_finished_skill(now)
+            if advance.stage_finished:
+                return
+
+            # operator の stop 境界は advance より後。時計は advance 側が持つ。
+            started_at = self._active_skill_started_at
             if (
-                active_skill_obj is not None
-                and active_skill_obj.is_complete
-                and not active_skill_dwell_fired
+                self._active_skill_name == stop_after_skill
+                and started_at is not None
+                and stop_after_s is not None
+                and now - started_at >= stop_after_s
             ):
-                candidates = self.transitions.get(current_active, [])
-                if not candidates:
-                    print(
-                        f"[orch] terminal skill {current_active!r} completed; "
-                        "stage finished",
-                        file=sys.stderr,
-                    )
-                    return
-                cand = candidates[0]
-                ctx = self._build_transition_ctx(cand)
-                self.state.transition(cand, ctx)
-                self.dispatcher.start(cand, self._build_params(cand))
                 print(
-                    f"[orch] skill_complete transition: {current_active} -> {cand}",
+                    f"[orch] operator stop boundary reached: {self._active_skill_name} "
+                    f"ran {stop_after_s:g}s; stopping",
                     file=sys.stderr,
                 )
-                active_skill_dwell_fired = True
-
-            # 学習 skill の時間切れ (Issue #141 束 1-13 / D4)。秒数は skill_config の
-            # `max_seconds_hard`、動きは `on_timeout` (既定 advance = 次の skill へ進む)。
-            # 時間切れは「うまくいった証拠」ではないので、記録には必ず残す。
-            hard_timeout = self.hard_timeout_by_skill.get(current_active or "")
-            if (
-                hard_timeout is not None
-                and active_skill_started_at is not None
-                and now - active_skill_started_at >= hard_timeout
-            ):
-                timeout_action = self.timeout_action_by_skill.get(
-                    current_active or "", "advance"
-                )
-                candidates = self.transitions.get(current_active, [])
-                if not candidates:
-                    # 終端の skill。既定 (advance) は stage を終え、`on_timeout: stop`
-                    # を書いたときは止める。
-                    if timeout_action == "stop":
-                        raise LiveSourceSafetyError(
-                            f"skill {current_active!r} reached YAML max_seconds_hard="
-                            f"{hard_timeout:g}s; holding and stopping this stage without "
-                            "transition"
-                        )
-                    print(
-                        f"[orch] terminal skill {current_active!r} reached YAML "
-                        f"max_seconds_hard={hard_timeout:g}s; stage finished",
-                        file=sys.stderr,
-                    )
-                    return
-                if timeout_action == "stop":
-                    raise LiveSourceSafetyError(
-                        f"skill {current_active!r} reached YAML max_seconds_hard="
-                        f"{hard_timeout:g}s; holding and stopping this stage without "
-                        "transition"
-                    )
-                if not active_skill_dwell_fired:
-                    cand = candidates[0]
-                    ctx = self._build_transition_ctx(cand)
-                    self.state.transition(cand, ctx)
-                    self.dispatcher.start(cand, self._build_params(cand))
-                    print(
-                        f"[orch] skill_timeout ({hard_timeout:g}s) advance: "
-                        f"{current_active} -> {cand}",
-                        file=sys.stderr,
-                    )
-                    active_skill_dwell_fired = True
-
-            # active skill が自身の max_dwell_sec を expose していれば dwell 判定。
-            # None expose なら enter_check ベースのみ (fail-safe 無し)。
-            if (
-                active_skill_obj is not None
-                and not active_skill_dwell_fired
-                and active_skill_started_at is not None
-                and active_skill_obj.max_dwell_sec is not None
-            ):
-                max_dwell = active_skill_obj.max_dwell_sec
-                elapsed = now - active_skill_started_at
-                if elapsed >= max_dwell:
-                    candidates = self.transitions.get(current_active, [])
-                    if candidates:
-                        cand = candidates[0]
-                        ctx = self._build_transition_ctx(cand)
-                        self.state.transition(cand, ctx)
-                        self.dispatcher.start(cand, self._build_params(cand))
-                        print(
-                            f"[orch] skill_max_dwell ({max_dwell:g}s) "
-                            f"auto-transition: {current_active} -> {cand}",
-                            file=sys.stderr,
-                        )
-                        # この活性化ぶんは発火済にして再発火防止。次 iteration で
-                        # dispatcher.active_skill_name の変化を検出して timer リセット。
-                        active_skill_dwell_fired = True
-                    else:
-                        raise LiveSourceSafetyError(
-                            f"skill {current_active!r} exceeded "
-                            f"{max_dwell:g}s and no transition candidates"
-                        )
+                return
 
             next_deadline += dt
             sleep_s = next_deadline - time.monotonic()
@@ -755,6 +671,134 @@ class Orchestrator:
                 time.sleep(sleep_s)
             else:
                 next_deadline = time.monotonic() + dt
+
+    def advance_finished_skill(self, now: Optional[float] = None) -> SkillAdvance:
+        """active skill が終わったか時間切れなら次へ進める。1 回の呼び出しで最大 1 遷移。
+
+        `tick()` は **YOLO の `enter_check` しか見ない**。この method はその受け皿で、
+        3 つの signal を順に見る:
+
+          1. `is_complete`      skill が自分で「収束した」と言う (腕の pre-motion 等)
+          2. `max_seconds_hard` YAML の時間切れ。`on_timeout` は advance / stop
+          3. `max_dwell_sec`    skill が expose していれば dwell 上限
+
+        ⚠️ **`run_live()` と boundary の `OrchestratorDriver` の両方から呼ぶこと。**
+        元は `run_live()` の局所変数で閉じていたため、`tick()` を直接回す大会経路には
+        受け皿が無く、YOLO が落とすと `rotate_table_base` から永久に出られなかった
+        (2026-09-21)。片方にしか無いと同じことが再発する。
+
+        時間切れは「うまくいった証拠ではない」ので、進んだ理由は必ず stderr に残す。
+
+        Args:
+            now: 単調時刻。省略時は `time.monotonic()`。
+
+        Returns:
+            SkillAdvance。遷移しなければ `fired_to is None`。
+
+        Raises:
+            LiveSourceSafetyError: `on_timeout: stop` の skill が時間切れした、
+                または dwell 上限に達したのに遷移先が無い。
+        """
+        now = time.monotonic() if now is None else now
+        active_skill_obj = self.dispatcher.active_skill
+        current_active = (
+            active_skill_obj.name if active_skill_obj is not None else None
+        )
+        # active skill が変わったら timer を張り直す。tick() 内の enter_check 発火でも
+        # 変わるので、呼び出し側ではなくここで検出する。
+        if current_active != self._active_skill_name:
+            self._active_skill_name = current_active
+            self._active_skill_started_at = now if current_active is not None else None
+            self._active_skill_dwell_fired = False
+
+        started_at = self._active_skill_started_at
+
+        def _advance(cand: str, reason: str, message: str) -> SkillAdvance:
+            ctx = self._build_transition_ctx(cand)
+            self.state.transition(cand, ctx)
+            self.dispatcher.start(cand, self._build_params(cand))
+            print(message, file=sys.stderr)
+            self._active_skill_dwell_fired = True
+            return SkillAdvance(fired_to=cand, reason=reason)
+
+        # 1) 観測駆動の有限 skill (腕の pre-motion 等) は measured target が収束して
+        #    初めて完了する。**max_dwell より先に見る**ので、時間切れを「成功」と
+        #    取り違えない。
+        if (
+            active_skill_obj is not None
+            and active_skill_obj.is_complete
+            and not self._active_skill_dwell_fired
+        ):
+            candidates = self.transitions.get(current_active, [])
+            if not candidates:
+                print(
+                    f"[orch] terminal skill {current_active!r} completed; "
+                    "stage finished",
+                    file=sys.stderr,
+                )
+                return SkillAdvance(reason="complete", stage_finished=True)
+            return _advance(
+                candidates[0],
+                "complete",
+                f"[orch] skill_complete transition: {current_active} -> {candidates[0]}",
+            )
+
+        # 2) 学習 skill の時間切れ (Issue #141 束 1-13 / D4)。
+        hard_timeout = self.hard_timeout_by_skill.get(current_active or "")
+        if (
+            hard_timeout is not None
+            and started_at is not None
+            and now - started_at >= hard_timeout
+        ):
+            timeout_action = self.timeout_action_by_skill.get(
+                current_active or "", "advance"
+            )
+            if timeout_action == "stop":
+                raise LiveSourceSafetyError(
+                    f"skill {current_active!r} reached YAML max_seconds_hard="
+                    f"{hard_timeout:g}s; holding and stopping this stage without "
+                    "transition"
+                )
+            candidates = self.transitions.get(current_active, [])
+            if not candidates:
+                print(
+                    f"[orch] terminal skill {current_active!r} reached YAML "
+                    f"max_seconds_hard={hard_timeout:g}s; stage finished",
+                    file=sys.stderr,
+                )
+                return SkillAdvance(reason="timeout", stage_finished=True)
+            if not self._active_skill_dwell_fired:
+                return _advance(
+                    candidates[0],
+                    "timeout",
+                    f"[orch] skill_timeout ({hard_timeout:g}s) advance: "
+                    f"{current_active} -> {candidates[0]}",
+                )
+
+        # 3) skill が max_dwell_sec を expose していれば dwell 判定。
+        #    None expose なら enter_check ベースのみ (fail-safe 無し)。
+        if (
+            active_skill_obj is not None
+            and not self._active_skill_dwell_fired
+            and started_at is not None
+            and active_skill_obj.max_dwell_sec is not None
+        ):
+            max_dwell = active_skill_obj.max_dwell_sec
+            if now - started_at >= max_dwell:
+                candidates = self.transitions.get(current_active, [])
+                if not candidates:
+                    raise LiveSourceSafetyError(
+                        f"skill {current_active!r} exceeded "
+                        f"{max_dwell:g}s and no transition candidates"
+                    )
+                return _advance(
+                    candidates[0],
+                    "dwell",
+                    f"[orch] skill_max_dwell ({max_dwell:g}s) "
+                    f"auto-transition: {current_active} -> {candidates[0]}",
+                )
+
+        return SkillAdvance()
 
     # ---- 内部 helpers ----
     def _seed_base_rotation_reference_if_needed(self) -> None:
