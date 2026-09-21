@@ -258,6 +258,15 @@ images:
     #       (groot_rotate_leg_200k / groot_insert_leg_200k / groot_overlay /
     #        groot_flip_table_n17_2_baseline)
     # 2 lerobot env 内蔵 (pick=0.6.0 image main / 53D=0.6.1 /opt/venv-groot53)、YOLO=ultralytics。
+    #
+    # pick の hybrid (任意、Issue #3 / 本体 #148)。**既定は使わない**ので、
+    # 下の image を必要とするのは `-e RAMEN_PICK_HYBRID=1` を付けたときだけ:
+    #   vllm/vllm-openai@sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a
+    #   (= v0.29.0 の linux/arm64。公開 image、CUDA 13.0.2 / NVARCH=sbsa、
+    #    TORCH_CUDA_ARCH_LIST に 11.0 = sm_110 を含む)
+    # Thor 上で Qwen/Qwen3-VL-8B-Instruct を 127.0.0.1:8000 に立て、
+    # --gpu-memory-utilization 0.20 で GR00T と同居させる。手順は INSTRUCTIONS.md。
+    # ⚠️ 実 Thor での実行は未検証 (09-27 接続テスト待ち)。
     entrypoint:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]

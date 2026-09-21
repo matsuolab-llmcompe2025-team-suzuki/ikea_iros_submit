@@ -73,6 +73,57 @@ docker run --rm --runtime nvidia --network host \
 - `--synthetic-hand-state`: 会場は hand state を publish しない（Dex1-1、`boundary/states.py` に「usually absent, synthesize whatever your model expects」と明記）。
 - `--action-sink boundary`: `(T,25)` を運営 adapter へ出す。外すと `rt/arm_sdk` へ直接出す（DDS 経路、CycloneDDS + `unitree_sdk2py` を image に同梱済み）。
 
+## pick の hybrid（任意。既定は GR00T のまま）
+
+`pick_table_leg` は既定で GR00T expert（`groot_pick_legs_v2`）で走る。**何もしなければ
+これまでどおり**。VLM で区間境界を判定する hybrid（本体 repo Issue #148）に切り替えたい
+場合だけ、VLM サーバを 1 つ足して env を渡す。
+
+```bash
+# Thor 上、policy server より先に起動しておく（8B の load に数分かかる）
+docker run -d --name ramen-vlm --runtime nvidia --network host \
+  -e NVIDIA_DISABLE_REQUIRE=1 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai@sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a \
+  Qwen/Qwen3-VL-8B-Instruct \
+  --served-model-name Qwen/Qwen3-VL-8B-Instruct \
+  --host 127.0.0.1 --port 8000 \
+  --dtype bfloat16 --max-model-len 4096 \
+  --max-num-seqs 1 --max-num-batched-tokens 4096 \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image":5,"video":0}' \
+  --gpu-memory-utilization 0.20
+
+curl -fsS http://127.0.0.1:8000/health    # これが通ってから policy server を起動する
+
+# policy server 側に足す env
+#   -e RAMEN_PICK_HYBRID=1
+```
+- digest は `vllm/vllm-openai:v0.29.0` の **linux/arm64**。`TORCH_CUDA_ARCH_LIST` に
+  `11.0`（sm_110 = Thor）を含み、CUDA 13.0.2 / `NVARCH=sbsa` でこちらの thor image と同系統。
+- `--gpu-memory-utilization 0.20`: Thor は 128 GB unified なので約 26 GB。`--max-model-len 4096`
+  かつ `--max-num-seqs 1` なので KV cache はごく小さく、weights（bf16 8B ≒ 16 GB）が主。
+  GR00T の常駐 2 つ（約 12 GiB）+ YOLO と同居させる前提の値。**開発機（RTX 5090）用の
+  `run_local_vlm_server.sh` は 0.64 なので、そのまま Thor に持ち込まないこと。**
+- `--host 127.0.0.1`: このサーバは同じ Thor の policy server からしか呼ばない。外に出さない。
+- **事前に HF cache へ pull しておくこと。** 準備は 1 スロット 20 分しかなく、
+  Qwen3-VL-8B を空キャッシュから落とすと間に合わない。
+- 別ホストに立てた場合は `-e RAMEN_PICK_VLM_ENDPOINT=http://<host>:8000/v1/chat/completions`。
+- **VLM に繋がらないと policy server は起動時に落ちる**（endpoint を skill を組む前に
+  probe している）。`pick_table_leg` に入ってから気付く形にすると、会場では
+  「掴まない」としか見えないため。hybrid をやめるなら `RAMEN_PICK_HYBRID` を外すだけでよい。
+
+## 会場で image を焼き直さずに変えられるもの（Thor、policy server の env）
+
+| env | 既定 | 何が変わるか |
+|---|---|---|
+| `RAMEN_POLICY` | `groot_pick_real` | `groot_orchestrator`（推奨、全 skill 自動遷移）/ `groot_53d_real` |
+| `RAMEN_VARIANT_<SKILL>` | policy_config.yaml | expert の差し替え（例 `RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32`） |
+| `RAMEN_GPU_MODELS` | `2` | GPU に載せる model 数（今 + 次）。苦しければ `1` |
+| `RAMEN_PICK_HYBRID` | 未設定（GR00T） | `1` で pick を VLM/VLA/MP hybrid に |
+| `RAMEN_ON_TIMEOUT` | `advance` | `stop` で「時間切れなら止める」に。既定は YOLO が外しても先へ進む |
+| `RAMEN_ORCH_LOG` | 未設定 | `(T,25)` を JSONL に残す |
+
 ## 提出時に添えるもの（運営チェックリスト、2026-08 訂正）
 1. Git repo link（無改変 `boundary/` + 各コンテナの Dockerfile）
 2. 両 image の **registry digest**（`:latest` ではなく `@sha256:…`）
