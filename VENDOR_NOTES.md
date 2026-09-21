@@ -40,13 +40,31 @@ python3 -m pytest components/ramen/tests -q
 行番号つきの diff は近傍が 1 行動いただけで当たらなくなり、しかも気付かずに image を
 焼く事故になる。完全一致のアンカー文字列で置換し、**見つからなければ同期を失敗させる**。
 
-現在 1 件:
+現在 2 件:
 - `lower_policy/policies/groot.py` — GR00T 53D worker を `RAMEN_WORKER_PYTHON_53D`
   （lerobot 0.6.1 の python）で直接起動する。container に pixi は無いので本家の
   `pixi run` 経路は fallback に回す。`Dockerfile.thor.groot` の同名 ENV と対。
+- `lower_policy/policies/groot_pick_legs.py` — pick worker の repo root 解決と
+  `RAMEN_WORKER_PYTHON`（lerobot 0.6.0 の python）起動。vendor tree では
+  `parents[4]` が vendor/desktop を指すので、worker script を持つ方を root にする。
 
 > ⚠️ `components/` 直下の自作パッチ（`transport.py` / `client.py` / `README.md`）は
 > **この script の対象外**（vendor/desktop の外）。下記「upstream 追従」節のとおり手で守る。
+
+### upstream template への自作追加（2026-09-21）
+
+運営 template を再取得したら、以下も手で戻すこと。**どれも既定の挙動は変えない**
+（既定で走らせた `conformance.py` は運営の想定どおりのまま）。
+
+- `mocks/mock_orin.py` — `--stereo` / `--gripper-q`。運営の 2026-09-21 bridge は
+  どちらも実機で publish するが、この mock は 2026-07-21 の vendor なので持たない。
+  無いと conformance は**我々の fallback 経路（mono 複製・合成 hand state）しか
+  通らず**、本命の経路が end-to-end で 1 度も走らない。
+- `conformance.py` — `--full-rig`。上の 2 つを立てて mock を起動する。
+- `components/client.py` — `:5557` の 2 本目 SUB（`gripper_q`）と、`:5555` を
+  **JPEG のまま**運ぶ `RawCameraStream`（生 RGB だと 4.61 MB/step = 1 GbE で 45.6 ms）。
+- `components/server.py` — `_JpegObsPolicy` が `policy.act()` の直前で JPEG を展開する。
+  ここを外すと全 policy が `obs["images"]` を受け取れなくなる。
 
 ## Unitree SDK / CycloneDDS を image に同梱（Issue #1、2026-09-20）
 
@@ -129,7 +147,9 @@ python3 -m pytest components/ramen/tests -q
   - `pip install lerobot[groot]==0.6.0`（torch 制約 >=2.7,<2.12 = NGC torch を保持）+ numpy 2.2.6 +
     submission reqs。inference は `[groot]` のみで足りる（dataset/training 不要 = torchcodec aarch64 回避）。
   - `ENV RAMEN_POLICY=groot_pick_real RAMEN_WORKER_PYTHON=python3`（同一 env で worker spawn）。
-  - weights（ver2-lora, private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
+  - weights（private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
+    大会経路の pick は **ver1**（`policy_config.yaml` の `default_variant_by_skill` が正本）、
+    `RAMEN_POLICY=groot_pick_real` の単体経路は contract 固定の ver2-lora。
   - build: `docker buildx build --builder armbuilder --platform linux/arm64 \
     -f docker/Dockerfile.thor.groot -t <registry>/ramen-thor-groot:<tag> --push .`
   - ⚠️ **旧 25.08 build 検証ログ（無効化、2026-08-31）**: 当初 `nvcr.io/nvidia/pytorch:25.08-py3`

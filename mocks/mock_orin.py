@@ -8,6 +8,17 @@ your client cannot tell it is not on the G1 (until it tries to move).
     python mocks/mock_orin.py --with-hands    # Dex3 rig: hand state present
     python mocks/mock_orin.py --no-wrists     # ego camera only
 
+TEAM RAMEN additions (default OFF so a plain run stays byte-comparable with the
+organizer's own conformance expectations):
+
+    python mocks/mock_orin.py --stereo        # also ego_view_left / ego_view_right
+    python mocks/mock_orin.py --gripper-q     # also gripper_q on :5557
+
+Both exist because the organizer's 2026-09-21 bridge publishes them on the real
+rig but this mock predates it (vendored 2026-07-21). Without them, a conformance
+run only ever exercises our *fallback* paths — mono duplication and the synthetic
+hand state — and the real ones are untested end to end.
+
 The images are a moving synthetic pattern rather than noise, so you can see
 at a glance whether your client is decoding frames or holding a stale one.
 """
@@ -75,14 +86,21 @@ def publish_cameras(port: int, fps: int, keys: list[str], stop: threading.Event)
     socket.close(linger=0)
 
 
-def publish_state(port: int, rate_hz: float, with_hands: bool, stop: threading.Event):
+# Dex1-1 の生モータ角 (tools/run_wbc_with_dex1.py:65-66)。0.0 = 閉 / -5.30 = 開。
+DEX1_CLOSED_Q = 0.0
+DEX1_OPEN_Q = -5.30
+
+
+def publish_state(port: int, rate_hz: float, with_hands: bool, gripper_q: bool,
+                  stop: threading.Event):
     context = zmq.Context.instance()
     socket = context.socket(zmq.PUB)
     socket.setsockopt(zmq.SNDHWM, 20)
     socket.setsockopt(zmq.LINGER, 0)
     socket.bind(f"tcp://*:{port}")
     print(f"[mock-orin] state PUB tcp://*:{port} at {rate_hz} Hz "
-          f"(hands {'present' if with_hands else 'absent — Dex1-1 rig'})")
+          f"(hands {'present' if with_hands else 'absent — Dex1-1 rig'}, "
+          f"gripper_q {'present' if gripper_q else 'absent'})")
 
     period, start, sent = 1.0 / rate_hz, time.monotonic(), 0
     while not stop.is_set():
@@ -95,6 +113,16 @@ def publish_state(port: int, rate_hz: float, with_hands: bool, stop: threading.E
         if with_hands:
             payload["left_hand_q"] = [0.5] * HAND_DOF
             payload["right_hand_q"] = [0.5] * HAND_DOF
+        if gripper_q:
+            # 左右で違う開度をゆっくり往復させる。定数だと「実測を読めている」と
+            # 「合成が偶然同じ値を返した」を見分けられない。
+            span = DEX1_OPEN_Q - DEX1_CLOSED_Q
+            left = DEX1_CLOSED_Q + span * (0.5 + 0.5 * np.sin(phase * 0.5))
+            right = DEX1_CLOSED_Q + span * (0.5 + 0.5 * np.cos(phase * 0.5))
+            payload["gripper_q"] = {
+                "left": {"q": float(left), "dq": 0.0, "tau_est": 0.3},
+                "right": {"q": float(right), "dq": 0.0, "tau_est": 0.4},
+            }
         socket.send(STATE_TOPIC + msgpack.packb(payload, use_bin_type=True))
         sent += 1
         if sent % 250 == 0:
@@ -115,15 +143,28 @@ def main():
                         help="Publish Dex3 hand state (the real rig has Dex1-1 and does not).")
     parser.add_argument("--no-wrists", action="store_true",
                         help="Publish ego_view only.")
+    parser.add_argument("--stereo", action="store_true",
+                        help="Also publish ego_view_left / ego_view_right, like the "
+                             "organizer's 2026-09-21 bridge does by default.")
+    parser.add_argument("--gripper-q", action="store_true",
+                        help="Also publish gripper_q on :5557 (Dex1-1 raw motor "
+                             "angle, 0.0 closed / -5.30 open), like the organizer's "
+                             "2026-09-21 bridge does.")
     args = parser.parse_args()
 
     keys = ["ego_view"] if args.no_wrists else ["ego_view", "left_wrist", "right_wrist"]
+    if args.stereo:
+        # 実 bridge は ego_view とは別に左右を出す (real_orin_cameras.py:185-189)。
+        # ego_view は EGO_VIEW_EYE 既定 "left" なので ego_view_left と同じ画像だが、
+        # ここでは key 名が焼き込まれた別パターンになるので、取り違えがすぐ分かる。
+        keys += ["ego_view_left", "ego_view_right"]
     stop = threading.Event()
     threads = [
         threading.Thread(target=publish_cameras,
                          args=(args.camera_port, args.fps, keys, stop), daemon=True),
         threading.Thread(target=publish_state,
-                         args=(args.state_port, args.state_hz, args.with_hands, stop),
+                         args=(args.state_port, args.state_hz, args.with_hands,
+                               args.gripper_q, stop),
                          daemon=True),
     ]
     for thread in threads:

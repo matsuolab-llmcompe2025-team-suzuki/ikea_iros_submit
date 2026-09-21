@@ -12,14 +12,43 @@ lane: decoupled
 platform: linux/arm64
 
 images:
-  thor:                       # policy server / GR00T 全5 skill + full orchestrator (YOLO)
+  thor:                       # policy server / RAMEN-Ori(rotate) + GR00T(pick/insert/rotate_leg/flip) + full orchestrator (YOLO)
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-reset"
-    digest: "sha256:5c204079385559aa9e4dcc4b0778030aab18e5ae06a1cbcfefd3e77a3cf40d65"
-    #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
-    #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-venuefix2"
+    digest: "sha256:249e504251dd7537410199f724e06348b72a746b09b0cf94e486c6b25a6e6ebb"
+    #   単一 platform (linux/arm64) の manifest。index ではないので digest はこれ 1 本。
+    #   GHCR 上で mediaType=manifest.v2+json / manifests キー無し / layers 102 を確認済み。
+    #   (buildx は既定で attestation を付けて index 化するので --provenance=false --sbom=false)
+    #   旧 tag 20260921-reset / 20260921-venuefix は温存。
+    #
+    # --- venuefix2 (レビュー指摘の修正) ---------------------------------------
+    #   a. Dex1 の staleness 判定が原理的に発火していなかった。`poll()` が古い値を
+    #      無期限に返すので `measured_is_fresh` が恒久的に True。bridge (:5557) が
+    #      落ちても凍結値を「実測」として渡し続けていた (ログも「実測を使う」のまま)
+    #   b. base_height のガードが大会経路に届いていなかった。driver は submit 自身の
+    #      taskspace_adapter を import するので、本体 repo 側だけ直しても効かない
+    #   c. `_taskspace` が `act()` の try の外だった。例外が出ると serve_policy が
+    #      接続を切る = run の終わり。HOLD + 直前の行を返す形にした
+    #   d. :5555 の SUB 二重張り解消 / _JpegObsPolicy に close() を追加
+    #
+    # --- 2026-09-21 venuefix で入ったもの (運営 interface package 2026.09.21 対応) ---
+    #   1. base_height_cmd の既定を 0.0 -> 0.74。運営 adapter は col[21] を WBC へ
+    #      リテラル転送する (wbc_adapter/wbc_driver.py:455)。0 は「指定なし」ではなく
+    #      骨盤高さ 0m = 床まで沈む指令だった。呼出側は誰も渡していないので、
+    #      既定値がそのまま go-live の 1 通目から出ていた
+    #   2. head の実ステレオ (ego_view_left/right) を使う。運営 bridge が publish して
+    #      いるのに mono を複製して「偽の右眼」で pick の expert に渡していた
+    #   3. Dex1 の実測開度を :5557 の gripper_q から読む (2 本目の SUB)。
+    #      boundary/states.py が 4 キーしか decode しないので捨てられていた。
+    #      合成 (自分の指令のエコー) から実測に置換
+    #   4. カメラを **JPEG のまま**運ぶ。運営 bridge は JPEG を配っているのに
+    #      client が Orin で展開して生 RGB を流していた。実シーンで 4.61MB -> 0.338MB、
+    #      1 GbE 実効 101MB/s に対し 45.6ms -> 3.35ms。ピクセルは byte-identical
+    #   5. stage variant の正本を policy_config.yaml の default_variant_by_skill に統一。
+    #      pick が submit 側 v2 / 本体 config v1 で食い違っていた -> v1 に統一
+    #   6. vendor 同期の穴を 2 つ修正 (pick worker script / joint_layout)
     #
     # --- eeorigin (main、#128) に入っているもの -------------------------------
     #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
@@ -258,22 +287,60 @@ images:
     #       (groot_rotate_leg_200k / groot_insert_leg_200k / groot_overlay /
     #        groot_flip_table_n17_2_baseline)
     # 2 lerobot env 内蔵 (pick=0.6.0 image main / 53D=0.6.1 /opt/venv-groot53)、YOLO=ultralytics。
+    #
+    # pick の hybrid (任意、Issue #3 / 本体 #148)。**既定は使わない**ので、
+    # 下の image を必要とするのは `-e RAMEN_PICK_HYBRID=1` を付けたときだけ:
+    #   vllm/vllm-openai@sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a
+    #   (= v0.29.0 の linux/arm64。公開 image、CUDA 13.0.2 / NVARCH=sbsa、
+    #    TORCH_CUDA_ARCH_LIST に 11.0 = sm_110 を含む)
+    # Thor 上で Qwen/Qwen3-VL-8B-Instruct を 127.0.0.1:8000 に立て、
+    # --gpu-memory-utilization 0.20 で GR00T と同居させる。手順は INSTRUCTIONS.md。
+    # ⚠️ 実 Thor での実行は未検証 (09-27 接続テスト待ち)。
     entrypoint:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
   orin:                       # policy client (model 非依存の relay、RAMEN-Ori track と共通)
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
-    digest: "sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:20260921-venuefix2"
+    digest: "sha256:b5e61a0dc502cf0b1fe225392bff42bf60812fc91034f7643d8da183b9b257da"
     base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"
+    #   単一 platform (linux/arm64) の manifest、layers 26。GHCR 上で確認済み。
+    #   venuefix2: gripper_q の staleness を実際に発火させる (poll() 自身に期限)。
+    #   live 判定後に CameraStream を閉じる (同じ frame の二重配信をやめる)。
+    #   base tag は device の L4T (JetPack 5.1.1 / R35.3.1) に完全一致させること。
+    #   旧 tag onboarding (sha256:a7a64488...) は温存。
+    #
+    # --- 2026-09-21 venuefix で入ったもの --------------------------------------
+    #   **client 側の変更はこの image にしか入らない。** Thor だけ焼き直しても効かない。
+    #   1. :5557 に 2 本目の SUB を張り、Dex1 の実測開度 gripper_q を obs に載せる
+    #      (boundary/states.py は REQUIRED/OPTIONAL の 4 キーしか decode しない)
+    #   2. カメラを **JPEG のまま**運ぶ。以前は Orin で decode して生 RGB を送っていた。
+    #      実シーンで 4.61MB -> 0.338MB / 45.6ms -> 3.35ms (1 GbE 実効 101MB/s 実測)
+    #      再エンコードしないので server が展開したピクセルは以前と byte-identical
+    #   Python 3.8 (JetPack 5.1.1 の既定) での実行まで確認済み。
     entrypoint:
       ["python3", "-u", "components/client.py",
        "--lane", "decoupled", "--thor", "192.168.100.1", "--orin", "192.168.100.2"]
 
 thor_orin_port: 8765
 
-# GR00T pick weights (ver2-lora, private Team-RAMEN)。image に焼かず runtime に HF 取得。
+# weights は image に焼かず runtime に HF 取得 (private Team-RAMEN)。
 #   docker run 時に -e HF_TOKEN=<token> を渡すこと (private repo pull に必須)。
-weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1"
+#
+# ⚠️ **準備スロットは 20 分しかない。** 下の 4 つは host の
+# ~/.cache/huggingface へ事前に pull しておくこと (mount する前提)。
+# orchestrator は 1 脚で 4 つとも通る:
+#   rotate_table_base     hf://Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b
+#                         (RAMEN-Ori。2026-09-21 に GR00T overlay から差し替え)
+#   pick_table_leg        下の weights_uri と同じ
+#   insert_table_leg      hf://Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k@0f0927bcc1aed6927fb26b82c017009961ee3d35
+#   rotate_leg_to_tighten hf://Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26
+# Stage 5 の flip は RAMEN_POLICY=groot_53d_real 側:
+#   hf://Team-RAMEN/... (policy_config.yaml の groot_flip_table_n17_2_baseline)
+# pick を hybrid にするなら Qwen/Qwen3-VL-8B-Instruct も (INSTRUCTIONS.md)。
+# ⚠️ この値は `policy_config.yaml` の `default_variant_by_skill.pick_table_leg` と
+#    一致させること。2026-09-21 まで submit が v2、本体 config が v1 を指していた。
+#    v1 は subdir 配置なので `checkpoint_subdir: checkpoint-40000` で読む。
+weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a"
 
 # Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。
 peak_gpu_memory_thor_gb: "TBD"   # 実機測定待ち (128 GB unified)

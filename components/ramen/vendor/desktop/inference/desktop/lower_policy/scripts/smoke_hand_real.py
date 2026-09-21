@@ -40,12 +40,41 @@ import time
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
 
-# Unitree's bundled Dex1-1 test accepts |q-target| < 0.05 rad.  The Desktop
-# subscriber and the 2 kHz serial bridge are sampled asynchronously, so allow
-# 0.01 rad of observation margin instead of declaring a healthy gripper failed
-# at the boundary.  At the documented 0.6 rad/cm conversion this is 1 mm.
-RETURN_TOLERANCE_RAD = 0.06
+
+# This is a response diagnostic, not a task-level grasp tolerance.  A 0.06 rad
+# tolerance allowed a 0.12 rad probe to be declared complete after only half of
+# the requested travel.  Require 0.02 rad (about 0.33 mm at the documented
+# 0.6 rad/cm conversion) so the probe actually validates command tracking.
+COMMAND_TOLERANCE_RAD = 0.02
+RETURN_TOLERANCE_RAD = 0.02
+COMMAND_TIMEOUT_S = 3.0
+
+
+def _wait_for_target(
+    state_source,
+    target: Sequence[float],
+    timeout_s: float,
+    *,
+    tolerance_rad: float,
+):
+    """Wait for both measured motors; a fresh repeated stale value must not pass."""
+
+    target_array = np.asarray(target, dtype=np.float64)
+    deadline = time.monotonic() + timeout_s
+    latest = None
+    max_error = float("inf")
+    while time.monotonic() < deadline:
+        latest = state_source.get()
+        if latest is not None:
+            actual = np.asarray(latest.position_rad, dtype=np.float64)
+            max_error = float(np.max(np.abs(actual - target_array)))
+            if max_error <= tolerance_rad:
+                return True, actual, max_error
+        time.sleep(0.01)
+    actual = None if latest is None else np.asarray(latest.position_rad, dtype=np.float64)
+    return False, actual, max_error
 
 
 @dataclass
@@ -107,6 +136,24 @@ def _run(interface: str, steps: Sequence[_Step], *, execute: bool) -> int:
         f"[read-only] current Dex1 rad: left={initial[0]:.4f} right={initial[1]:.4f}",
         file=sys.stderr,
     )
+    if bool(getattr(snapshot, "health_diagnostics_available", False)):
+        faults = np.asarray(snapshot.fault_code, dtype=np.uint32)
+        modes = np.asarray(snapshot.motor_mode, dtype=np.uint8)
+        temperatures = np.asarray(snapshot.shell_temperature_c, dtype=np.uint8)
+        print(
+            "[read-only] Dex1 motor health: "
+            f"left(mode={int(modes[0])},temp={int(temperatures[0])}C,"
+            f"fault=0x{int(faults[0]):x}) "
+            f"right(mode={int(modes[1])},temp={int(temperatures[1])}C,"
+            f"fault=0x{int(faults[1]):x})",
+            file=sys.stderr,
+        )
+        if execute and np.any(faults):
+            state_source.close()
+            raise RuntimeError(
+                "Dex1 motor fault is active; refusing to create a command publisher "
+                f"(left=0x{int(faults[0]):x}, right=0x{int(faults[1]):x})"
+            )
     if not execute:
         print("[read-only] --execute not supplied; no publisher or command created")
         state_source.close()
@@ -135,13 +182,22 @@ def _run(interface: str, steps: Sequence[_Step], *, execute: bool) -> int:
     print(f"[smoke] initial hand q: left={cur[0]:.2f} right={cur[1]:.2f}", file=sys.stderr)
 
     return_ok = True
+    command_ok = True
     try:
         for step in steps:
             if step.op == "pause":
                 time.sleep(step.value)
+                paused = state_source.get()
+                measured_text = "unavailable"
+                residual_text = "unavailable"
+                if paused is not None:
+                    measured = np.asarray(paused.position_rad, dtype=np.float64)
+                    measured_text = str(measured.tolist())
+                    residual_text = str(np.abs(measured - np.asarray(cur)).tolist())
                 print(
                     f"[pause {step.value:g}s] current target: "
-                    f"left={cur[0]:.2f} right={cur[1]:.2f}"
+                    f"left={cur[0]:.2f} right={cur[1]:.2f} "
+                    f"measured={measured_text} residual={residual_text}"
                 )
                 continue
 
@@ -157,39 +213,46 @@ def _run(interface: str, steps: Sequence[_Step], *, execute: bool) -> int:
                 f"[send {step.op}:{step.value:g}] target: "
                 f"left={cur[0]:.2f} right={cur[1]:.2f}"
             )
+            reached, actual, error = _wait_for_target(
+                state_source,
+                cur,
+                COMMAND_TIMEOUT_S,
+                tolerance_rad=COMMAND_TOLERANCE_RAD,
+            )
+            if not reached:
+                command_ok = False
+                actual_text = "unavailable" if actual is None else actual.tolist()
+                print(
+                    f"[smoke] command TIMEOUT: target={cur} measured={actual_text} "
+                    f"max_error={error:.4f}rad",
+                    file=sys.stderr,
+                )
+                break
+            print(
+                f"[smoke] command reached: measured={actual.tolist()} "
+                f"max_error={error:.4f}rad",
+                file=sys.stderr,
+            )
     except KeyboardInterrupt:
         print("[smoke] KeyboardInterrupt、returning to measured start pose", file=sys.stderr)
     finally:
         try:
             hand.send_action(initial)
-            return_deadline = time.monotonic() + 3.0
-            return_error = float("inf")
-            returned = None
-            while time.monotonic() < return_deadline:
-                returned = state_source.get()
-                if returned is not None:
-                    actual = returned.position_rad.astype(float)
-                    return_error = max(
-                        abs(actual[0] - initial[0]),
-                        abs(actual[1] - initial[1]),
-                    )
-                    if return_error <= RETURN_TOLERANCE_RAD:
-                        break
-                time.sleep(0.01)
-            if returned is None:
+            return_reached, actual, return_error = _wait_for_target(
+                state_source,
+                initial,
+                COMMAND_TIMEOUT_S,
+                tolerance_rad=RETURN_TOLERANCE_RAD,
+            )
+            if actual is None:
                 return_ok = False
                 print(
                     "[smoke] WARNING: no Dex1 feedback while returning to start pose",
                     file=sys.stderr,
                 )
             else:
-                actual = returned.position_rad.astype(float)
-                status = (
-                    "reached"
-                    if return_error <= RETURN_TOLERANCE_RAD
-                    else "TIMEOUT"
-                )
-                return_ok = return_error <= RETURN_TOLERANCE_RAD
+                status = "reached" if return_reached else "TIMEOUT"
+                return_ok = return_reached
                 print(
                     f"[smoke] return {status}: left={actual[0]:.4f} "
                     f"right={actual[1]:.4f} max_error={return_error:.4f}rad",
@@ -201,7 +264,7 @@ def _run(interface: str, steps: Sequence[_Step], *, execute: bool) -> int:
         hand.stop()
         state_source.close()
         print("[smoke] hand actuator stopped", file=sys.stderr)
-    return 0 if return_ok else 2
+    return 0 if return_ok and command_ok else 2
 
 
 def main() -> int:

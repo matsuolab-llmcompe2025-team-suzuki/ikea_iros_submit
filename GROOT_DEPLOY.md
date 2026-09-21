@@ -69,14 +69,21 @@ navigate・base = 0。**scipy 不要** (matrix→quat は Shepperd 法)。
   (`RAMEN_WORKER_PYTHON_53D`)。takada/suzuki checkpoint は custom load (raw_config +
   streaming shards + tied-embedding 復元) が必要 = vendored `groot.py` が担う。
 
-**skill → model** (leg round):
+**skill → model** (leg round)。**正本は `policy_config.yaml` の
+`default_variant_by_skill`** — driver はそこを読む (Issue #148)。下表は転記なので、
+食い違ったら config が正しい。
+
 | skill | policy_config variant | 形式 |
 |---|---|---|
-| rotate_table_base | `groot_overlay` | 53D |
-| pick_table_leg | `groot_pick_legs_v2` (ver2-lora) | 38D |
+| rotate_table_base | `rotate_table_base_ramen_ori_141_c32_state_dropout` | RAMEN-Ori |
+| pick_table_leg | `groot_pick_legs_v1` (subdir `checkpoint-40000`) | 38D |
 | insert_table_leg | `groot_insert_leg_200k` | 53D |
 | rotate_leg_to_tighten | `groot_rotate_leg_200k` | 53D |
 | flip_table | `groot_flip_table_n17_2_baseline` | 53D |
+
+⚠️ `RAMEN_POLICY=groot_pick_real` (単体 pick の debug 経路) は別実装
+(`components/ramen/groot_worker.py`) で、contract に焼かれた **ver2-lora** を使う。
+大会経路 (`groot_orchestrator`) とは別の ckpt なので、比較するときは注意。
 
 ---
 

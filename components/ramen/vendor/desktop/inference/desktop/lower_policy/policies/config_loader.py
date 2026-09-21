@@ -23,6 +23,9 @@ policy = policy_cls.from_ckpt(cfg)
 # YAML schema
 
 ```yaml
+default_variant_by_skill:
+  <skill_name>: <variant_name>   # 本番 run の既定 (Issue #148)
+
 policies:
   <variant_name>:
     policy_type: "groot" | "ramen_ori" | "groot_pick_legs" | "act_diffusion"
@@ -98,6 +101,43 @@ def list_variants(config_path: str | Path = DEFAULT_CONFIG_PATH) -> list[str]:
     if not isinstance(policies, dict):
         raise ValueError(f"policies section must be a dict, got {type(policies)}")
     return list(policies.keys())
+
+
+def load_default_variant_by_skill(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+) -> dict[str, str]:
+    """`default_variant_by_skill` section を読む (Issue #148)。
+
+    本番 run で「どの skill をどの ckpt で走らせるか」の正本。呼出側 (entrypoint)
+    は CLI が渡さなかった slot だけをこれで埋める。
+
+    ここでは値が registry にある variant 名かどうかだけを見る。skill 名が有効か
+    は slot と CLI 引数の対応を持っている呼出側が判定する (対応表をここに複製
+    しない)。
+    """
+    data = _load_yaml(config_path)
+    section = data.get("default_variant_by_skill")
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"{config_path}: 'default_variant_by_skill' section is required"
+        )
+    policies = data.get("policies")
+    if not isinstance(policies, dict):
+        raise ValueError(f"{config_path}: 'policies' section is required")
+    defaults: dict[str, str] = {}
+    for skill_name, variant in section.items():
+        if not isinstance(variant, str) or not variant:
+            raise ValueError(
+                f"{config_path}: default_variant_by_skill.{skill_name} must be a "
+                f"variant name, got {variant!r}"
+            )
+        if variant not in policies:
+            raise ValueError(
+                f"{config_path}: default_variant_by_skill.{skill_name}={variant!r} "
+                "is not registered under policies"
+            )
+        defaults[str(skill_name)] = variant
+    return defaults
 
 
 _RTC_KEYS = frozenset(

@@ -62,11 +62,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from boundary import ActionSink, CameraStream, StateStream  # noqa: E402
 from boundary.actions import ActionError  # noqa: E402
+from components.ramen.gripper_state import GripperStateStream  # noqa: E402
+from components.ramen.raw_camera import RawCameraStream  # noqa: E402
 from components.transport import PolicyLink  # noqa: E402
 
 LANES = ("sonic", "decoupled")
-SONIC_STEP_HZ = 50.0        # gear_sonic_deploy's control cadence
-DECOUPLED_CHUNK_HZ = 20.0   # task-space re-query rate
+SONIC_STEP_HZ = 50.0  # gear_sonic_deploy's control cadence
+DECOUPLED_CHUNK_HZ = 20.0  # task-space re-query rate
 
 
 class Inference:
@@ -79,10 +81,13 @@ class Inference:
     trying to correct.
     """
 
-    def __init__(self, link: PolicyLink, cameras, states, prompt, camera_keys):
+    def __init__(
+        self, link: PolicyLink, cameras, states, prompt, camera_keys, grippers=None
+    ):
         self._link = link
         self._cameras = cameras
         self._states = states
+        self._grippers = grippers
         self._prompt = prompt
         self._camera_keys = camera_keys
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
@@ -98,13 +103,27 @@ class Inference:
         state = self._states.read(timeout_ms=0) or self._states.latest()
         if frame is None or state is None:
             return None
-        # Only the cameras the server declared: three 480x640x3 images is
-        # ~2.7 MB per step raw, so shipping ones the model ignores is pure
-        # latency.
+        # Only the cameras the server declared — shipping ones the model
+        # ignores is pure latency.
+        #
+        # **JPEG のまま運ぶ。** bridge は JPEG を配っている (CONTRACT.md:78) のに、
+        # 以前はここで decode 済みの RGB ndarray を送っていた。会場リグの実写では
+        # 1 枚 68〜97 KB の JPEG が raw 900 KB に膨らむ (x9〜13)。5 枚で 4.61 MB、
+        # Thor <-> PC2 の実効 101 MB/s (1 GbE、実測) では **転送だけで 45.6 ms** =
+        # 運営 adapter の 1 周期 50 ms をほぼ使い切っていた。
+        # 再エンコードはしないので server が展開したピクセルは以前と同一。
+        # 展開は components/server.py が policy に渡す直前で 1 回だけ行う。
         return {
-            "images": {k: frame.images[k] for k in self._camera_keys if k in frame.images},
+            "images_jpeg": {
+                k: frame.jpegs[k] for k in self._camera_keys if k in frame.jpegs
+            },
             "body_q": state.body_q,
             "base_quat": state.base_quat,
+            # Dex1-1 の実測開度。boundary/states.py は REQUIRED/OPTIONAL の 4 キーしか
+            # decode しないので、同じ :5557 に張った 2 本目の SUB から拾っている
+            # (components/ramen/gripper_state.py)。bridge が旧版なら None。
+            # 単位は運営の生モータ角 (q=0.0 閉 / -5.30 開)。
+            "gripper_q": self._grippers.poll() if self._grippers is not None else None,
             "prompt": self._prompt,
             "t": frame.received_at,
         }
@@ -196,15 +215,19 @@ def run_sonic(inference: Inference, sink, prefetch_rows: int):
             index = _skip_rows(latency, SONIC_STEP_HZ, len(token))
             chunks += 1
             if chunks % 10 == 1:
-                print(f"[client] chunk T={len(token)} latency={latency * 1000:.0f}ms "
-                      f"skip={index} peak|token|={float(abs(token).max()):.3f}")
+                print(
+                    f"[client] chunk T={len(token)} latency={latency * 1000:.0f}ms "
+                    f"skip={index} peak|token|={float(abs(token).max()):.3f}"
+                )
 
         # Enough rows left to cover the round trip? Start the next inference.
         if not inference.busy and (len(token) - index) <= prefetch_rows:
             inference.submit()
 
         tick = time.monotonic()
-        sink.send_step(token[index:index + 1], left[index:index + 1], right[index:index + 1])
+        sink.send_step(
+            token[index : index + 1], left[index : index + 1], right[index : index + 1]
+        )
         index += 1
         remaining = period - (time.monotonic() - tick)
         if remaining > 0:
@@ -235,7 +258,9 @@ def run_decoupled(inference: Inference, sink):
 
         chunks += 1
         if chunks % 10 == 1:
-            print(f"[client] chunk T={len(chunk)} latency={latency * 1000:.0f}ms skip={skip}")
+            print(
+                f"[client] chunk T={len(chunk)} latency={latency * 1000:.0f}ms skip={skip}"
+            )
 
         remaining = period - (time.monotonic() - tick)
         if remaining > 0:
@@ -244,29 +269,58 @@ def run_decoupled(inference: Inference, sink):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--lane", choices=LANES,
-                        default=os.environ.get("PEVAL_LANE", "sonic"))
+    parser.add_argument(
+        "--lane", choices=LANES, default=os.environ.get("PEVAL_LANE", "sonic")
+    )
     parser.add_argument("--thor", default="192.168.100.1", help="Policy server host.")
     parser.add_argument("--thor-port", type=int, default=8765)
-    parser.add_argument("--orin", default="127.0.0.1",
-                        help="Host of the organizer's camera/state endpoints.")
-    parser.add_argument("--prompt", default="grab the bottle",
-                        help="Task instruction handed to the policy.")
-    parser.add_argument("--prefetch-rows", type=int, default=8,
-                        help="SONIC only: rows left in the current chunk when the "
-                             "next inference starts. Raise it if your model is slow.")
+    parser.add_argument(
+        "--orin",
+        default="127.0.0.1",
+        help="Host of the organizer's camera/state endpoints.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="grab the bottle",
+        help="Task instruction handed to the policy.",
+    )
+    parser.add_argument(
+        "--prefetch-rows",
+        type=int,
+        default=8,
+        help="SONIC only: rows left in the current chunk when the "
+        "next inference starts. Raise it if your model is slow.",
+    )
     args = parser.parse_args()
 
+    # live 判定だけは運営の実装をそのまま使い、hot loop は JPEG のまま運ぶ方を使う。
     cameras = CameraStream(host=args.orin)
+    raw_cameras = RawCameraStream(host=args.orin)
     states = StateStream(host=args.orin)
+    grippers = GripperStateStream(host=args.orin)
     sink = ActionSink.for_lane(args.lane)
 
-    print(f"[client] lane={args.lane} thor={args.thor}:{args.thor_port} orin={args.orin}")
+    print(
+        f"[client] lane={args.lane} thor={args.thor}:{args.thor_port} orin={args.orin}"
+    )
     print("[client] waiting for the organizer's endpoints...")
     cameras.wait_until_live()
+    # live 判定が済んだら閉じる。**hot loop は raw_cameras 側しか使わない**ので、
+    # 張りっぱなしにすると bridge が同じ frame を 2 回配ることになる
+    # (実測 0.338 MB x 30 Hz = 10 MB/s の二重配信)。
+    cameras.close()
     state = states.wait_until_live()
-    print(f"[client] endpoints live (hand state "
-          f"{'present' if state.hands_present else 'absent — Dex1-1 rig'})")
+    print(
+        f"[client] endpoints live (hand state "
+        f"{'present' if state.hands_present else 'absent — Dex1-1 rig'})"
+    )
+    # Dex1-1 の実測が :5557 に載っているか。載っていれば hand_state が実測になり、
+    # pick_leg_hybrid の interlock も本物になる。載っていなければ合成のまま走る。
+    # go-live 前に気づけるよう、ここで 1 度 poll して結果を出しておく。
+    print(
+        f"[client] Dex1 gripper_q: "
+        f"{'present' if grippers.poll() is not None else 'absent — synthesizing'}"
+    )
 
     link = PolicyLink(f"ws://{args.thor}:{args.thor_port}")
     declared = link.metadata.get("lane")
@@ -277,24 +331,34 @@ def main():
         )
 
     link.reset()
-    inference = Inference(link, cameras, states, args.prompt,
-                          link.metadata.get("camera_keys", ["ego_view"]))
+    inference = Inference(
+        link,
+        raw_cameras,
+        states,
+        args.prompt,
+        link.metadata.get("camera_keys", ["ego_view"]),
+        grippers,
+    )
     try:
         if args.lane == "sonic":
             run_sonic(inference, sink, args.prefetch_rows)
         else:
             run_decoupled(inference, sink)
     except KeyboardInterrupt:
-        print("\n[client] interrupted — THE ROBOT IS STILL HOLDING ITS LAST COMMAND. "
-              "Use the e-stop to bring it to a safe state.")
+        print(
+            "\n[client] interrupted — THE ROBOT IS STILL HOLDING ITS LAST COMMAND. "
+            "Use the e-stop to bring it to a safe state."
+        )
     except ActionError as exc:
         print(f"\n[client] ACTION REJECTED: {exc}", file=sys.stderr)
         raise SystemExit(1)
     finally:
         inference.close()
         sink.close()
-        cameras.close()
+        cameras.close()  # live 判定の直後に閉じてある。二重呼び出しは LINGER=0 で安全
+        raw_cameras.close()
         states.close()
+        grippers.close()
 
 
 if __name__ == "__main__":

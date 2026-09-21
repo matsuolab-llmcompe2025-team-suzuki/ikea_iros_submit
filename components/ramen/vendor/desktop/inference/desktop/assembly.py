@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -475,6 +475,7 @@ def build_vla_skill(
     fk_factory: FkFactory,
     deferred: bool = False,
     policy: Optional[Any] = None,
+    extra_skill_kwargs: Optional[dict[str, Any]] = None,
 ) -> BuiltSkill:
     """slot と skill_config から VlaSkill を 1 つ組み立てる。
 
@@ -543,6 +544,7 @@ def build_vla_skill(
             file=sys.stderr,
         )
 
+    extra = dict(extra_skill_kwargs or {})
     skill = vla_skill_cls(
         policy=policy,
         waist_actuator=waist_actuator,
@@ -559,6 +561,7 @@ def build_vla_skill(
         z_ceiling=z_ceiling,
         retry_controller=retry_controller,
         retry_options=retry_options,
+        **extra,
     )
     print(
         f"[assembly] {skill_name} = {vla_skill_cls.__name__} (variant={variant.name}, "
@@ -651,6 +654,8 @@ def build_head_procedure(
             "velocity_limit_rad_s",
             "acceleration_limit_rad_s2",
             "measured_tolerance_rad",
+            "measured_velocity_tolerance_rad_s",
+            "command_tolerance_rad",
             "stage_timeout_s",
         }
     )
@@ -677,6 +682,77 @@ def build_head_procedure(
     built = [skill.name for skill in skills]
     if built != names:
         raise RuntimeError(f"head procedure name mismatch: {built} != {names}")
+    return skills
+
+
+def build_model_transition_procedure(
+    *,
+    skill_config: dict,
+    previous_skill: str,
+    next_skill: str,
+    initial_pose: Any,
+    hand_actuator: Any,
+    hold_sec: float,
+    include_hand: bool,
+    published_arm_target_provider: Optional[Callable[[], Any]] = None,
+) -> list:
+    """Build a fail-closed model-to-model frame-zero transition.
+
+    Unlike a stage-start head procedure this deliberately does **not** open the
+    hands first.  The previous Dex1 target remains published while the arms use
+    the collision-clearance route.  The next model's recorded frame-zero hand
+    target is applied only after the arms have measurably converged.
+    """
+
+    from inference.desktop.lower_policy.skills.collision_aware_pre_motion import (
+        CollisionAwareArmPreMotionSkill,
+    )
+    from inference.desktop.lower_policy.skills.hand_pre_motion import (
+        HandPreMotionSkill,
+    )
+    from inference.desktop.lower_policy.skills.hold_pose import HoldPoseSkill
+    from inference.desktop.orchestrator import model_transition_skill_names
+
+    names = model_transition_skill_names(
+        previous_skill, next_skill, include_hand=include_hand
+    )
+    arm_settings = dict(skill_config.get("arm_pre_motion") or {})
+    unknown = sorted(
+        set(arm_settings)
+        - {
+            "velocity_limit_rad_s",
+            "acceleration_limit_rad_s2",
+            "measured_tolerance_rad",
+            "measured_velocity_tolerance_rad_s",
+            "command_tolerance_rad",
+            "stage_timeout_s",
+        }
+    )
+    if unknown:
+        raise ValueError(f"arm_pre_motion has unknown keys: {unknown}")
+    skills: list = [
+        CollisionAwareArmPreMotionSkill(
+            tuple(initial_pose.arm_position_rad.tolist()),
+            skill_name=names[0],
+            published_target_provider=published_arm_target_provider,
+            **arm_settings,
+        )
+    ]
+    if include_hand:
+        grasp = bool(initial_pose.requires_separate_hand_initialization)
+        skills.append(
+            HandPreMotionSkill.from_config(
+                skill_config,
+                next_skill,
+                target="grasp" if grasp else "pose",
+                hand_actuator=hand_actuator,
+                name=names[1],
+            )
+        )
+    skills.append(HoldPoseSkill(hold_sec, name=names[-1]))
+    built = [skill.name for skill in skills]
+    if built != names:
+        raise RuntimeError(f"model transition name mismatch: {built} != {names}")
     return skills
 
 

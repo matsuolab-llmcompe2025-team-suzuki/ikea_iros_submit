@@ -338,6 +338,53 @@ assert Path(script).is_file(), f"worker script が無い: {script}"
 print(f"[build] orchestrator pick worker OK ({py} {script})")
 PY
 
+# 4) pick の hybrid (`-e RAMEN_PICK_HYBRID=1`) が image の中で組めること。
+#    VLM は立てないので endpoint の probe だけ差し替え、そこまでの
+#    「config が読めて / 参照画像が焼けていて / class が import できる」を見る。
+#    参照画像は .dockerignore に引っかかると **無言で欠ける** ので実体を確認する。
+RUN cd /app/components/ramen/vendor/desktop \
+    && python3 - <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/app/components/ramen/vendor/desktop")
+sys.path.insert(0, "/app")
+
+from inference.desktop.pick_leg_hybrid import real_skill
+from inference.desktop.pick_leg_hybrid.config import DEFAULT_CONFIG_PATH
+
+assert DEFAULT_CONFIG_PATH.is_file(), f"hybrid config が無い: {DEFAULT_CONFIG_PATH}"
+cfg, references = real_skill.load_reference_images(DEFAULT_CONFIG_PATH)
+assert len(references) == 2, f"参照画像は 2 枚のはず: {len(references)}"
+for name in (cfg.references.before, cfg.references.after):
+    path = (DEFAULT_CONFIG_PATH.parent / name).resolve()
+    assert path.is_file() and path.stat().st_size > 0, f"参照画像が無い: {path}"
+
+# VLM は image build 時には居ない。probe だけ差し替えて driver の配線を通す。
+real_skill.probe_vlm_endpoint = lambda cfg, refs=None, timeout_sec=3.0: {cfg.vlm.model}
+import os
+
+os.environ["RAMEN_PICK_HYBRID"] = "1"
+from components.ramen.orchestrator_driver import (
+    _hybrid_pick_settings,
+    _load_skill_config,
+)
+
+settings = _hybrid_pick_settings(_load_skill_config("/app/components/ramen/vendor/desktop"))
+assert settings is not None and settings.skill_cls is real_skill.RealPickLegHybridVlaSkill
+assert settings.extra_kwargs["phase3_executor"] == "rule_based"
+
+# JPEG encode は cv2、HTTP は requests。どちらも lazy import なので、
+# 欠けていても **最初の VLM 呼び出しまで気付けない** = 会場で踏む。
+import cv2  # noqa: F401
+import requests  # noqa: F401
+
+print(
+    f"[build] pick hybrid OK (VLM {cfg.vlm.model}, timeout "
+    f"{cfg.runtime.hard_timeout_sec:g}s, refs 2, cv2 + requests あり)"
+)
+PY
+
 # weights (ver2-lora, private Team-RAMEN) は image に焼かず runtime に HF から取得。
 #   docker run 時に -e HF_TOKEN=<token> を渡す (private repo pull に必須)。
 #   manifest.yaml の weights_uri と整合。

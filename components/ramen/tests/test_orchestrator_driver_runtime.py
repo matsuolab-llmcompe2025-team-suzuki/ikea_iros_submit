@@ -20,11 +20,27 @@ for _p in (str(_VENDOR_DESKTOP), str(_ROOT)):
         sys.path.insert(0, _p)
 
 from components.ramen.orchestrator_driver import (  # noqa: E402
+    _INITIAL_SKILL,
     _LEGS,
     _STAGE_SKILLS,
     _TRANSITIONS,
     OrchestratorDriver,
 )
+
+
+def _driver_stub(start_skill: str | None = None):
+    """`_build_residency` だけを呼ぶための最小の self。
+
+    `_resume` (どの脚から始めるか) を見るようになったので、素の None では呼べない。
+    """
+    from components.ramen.orchestrator_driver import _LEGS as _L
+    from components.ramen.orchestrator_driver import _Resume
+
+    stub = OrchestratorDriver.__new__(OrchestratorDriver)
+    stub._resume = _Resume(
+        start_skill=start_skill or _INITIAL_SKILL, legs_done=0, end_legs=_L
+    )
+    return stub
 
 
 # ---------------------------------------------------------------- 先読み
@@ -70,9 +86,9 @@ def test_residency_preloads_the_next_expert(monkeypatch):
     読み込み 約 8 秒 < 各 skill の 21〜58 秒 なので、次の 1 つで間に合う。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
 
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     assert residency is not None
     assert residency.resident == 2  # 全部載せると 53D×4 + pick で約 26 GiB
@@ -90,9 +106,9 @@ def test_residency_preloads_the_next_expert(monkeypatch):
 def test_residency_respects_the_env_override(monkeypatch):
     """`RAMEN_GPU_MODELS=2` なら今の skill と次だけを載せる。"""
     monkeypatch.setenv("RAMEN_GPU_MODELS", "2")
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
 
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
     assert residency.resident == 2
     residency.on_skill_started("rotate_table_base")
     _drain(residency)
@@ -142,7 +158,7 @@ def test_four_leg_loop_advances_the_counter_and_then_stops():
     from inference.desktop.orchestrator import Orchestrator, enter_never
     from inference.desktop.perception.stream import DetectionStream
 
-    names = [name for name, _c, _v in _STAGE_SKILLS]
+    names = [name for name, _c in _STAGE_SKILLS]
     orch = Orchestrator(
         _NoDetections(),
         DetectionStream(
@@ -245,10 +261,17 @@ def built_driver(monkeypatch):
     monkeypatch.setattr(
         OrchestratorDriver, "_resolve_yolo_weight", staticmethod(lambda ref: "stub.pt")
     )
-    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    monkeypatch.delenv("RAMEN_ORCH_LOG", raising=False)
+    for key in (
+        "RAMEN_GPU_MODELS",
+        "RAMEN_ORCH_LOG",
+        "RAMEN_START_LEG",
+        "RAMEN_END_LEG",
+        "RAMEN_START_SKILL",
+        "RAMEN_PICK_HYBRID",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     yield drv
     drv.close()
 
@@ -263,7 +286,7 @@ def test_the_driver_wires_the_residency_and_tick_hook(built_driver):
 def test_the_driver_passes_the_hard_timeouts(built_driver):
     """時間切れの受け皿が 4 skill 分渡っていること。"""
     hard = built_driver._orch.hard_timeout_by_skill
-    for name, _cls, _variant in _STAGE_SKILLS:
+    for name, _cls in _STAGE_SKILLS:
         assert name in hard, name
         assert hard[name] > 0
 
@@ -300,8 +323,8 @@ def test_residency_keeps_every_expert_at_every_point_of_the_leg(monkeypatch):
     実測では脚ごとに 8.5 秒のスパイクが出ていた (2026-09-21、pod)。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
-    residency = OrchestratorDriver._build_residency(None, policies)
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     try:
         for name in policies:
@@ -323,9 +346,9 @@ def test_the_next_skill_is_always_ready_before_it_starts(monkeypatch):
     なく「必要になった時点で載っているか」。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    names = [name for name, _c, _v in _STAGE_SKILLS]
+    names = [name for name, _c in _STAGE_SKILLS]
     policies = {name: _StubPolicy(name) for name in names}
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     try:
         for leg in range(2):
@@ -405,7 +428,7 @@ def test_reset_clears_the_halt_and_the_leg_counter(built_driver):
 
     assert built_driver._advance_halted is False
     assert built_driver._orch.state.n_legs_completed == 0
-    assert built_driver._orch.state.current_skill == "rotate_table_base"
+    assert built_driver._orch.state.current_skill == _INITIAL_SKILL
     assert built_driver._orch.dispatcher.active_skill_name is None
 
 
@@ -428,3 +451,171 @@ def test_enter_check_fails_loudly_on_an_unregistered_skill():
         assert c in _YOLO_FREE_ENTRY or c in DEFAULT_ENTER_CHECK, c
     # 明示リストは実在の遷移先だけであること (typo 検出)
     assert _YOLO_FREE_ENTRY <= candidates
+
+
+# ---------------------------------------------------- 1 本目は卓を回さない
+def test_the_first_leg_does_not_rotate_the_table(built_driver):
+    """開始 skill が pick であること (自前経路の STAGE_SKILL_SEQUENCES[1] と同じ)。
+
+    元は `rotate_table_base` 始まりで、4 脚に対して回転が 4 回あった。学習データの
+    1 本目とは違う卓の向きから掴みにいくうえ、頭で 30 秒を余分に使う。
+    """
+    assert _INITIAL_SKILL == "pick_table_leg"
+    assert built_driver._orch.state.current_skill == "pick_table_leg"
+
+
+def test_the_loop_matches_the_self_path_stage_sequences():
+    """ループを 1 周すると自前経路の stage 2..4 と同じ並びになること。"""
+    from inference.desktop.orchestrator import STAGE_SKILL_SEQUENCES
+
+    def _walk(start: str, steps: int) -> list[str]:
+        path = [start]
+        for _ in range(steps):
+            path.append(_TRANSITIONS[path[-1]][0])
+        return path
+
+    # 1 本目: pick -> insert -> rotate_leg、その次が 2 本目の頭の rotate。
+    first = _walk(_INITIAL_SKILL, len(STAGE_SKILL_SEQUENCES[1]) - 1)
+    assert first == STAGE_SKILL_SEQUENCES[1]
+    assert _TRANSITIONS[first[-1]][0] == "rotate_table_base"
+
+    # 2 本目以降: rotate -> pick -> insert -> rotate_leg。
+    second = _walk("rotate_table_base", len(STAGE_SKILL_SEQUENCES[2]) - 1)
+    assert second == STAGE_SKILL_SEQUENCES[2]
+
+
+def test_the_preload_order_starts_at_the_initial_skill(monkeypatch):
+    """先読みの列が実際の実行順で始まること。
+
+    `_STAGE_SKILLS` の並び (rotate_table_base 始まり) のままだと、構築時の
+    `order[0:resident]` が「1 本目に使わない rotate」を読んで「次に要る insert」を
+    読まない = 最初の切替で丸ごとブロックする。
+    """
+    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
+
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
+    try:
+        assert residency._order[0] == _INITIAL_SKILL
+        assert residency._order[1] == _TRANSITIONS[_INITIAL_SKILL][0]
+        # 4 脚ぶんに伸ばしてあること (1 脚だけだと末尾で毎周回解放する)
+        assert len(residency._order) == len(_STAGE_SKILLS) * _LEGS
+    finally:
+        residency.close()
+
+
+# ---------------------------------------------------- 途中の脚から再開する
+#
+# 自前経路の `--phase3-start-stage` / `--phase3-end-stage` に相当する。boundary の
+# server は 1 本の process が走り続けるので stage を分けられないが、**会場で
+# 3 本目からやり直せないと困る**ので同じ粒度を env で持たせている。
+@pytest.fixture
+def clean_resume_env(monkeypatch):
+    for key in ("RAMEN_START_LEG", "RAMEN_END_LEG", "RAMEN_START_SKILL"):
+        monkeypatch.delenv(key, raising=False)
+    return monkeypatch
+
+
+def test_the_default_is_the_whole_run_from_the_first_leg(clean_resume_env):
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    resume = _resume_settings()
+
+    assert resume.start_skill == _INITIAL_SKILL
+    assert resume.legs_done == 0
+    assert resume.end_legs == _LEGS
+
+
+def test_starting_at_a_later_leg_rotates_the_table_first(clean_resume_env):
+    """2 本目以降は卓を回してから pick (STAGE_SKILL_SEQUENCES[2] と同じ)。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "3")
+    resume = _resume_settings()
+
+    assert resume.start_skill == "rotate_table_base"
+    # 判定に効く数。0 だと `enter_pick_table_leg` が 1 本目の Kabsch に落ちる。
+    assert resume.legs_done == 2
+    assert resume.end_legs == _LEGS
+
+
+def test_the_end_leg_can_stop_the_run_early(clean_resume_env):
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "2")
+    clean_resume_env.setenv("RAMEN_END_LEG", "2")
+    resume = _resume_settings()
+
+    assert (resume.legs_done, resume.end_legs) == (1, 2)
+
+
+def test_a_leg_inside_a_leg_can_be_resumed(clean_resume_env):
+    """脚の途中 (insert から等) に戻す口。物理的な前提は運用側の責任。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "2")
+    clean_resume_env.setenv("RAMEN_START_SKILL", "insert_table_leg")
+    resume = _resume_settings()
+
+    assert resume.start_skill == "insert_table_leg"
+    assert resume.legs_done == 1
+
+
+@pytest.mark.parametrize(
+    "env, match",
+    [
+        ({"RAMEN_START_LEG": "0"}, "RAMEN_START_LEG"),
+        ({"RAMEN_START_LEG": "5"}, "RAMEN_START_LEG"),
+        ({"RAMEN_START_LEG": "two"}, "RAMEN_START_LEG"),
+        ({"RAMEN_END_LEG": "9"}, "RAMEN_END_LEG"),
+        ({"RAMEN_START_LEG": "3", "RAMEN_END_LEG": "2"}, "RAMEN_END_LEG"),
+        ({"RAMEN_START_SKILL": "flip_table"}, "RAMEN_START_SKILL"),
+    ],
+)
+def test_bad_resume_settings_fail_at_startup(clean_resume_env, env, match):
+    """typo で黙って 1 本目から回り直さないこと。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    for key, value in env.items():
+        clean_resume_env.setenv(key, value)
+
+    with pytest.raises(ValueError, match=match):
+        _resume_settings()
+
+
+def test_the_built_driver_resumes_at_the_requested_leg(monkeypatch):
+    """組み立てまで通して、state と先読みの列が再開点に揃っていること。"""
+    import inference.desktop.perception.yolo_obb as yolo
+
+    class _StubYolo:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def predict(self, rgb):  # noqa: ANN001
+            return []
+
+    monkeypatch.setattr(yolo, "YoloObbPerception", _StubYolo)
+    monkeypatch.setattr(
+        OrchestratorDriver, "_resolve_yolo_weight", staticmethod(lambda ref: "stub.pt")
+    )
+    for key in ("RAMEN_GPU_MODELS", "RAMEN_ORCH_LOG", "RAMEN_START_SKILL",
+                "RAMEN_END_LEG", "RAMEN_PICK_HYBRID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("RAMEN_START_LEG", "3")
+
+    drv = OrchestratorDriver(prime_first_model=False)
+    try:
+        assert drv._orch.state.current_skill == "rotate_table_base"
+        assert drv._orch.state.n_legs_completed == 2
+        assert drv._residency._order[0] == "rotate_table_base"
+
+        # reset は「1 本目から」ではなく **再開点** に戻すこと。戻さないと
+        # reset のたびに enter_pick_table_leg が 1 本目の規則 (Kabsch) に落ちる。
+        drv._advance_halted = True
+        drv._orch.state.n_legs_completed = _LEGS
+        drv.reset()
+        assert drv._advance_halted is False
+        assert drv._orch.state.n_legs_completed == 2
+        assert drv._orch.state.current_skill == "rotate_table_base"
+    finally:
+        drv.close()

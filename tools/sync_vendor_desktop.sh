@@ -102,6 +102,12 @@ rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/model/subtask_policy_training/gr00t/" \
   "${VENDOR_DESKTOP}/model/subtask_policy_training/gr00t/"
 
+# `perception/g1_urdf_fk_torch.py` が module 直下で import する。いま vendor 内に
+# その FK を使う箇所は無いが、**`inference/` 配下のコードが import している**ので
+# 入れておく。欠けていると誰かが触った瞬間に会場で ImportError になる (4 KB)。
+cp "${SOURCE_REPO}/model/subtask_policy_training/joint_layout.py" \
+   "${VENDOR_DESKTOP}/model/subtask_policy_training/joint_layout.py"
+
 # --- model/ramen_ori (RAMEN-Ori の nn.Module + Hydra config) -------------------
 #
 # `policies/ramen_ori.py` の `from_ckpt` が
@@ -115,6 +121,23 @@ rsync -a "${RSYNC_EXCLUDES[@]}" \
 rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/model/ramen_ori/" \
   "${VENDOR_DESKTOP}/model/ramen_ori/"
+
+# --- model/subtask_policy_training/deployment (pick worker の実体) -------------
+#
+# `groot_pick_legs.py` が subprocess で spawn する worker script。**vendor/desktop の
+# 外** (`components/ramen/vendor/model/`) に置いてあるのは、vendor tree では
+# `parents[4]` が vendor/desktop を指してしまい、VENDOR PATCH が 1 つ上の
+# `vendor/` まで遡ってここを見つける作りになっているため。
+#
+# 2026-09-21 まで**この 1 本だけ同期の対象外**で、本体を変えても気づかないまま
+# 古いものが image に焼かれる状態だった。pick は大会経路の中核なので必ず同期する。
+VENDOR_MODEL="${SUBMIT_ROOT}/components/ramen/vendor/model"
+mkdir -p "${VENDOR_MODEL}/subtask_policy_training/deployment"
+cp "${SOURCE_REPO}/model/subtask_policy_training/deployment/real_groot_n17_worker.py" \
+   "${VENDOR_MODEL}/subtask_policy_training/deployment/real_groot_n17_worker.py"
+: >"${VENDOR_MODEL}/__init__.py"
+: >"${VENDOR_MODEL}/subtask_policy_training/__init__.py"
+: >"${VENDOR_MODEL}/subtask_policy_training/deployment/__init__.py"
 
 # --- package marker の復元 ----------------------------------------------------
 

@@ -17,6 +17,7 @@ skill_config.yaml:skills.<skill_name>.initial_pose の schema:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,37 @@ ARM_JOINT_ORDER: tuple[str, ...] = (
 # 5.4-rad mechanical full-open value is used only for collision clearance and
 # safe return; frame-zero dataset targets must use the recorded 4.5-rad basis.
 DEX1_MAX_RAD = 4.5
+
+
+def apply_policy_variant_profile(
+    cfg: dict, skill_name: str, variant_name: str | None
+) -> dict:
+    """Apply the dataset contract belonging to a concrete policy variant."""
+
+    result = copy.deepcopy(cfg)
+    skill = result.get("skills", {}).get(skill_name)
+    if not isinstance(skill, dict) or variant_name is None:
+        return result
+    profiles = skill.get("variant_profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError(f"skills.{skill_name}.variant_profiles must be a mapping")
+    profile = profiles.get(variant_name)
+    if profile is None:
+        return result
+    if not isinstance(profile, dict):
+        raise ValueError(
+            f"skills.{skill_name}.variant_profiles.{variant_name} must be a mapping"
+        )
+
+    def _merge(target: dict, override: dict) -> None:
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                _merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    _merge(skill, profile)
+    return result
 
 
 @dataclass(frozen=True)

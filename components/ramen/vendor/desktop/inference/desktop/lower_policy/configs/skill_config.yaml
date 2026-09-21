@@ -46,6 +46,8 @@ arm_pre_motion:
   velocity_limit_rad_s: 0.5
   acceleration_limit_rad_s2: 1.0
   measured_tolerance_rad: 0.10   # 実測がこの範囲に入ったら到達
+  measured_velocity_tolerance_rad_s: 0.05  # 停止を実測してから次modelへ
+  command_tolerance_rad: 0.001   # 最終targetまでLimiter指令が到達したことを確認
   stage_timeout_s: 15.0          # 1 つの経由姿勢に許す時間
 
 # 頭の手順で Dex1 を動かすときの共通値 (Issue #141 束 1-8 / D2)。
@@ -54,7 +56,7 @@ arm_pre_motion:
 #   N 秒保持の秒数だけは起動引数 (--setup-hold-sec)。
 hand_pre_motion:
   velocity_limit_rad_s: 1.5   # ramp の速さ
-  tolerance_rad: 0.15         # 到達とみなす目標との差
+  tolerance_rad: 0.05         # 空中到達。約0.83mm相当、接触把持は別判定
   required_stable_samples: 5  # 到達がこの tick 数続いたら完了
   minimum_timeout_sec: 5.0    # 締め切り = max(これ, 所要時間 + timeout_margin_sec)
   timeout_margin_sec: 3.0
@@ -119,7 +121,7 @@ skills:
     max_seconds_hard: 9
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     # Phase 3 motion_limits (partial override、未指定 field は motion_limits_default 継承):
     # 大きい motion (table base 回転 + 移動) を想定、accel を default より上げる。
     motion_limits:
@@ -178,7 +180,7 @@ skills:
     max_seconds_hard: 30
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     # Issue #137 Phase 4: 空振り retry (既定 OFF)。この block を有効化すると
     # 「attempt_seconds 以内に天板が success_deg 回らなければ開始姿勢へ戻り、
     # z 天井を 1 段下げて打ち直す」動作になる。段の値は教師 1401 セグメントの
@@ -264,7 +266,7 @@ skills:
     max_seconds_hard: 21
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     # Phase 3 motion_limits (精密 insertion、SOTA π0.5=52.5% の最難関 skill = 保守的)
     motion_limits:
       arm_velocity_rad_s: 1.0
@@ -329,7 +331,7 @@ skills:
     max_seconds_hard: 58
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     # Phase 3 motion_limits (通常 tighten motion、default 相当だが flip 準拠で明示)
     motion_limits:
       arm_velocity_rad_s: 1.5
@@ -400,7 +402,7 @@ skills:
     max_seconds_hard: 79
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     motion_limits:
       arm_velocity_rad_s: 1.0
       arm_acceleration_rad_s2: 8.0
@@ -430,18 +432,17 @@ skills:
       requires_separate_hand_initialization: true
       hand_initialization_instruction: "Place the table leg in the dataset-matched pre-insertion grasp, then close both Dex1 hands before the combined insert-and-tighten policy starts."
 
-  # flip_table: issue-70 の FLIP_TABLE_V4_ABSOLUTE_FRAME0 転写 (n17_4 と共有)。
-  #   dataset: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4 (268 ep = full_success + recovery_success の train split)。
-  #   Model: groot_flip_table_n17_4。
+  # flip_table: Furniture-GR00T v2 baseline 20k が実際に使った
+  # flip_table_2 episode 0..155 の分布に固定。n17_4 の姿勢/範囲と混ぜない。
   flip_table:
     # Physical flip-table policies own arms14 + Dex1 only.  Regular Mode owns
     # waist/legs and must not receive the checkpoint's observed waist slots.
     dispatch_waist: false
-    # 出典: compute_skill_timeout.py, HARA task 2 429ep, p95=24.4s × 1.5, ceil。
-    max_seconds_hard: 37
+    # baseline near-success は約45s。終盤動作と安定化のため60sまで許容する。
+    max_seconds_hard: 60
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     # Phase 3 motion_limits (issue-70 で flip_table dataset から verified、sweet spot)
     motion_limits:
       arm_velocity_rad_s: 1.5
@@ -451,48 +452,99 @@ skills:
     teacher_joint_range:
       margin_rad: 0.02
       source:
-        dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4"
-        dataset_revision: "b402c17d2b5475b3a5438b95b61c7194fa23159a"
-        frame_count: 326556
-        statistic: "min_max_action_robot_q_desired_arms14"
+        dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+        dataset_revision: "0dc47877dfb2efbea796a059c81290c649bc773c"
+        frame_count: 71650
+        statistic: "min_max_action_robot_q_desired_arms14_episode_indices_0_through_155_from_checkpoint_train_config"
       arm_position_rad:
-        L.shoulder_pitch: [-1.6070531607, +0.7783381939]
-        L.shoulder_roll:  [-0.5163833499, +1.2514497042]
-        L.shoulder_yaw:   [-0.6287920475, +0.9930834770]
-        L.elbow:          [-1.0051543713, +1.3821099997]
+        L.shoulder_pitch: [-1.5666456223, +0.6445195079]
+        L.shoulder_roll:  [-0.3177822828, +0.9129312038]
+        L.shoulder_yaw:   [-0.5295771360, +0.7913149595]
+        L.elbow:          [-0.8341802359, +1.3375406265]
         L.wrist_roll:     [-1.3624072075, +0.9048896432]
-        L.wrist_pitch:    [-0.8326460719, +1.2185134888]
-        L.wrist_yaw:      [-1.5919286013, +0.8808671832]
-        R.shoulder_pitch: [-1.9136897326, +0.4675723314]
-        R.shoulder_roll:  [-1.0704537630, +0.4302931130]
-        R.shoulder_yaw:   [-0.8742828965, +0.5121936202]
-        R.elbow:          [-0.6987094283, +1.3951027393]
-        R.wrist_roll:     [-0.6658838391, +1.2391921282]
-        R.wrist_pitch:    [-1.2544249296, +1.0806432962]
-        R.wrist_yaw:      [-0.4583360851, +1.5485922098]
+        L.wrist_pitch:    [-0.7523500919, +0.9254827499]
+        L.wrist_yaw:      [-1.0709218979, +0.2736824751]
+        R.shoulder_pitch: [-1.9136897326, +0.3862575293]
+        R.shoulder_roll:  [-0.9305514097, +0.3117553592]
+        R.shoulder_yaw:   [-0.8498908877, +0.4595260620]
+        R.elbow:          [-0.6168512106, +1.3679901361]
+        R.wrist_roll:     [-0.5820136666, +1.0586798191]
+        R.wrist_pitch:    [-1.0639227629, +0.8382484913]
+        R.wrist_yaw:      [-0.3256902099, +1.3714236021]
     initial_pose:
       arm_position_rad:
-        L.shoulder_pitch:  0.03441404365003109
-        L.shoulder_roll:   0.16259100288152695
-        L.shoulder_yaw:    0.21866360306739807
-        L.elbow:          -0.15529765188694
-        L.wrist_roll:     -0.1381627693772316
-        L.wrist_pitch:     0.12260473519563675
-        L.wrist_yaw:      -0.23490699380636215
-        R.shoulder_pitch: -0.018923509865999222
-        R.shoulder_roll:  -0.24823171645402908
-        R.shoulder_yaw:    0.040699612349271774
-        R.elbow:          -0.09826641529798508
-        R.wrist_roll:      0.3072306215763092
-        R.wrist_pitch:     0.256726399064064
-        R.wrist_yaw:       0.6130597293376923
+        L.shoulder_pitch:  0.01607997575774789
+        L.shoulder_roll:   0.18264327943325043
+        L.shoulder_yaw:    0.26085586845874786
+        L.elbow:          -0.06220103055238724
+        L.wrist_roll:     -0.1442396268248558
+        L.wrist_pitch:     0.08705304563045502
+        L.wrist_yaw:      -0.21875989437103271
+        R.shoulder_pitch: -0.050612280145287514
+        R.shoulder_roll:  -0.2726525217294693
+        R.shoulder_yaw:    0.0800039991736412
+        R.elbow:          -0.07146013528108597
+        R.wrist_roll:      0.32281383872032166
+        R.wrist_pitch:     0.2702529579401016
+        R.wrist_yaw:       0.6890287697315216
       dex1_opening_fraction:
-        left:  0.8401082621680366
+        left:  0.9225202136569552
         right: 1.0
-      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4"
-      dataset_revision: "b402c17d2b5475b3a5438b95b61c7194fa23159a"
-      training_episode_count: 268
-      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2;train_split_full_success_or_recovery_success_only"
+      dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2"
+      dataset_revision: "0dc47877dfb2efbea796a059c81290c649bc773c"
+      training_episode_count: 156
+      statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2;episode_indices_0_through_155_from_checkpoint_train_config;reconstruction_sha256=df3f888c8d8be373884427532d5b41c04d39aaac0d717d63024c75735844fb8c"
+    # Explicit comparisons with n17_4 must restore that artifact's own
+    # flip_table_4 pose/range instead of inheriting the Phase 3 baseline.
+    variant_profiles:
+      groot_flip_table_n17_4:
+        max_seconds_hard: 37
+        on_timeout: stop
+        teacher_joint_range:
+          margin_rad: 0.02
+          source:
+            dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4"
+            dataset_revision: "b402c17d2b5475b3a5438b95b61c7194fa23159a"
+            frame_count: 326556
+            statistic: "min_max_action_robot_q_desired_arms14"
+          arm_position_rad:
+            L.shoulder_pitch: [-1.6070531607, +0.7783381939]
+            L.shoulder_roll:  [-0.5163833499, +1.2514497042]
+            L.shoulder_yaw:   [-0.6287920475, +0.9930834770]
+            L.elbow:          [-1.0051543713, +1.3821099997]
+            L.wrist_roll:     [-1.3624072075, +0.9048896432]
+            L.wrist_pitch:    [-0.8326460719, +1.2185134888]
+            L.wrist_yaw:      [-1.5919286013, +0.8808671832]
+            R.shoulder_pitch: [-1.9136897326, +0.4675723314]
+            R.shoulder_roll:  [-1.0704537630, +0.4302931130]
+            R.shoulder_yaw:   [-0.8742828965, +0.5121936202]
+            R.elbow:          [-0.6987094283, +1.3951027393]
+            R.wrist_roll:     [-0.6658838391, +1.2391921282]
+            R.wrist_pitch:    [-1.2544249296, +1.0806432962]
+            R.wrist_yaw:      [-0.4583360851, +1.5485922098]
+        initial_pose:
+          arm_position_rad:
+            L.shoulder_pitch:  0.03441404365003109
+            L.shoulder_roll:   0.16259100288152695
+            L.shoulder_yaw:    0.21866360306739807
+            L.elbow:          -0.15529765188694
+            L.wrist_roll:     -0.1381627693772316
+            L.wrist_pitch:     0.12260473519563675
+            L.wrist_yaw:      -0.23490699380636215
+            R.shoulder_pitch: -0.018923509865999222
+            R.shoulder_roll:  -0.24823171645402908
+            R.shoulder_yaw:    0.040699612349271774
+            R.elbow:          -0.09826641529798508
+            R.wrist_roll:      0.3072306215763092
+            R.wrist_pitch:     0.256726399064064
+            R.wrist_yaw:       0.6130597293376923
+          dex1_opening_fraction:
+            left:  0.8401082621680366
+            right: 1.0
+          dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_4"
+          dataset_revision: "b402c17d2b5475b3a5438b95b61c7194fa23159a"
+          training_episode_count: 268
+          statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2;train_split_full_success_or_recovery_success_only"
 
   # PickTableLegSkill: pick_table_leg を CV + Motion Planning + ルールベースで解く
   # 8-stage サブFSM (Issue #123)。全 stage が「目標ポーズ + Motion Planning」で動く
@@ -528,7 +580,7 @@ skills:
     max_seconds_hard: 21
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
-    on_timeout: advance
+    on_timeout: stop
     motion_limits:
       arm_acceleration_rad_s2: 12.0
     # 教師データで各腕関節が取った範囲 (Issue #141 束 1-4 / D5-1)。範囲を出た関節だけ

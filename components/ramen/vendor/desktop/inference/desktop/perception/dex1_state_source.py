@@ -16,7 +16,7 @@ import math
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import numpy as np
@@ -24,6 +24,9 @@ import numpy as np
 
 DEX1_LEFT_STATE_TOPIC = "rt/dex1/left/state"
 DEX1_RIGHT_STATE_TOPIC = "rt/dex1/right/state"
+# ``dex1_1_gripper_server`` reserve-field health extension.  The magic keeps
+# older official servers (whose reserve fields are unspecified) compatible.
+DEX1_HEALTH_PROTOCOL_MAGIC = 0x44583131  # ASCII "DX11"
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,18 @@ class Dex1StateData:
     left_received_monotonic_ns: int
     right_received_monotonic_ns: int
     t: int
+    # Defaults preserve compatibility with snapshots created by tests and by
+    # callers that still model the unextended official bridge.
+    motor_mode: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint8)
+    )
+    shell_temperature_c: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint8)
+    )
+    fault_code: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint32)
+    )
+    health_diagnostics_available: bool = False
 
 
 class Dex1StateSource:
@@ -59,6 +74,10 @@ class Dex1StateSource:
         self._lock = threading.Lock()
         self._closed = False
         self._positions: list[float | None] = [None, None]
+        self._motor_modes = [0, 0]
+        self._shell_temperatures_c = [0, 0]
+        self._fault_codes = [0, 0]
+        self._health_available = [False, False]
         self._received_ns = [0, 0]
         self._latest: Dex1StateData | None = None
 
@@ -78,7 +97,8 @@ class Dex1StateSource:
             states = getattr(message, "states", None)
             if not states:
                 raise ValueError("empty MotorStates.states")
-            q = float(states[0].q)
+            motor = states[0]
+            q = float(motor.q)
             if not math.isfinite(q):
                 raise ValueError(f"non-finite motor position: {q!r}")
             received_ns = time.monotonic_ns()
@@ -86,12 +106,29 @@ class Dex1StateSource:
                 if self._closed:
                     return
                 self._positions[side] = q
+                self._motor_modes[side] = int(getattr(motor, "mode", 0))
+                self._shell_temperatures_c[side] = int(
+                    getattr(motor, "temperature", 0)
+                )
+                reserve = tuple(getattr(motor, "reserve", ()) or ())
+                health_available = (
+                    len(reserve) >= 2
+                    and int(reserve[1]) == DEX1_HEALTH_PROTOCOL_MAGIC
+                )
+                self._health_available[side] = health_available
+                self._fault_codes[side] = int(reserve[0]) if health_available else 0
                 self._received_ns[side] = received_ns
                 if self._positions[0] is None or self._positions[1] is None:
                     return
                 positions = np.asarray(self._positions, dtype=np.float32)
                 self._latest = Dex1StateData(
                     position_rad=positions,
+                    motor_mode=np.asarray(self._motor_modes, dtype=np.uint8),
+                    shell_temperature_c=np.asarray(
+                        self._shell_temperatures_c, dtype=np.uint8
+                    ),
+                    fault_code=np.asarray(self._fault_codes, dtype=np.uint32),
+                    health_diagnostics_available=all(self._health_available),
                     left_received_monotonic_ns=self._received_ns[0],
                     right_received_monotonic_ns=self._received_ns[1],
                     t=max(self._received_ns),

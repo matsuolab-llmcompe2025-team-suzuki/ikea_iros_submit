@@ -105,6 +105,73 @@ from components.transport import serve_policy  # noqa: E402
 LANES = ("sonic", "decoupled")
 
 
+def decode_obs_images(obs: dict) -> dict:
+    """`obs["images_jpeg"]` を展開して `obs["images"]` にする。
+
+    client は bridge が作った JPEG を**そのまま**運んでくる
+    (`components/ramen/raw_camera.py` に理由)。**再エンコードはしていない**ので、
+    ここで展開したピクセルは `boundary/cameras.py` が Orin 側で decode していた
+    ときと同一。decode する場所が Orin から Thor に移っただけ。
+
+    `boundary/cameras.py:104-116` と同じ手順で揃える:
+    `cv2.imdecode` (BGR) → `cvtColor(BGR2RGB)` → HWC uint8 RGB。
+    ここがズレると全 policy が色を反転したまま推論する。
+
+    `images_jpeg` が無い obs (warmup の dummy、旧 client) はそのまま返す。
+    """
+    jpegs = obs.get("images_jpeg")
+    if not jpegs:
+        return obs
+
+    import cv2
+
+    images = dict(obs.get("images") or {})
+    for key, blob in jpegs.items():
+        if key in images:
+            continue  # 明示的に渡された生画像を優先する (warmup など)
+        bgr = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue  # 壊れた 1 枚で run を落とさない。driver が直前の画像を保持する
+        images[key] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    decoded = dict(obs)
+    decoded["images"] = images
+    decoded.pop("images_jpeg", None)
+    return decoded
+
+
+class _JpegObsPolicy:
+    """`act()` の直前で JPEG を展開する薄いラッパ。
+
+    ここに 1 箇所だけ置くことで、`stub` / `groot_pick_real` / `groot_53d_real` /
+    `groot_orchestrator` のどれも **obs["images"] を今までどおり受け取る**。
+    policy 側は 1 行も変えなくてよい。
+    """
+
+    def __init__(self, policy) -> None:
+        self._policy = policy
+
+    @property
+    def metadata(self) -> dict:
+        return self._policy.metadata
+
+    def act(self, obs: dict) -> dict:
+        return self._policy.act(decode_obs_images(obs))
+
+    def reset(self):
+        return self._policy.reset()
+
+    def close(self):
+        """policy の後片付けを落とさない。
+
+        `serve_policy` は今のところ呼ばないが、`components/ramen/policy.py` の
+        4 クラスはいずれも `close()` を持ち、`OrchestratorTaskspacePolicy.close()`
+        は GPU 上の expert を解放する。**interface を黙って痩せさせるラッパ**は、
+        後で shutdown 処理を足したときに静かに握りつぶす。
+        """
+        close = getattr(self._policy, "close", None)
+        return close() if callable(close) else None
+
+
 class Policy:
     """Reference policy: correct shapes, no intelligence.
 
@@ -261,6 +328,15 @@ def _warmup_policy(policy, label: str, iters: int = 2) -> None:
             "left_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
             "right_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
         },
+        # Dex1 の実測 (運営 :5557 の gripper_q と同じ生モータ角、0.0=閉)。
+        # **これが無いと `RAMEN_PICK_HYBRID=1` のとき warmup が空振りする** —
+        # hybrid は実測が無い間 expert を 1 度も走らせないので、model の compile が
+        # serve 前に済まず、本番 1 tick 目で 45 秒待つことになる。
+        # driver の `reset()` がこの値を捨てるので、本番の判定には残らない。
+        "gripper_q": {
+            "left": {"q": 0.0, "dq": 0.0, "tau_est": 0.0},
+            "right": {"q": 0.0, "dq": 0.0, "tau_est": 0.0},
+        },
         "prompt": "warmup",
     }
     t0 = time.time()
@@ -323,7 +399,7 @@ def main():
     if choice in _WARMUP_MODES and os.environ.get("RAMEN_WARMUP", "1") != "0":
         print(f"[server] warming up ({choice}) before serving ...")
         _warmup_policy(policy, choice)
-    serve_policy(policy, host=args.host, port=args.port)
+    serve_policy(_JpegObsPolicy(policy), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

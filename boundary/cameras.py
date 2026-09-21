@@ -5,9 +5,11 @@ Wire format published by the organizer's camera server:
     ZMQ PUB, one msgpack frame per tick:
         {"timestamps": {key: float}, "images": {key: jpeg_bytes}}
 
-    keys: "ego_view"      head/stereo camera   (always present)
-          "left_wrist"    RealSense D405       (may be absent)
-          "right_wrist"   RealSense D405       (may be absent)
+    keys: "ego_view"        head camera, mono          (always present)
+          "ego_view_left"   head camera, stereo left   (may be absent)
+          "ego_view_right"  head camera, stereo right  (may be absent)
+          "left_wrist"      RealSense D405             (may be absent)
+          "right_wrist"     RealSense D405             (may be absent)
 
 JPEGs are encoded BGR; :meth:`CameraStream.read` decodes and flips to RGB,
 so what you get back is HWC uint8 RGB at 480x640x3 — the layout every
@@ -17,6 +19,11 @@ Only ``ego_view`` is guaranteed. The server does not publish at all until
 the ego camera is live, and it drops individual wrist keys when those
 cameras are absent or failing. Write your client so a missing wrist key is
 survivable.
+
+If your policy wants stereo input instead of the mono ``ego_view``, declare
+``ego_view_left``/``ego_view_right`` in your server's ``camera_keys``
+metadata (see ``components/server.py``) — the mono ``ego_view`` keeps
+publishing unchanged either way, so this is purely opt-in.
 
 The socket is CONFLATE: you always get the newest frame, never a backlog.
 If your policy is slower than 30 Hz you skip frames rather than fall behind,
@@ -33,7 +40,7 @@ import msgpack
 import numpy as np
 import zmq
 
-CAMERA_KEYS = ("ego_view", "left_wrist", "right_wrist")
+CAMERA_KEYS = ("ego_view", "ego_view_left", "ego_view_right", "left_wrist", "right_wrist")
 REQUIRED_KEY = "ego_view"
 FRAME_SHAPE = (480, 640, 3)
 
