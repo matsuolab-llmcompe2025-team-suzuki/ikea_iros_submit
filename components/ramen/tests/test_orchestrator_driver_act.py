@@ -100,6 +100,8 @@ def _driver(initial_hand2=_INSERT_HAND) -> OrchestratorDriver:
     drv._last_obs_t = None
     drv._frame_received_ns = 0
     drv._head_bgr = None
+    drv._head_packed_stereo = True
+    drv._stereo_seen = False
     drv._head_generation = 0
     drv._head_received_ns = 0
     drv._missing_images = {"head": 0, "wrist_l": 0, "wrist_r": 0}
@@ -384,3 +386,77 @@ def test_a_slow_tick_does_not_look_like_a_stalled_camera():
 
     assert drv._hold_reason is None, drv._hold_reason
     assert drv._orch.ticks == 2
+
+
+# ---------------------------------------------------------------- head の実ステレオ
+#
+# 運営 package 2026.09.21 で `ego_view_left` / `ego_view_right` が追加された。
+# **pick の expert は HEAD_RIGHT を使う** (`policies/groot_pick_legs.py:70` の 4 cam)
+# ので、mono を複製していると学習と違う入力になる。
+def test_real_stereo_is_used_when_the_organizer_sends_it():
+    """左右が来たら連結してそのまま渡すこと (複製しない)。"""
+    drv = _driver()
+    left = np.full((480, 640, 3), 10, np.uint8)
+    right = np.full((480, 640, 3), 200, np.uint8)
+    drv.act(
+        _obs(
+            t=1.0,
+            images={
+                "ego_view": np.zeros((480, 640, 3), np.uint8),
+                "ego_view_left": left,
+                "ego_view_right": right,
+                "left_wrist": left,
+                "right_wrist": right,
+            },
+        )
+    )
+
+    frame = drv._orch.frames[-1]
+    assert frame.rgb.shape == (480, 1280, 3)
+    half = frame.rgb.shape[1] // 2
+    # BGR に反転して入るので値そのものは 10 / 200 のまま (グレースケール的な塗り)。
+    assert int(frame.rgb[:, :half].max()) != int(frame.rgb[:, half:].max()), (
+        "左右が同じ = 複製されている"
+    )
+
+
+def test_mono_only_still_falls_back_to_duplication():
+    """左右が来ない構成では従来どおり mono を複製すること。"""
+    drv = _driver()
+    mono = np.full((480, 640, 3), 123, np.uint8)
+    drv.act(
+        _obs(
+            t=1.0,
+            images={
+                "ego_view": mono,
+                "left_wrist": mono,
+                "right_wrist": mono,
+            },
+        )
+    )
+
+    frame = drv._orch.frames[-1]
+    assert frame.rgb.shape == (480, 1280, 3)
+    half = frame.rgb.shape[1] // 2
+    assert np.array_equal(frame.rgb[:, :half], frame.rgb[:, half:])
+
+
+def test_a_half_present_stereo_falls_back_instead_of_guessing():
+    """片眼だけ来た tick は複製に落ちること (壊れた連結を作らない)。"""
+    drv = _driver()
+    mono = np.full((480, 640, 3), 50, np.uint8)
+    drv.act(
+        _obs(
+            t=1.0,
+            images={
+                "ego_view": mono,
+                "ego_view_left": np.full((480, 640, 3), 9, np.uint8),
+                "left_wrist": mono,
+                "right_wrist": mono,
+            },
+        )
+    )
+
+    frame = drv._orch.frames[-1]
+    half = frame.rgb.shape[1] // 2
+    assert np.array_equal(frame.rgb[:, :half], frame.rgb[:, half:])

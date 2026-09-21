@@ -436,6 +436,8 @@ class OrchestratorDriver:
         self._last_obs_t: object = None
         self._frame_received_ns = 0
         self._head_bgr: np.ndarray | None = None
+        self._head_packed_stereo = True
+        self._stereo_seen = False
         self._head_generation = 0
         self._head_received_ns = 0
         self._missing_images = {"head": 0, "wrist_l": 0, "wrist_r": 0}
@@ -816,24 +818,57 @@ class OrchestratorDriver:
             )
 
         images = obs.get("images") or {}
-        for key, slot in (
-            ("ego_view", "head"),
-            ("left_wrist", "wrist_l"),
-            ("right_wrist", "wrist_r"),
-        ):
+
+        def _bgr(key):
             raw = images.get(key)
             if raw is None:
+                return None
+            return np.ascontiguousarray(np.asarray(raw, np.uint8)[:, :, ::-1])
+
+        # head は **実ステレオがあればそれを使う。** 運営 package 2026.09.21 で
+        # `ego_view_left` / `ego_view_right` が追加された。無い構成 (旧 bridge や
+        # カメラ不調) では mono の `ego_view` を左右に複製する従来どおりの動き。
+        #
+        # 複製のままだと **pick の expert に偽の右眼を渡す**ことになる
+        # (`policies/groot_pick_legs.py:70` は HEAD_LEFT/HEAD_RIGHT/両手首の 4 cam)。
+        left, right = _bgr("ego_view_left"), _bgr("ego_view_right")
+        if left is not None and right is not None:
+            head = np.concatenate([left, right], axis=1)  # packed (H, 2W, 3)
+            packed = False  # 既に packed
+            if not self._stereo_seen:
+                self._stereo_seen = True
+                print(
+                    "[orch-driver] head は実ステレオ (ego_view_left/right) を使う",
+                    file=sys.stderr,
+                )
+        else:
+            head = _bgr("ego_view")
+            packed = True  # mono を左右に複製する
+            if head is not None and self._stereo_seen:
+                self._stereo_seen = False
+                print(
+                    "[orch-driver] ⚠️ 実ステレオが来ていない。mono を複製する "
+                    "(pick の右眼が左眼の複製になる)",
+                    file=sys.stderr,
+                )
+
+        for name, slot, bgr in (
+            ("ego_view", "head", head),
+            ("left_wrist", "wrist_l", _bgr("left_wrist")),
+            ("right_wrist", "wrist_r", _bgr("right_wrist")),
+        ):
+            if bgr is None:
                 if self._missing_images[slot] == 0:
                     print(
-                        f"[orch-driver] {key} が obs に無い。直前の画像を保持する",
+                        f"[orch-driver] {name} が obs に無い。直前の画像を保持する",
                         file=sys.stderr,
                     )
                 self._missing_images[slot] += 1
                 continue
             self._missing_images[slot] = 0
-            bgr = np.ascontiguousarray(np.asarray(raw, np.uint8)[:, :, ::-1])
             if slot == "head":
                 self._head_bgr = bgr
+                self._head_packed_stereo = packed
                 self._head_generation = generation
                 self._head_received_ns = received_ns
             else:
@@ -856,7 +891,8 @@ class OrchestratorDriver:
         return build_frame_data(
             self._head_bgr,
             t=self._head_generation,
-            packed_stereo=True,
+            # 実ステレオを連結済みなら複製しない。mono しか無いときだけ複製する。
+            packed_stereo=self._head_packed_stereo,
             received_monotonic_ns=self._head_received_ns,
         )
 

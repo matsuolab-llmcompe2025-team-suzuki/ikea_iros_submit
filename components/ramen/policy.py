@@ -358,7 +358,20 @@ class GrootPickTaskspacePolicy:
             "obs_chunk_size": self.OBS_CHUNK,
             # organizer が publish する camera key で宣言する (model cam への写像は
             # backend 側で行う)。ego_view のみ保証、wrist は欠落あり。
-            "camera_keys": ["ego_view", "left_wrist", "right_wrist"],
+            # 運営 package 2026.09.21 で `ego_view_left` / `ego_view_right` が
+            # 追加された (head の実ステレオ)。宣言した key しか client が
+            # 送らないので、ここに書かないと届かない。
+            # **pick の expert (groot_pick_legs) は HEAD_RIGHT を使う**
+            # (`policies/groot_pick_legs.py:70` の 4 cam)。宣言しないと
+            # 左眼の複製が右眼として渡り、学習と違う入力になる。
+            # mono の `ego_view` も従来どおり来るので fallback は残せる。
+            "camera_keys": [
+                "ego_view",
+                "ego_view_left",
+                "ego_view_right",
+                "left_wrist",
+                "right_wrist",
+            ],
             "wants_state": True,
             "wants_prompt": True,
         }
@@ -447,7 +460,20 @@ class MultiSkillTaskspacePolicy:
             "lane": self.lane,
             "action_chunk_size": self.ACTION_CHUNK,
             "obs_chunk_size": self.OBS_CHUNK,
-            "camera_keys": ["ego_view", "left_wrist", "right_wrist"],
+            # 運営 package 2026.09.21 で `ego_view_left` / `ego_view_right` が
+            # 追加された (head の実ステレオ)。宣言した key しか client が
+            # 送らないので、ここに書かないと届かない。
+            # **pick の expert (groot_pick_legs) は HEAD_RIGHT を使う**
+            # (`policies/groot_pick_legs.py:70` の 4 cam)。宣言しないと
+            # 左眼の複製が右眼として渡り、学習と違う入力になる。
+            # mono の `ego_view` も従来どおり来るので fallback は残せる。
+            "camera_keys": [
+                "ego_view",
+                "ego_view_left",
+                "ego_view_right",
+                "left_wrist",
+                "right_wrist",
+            ],
             "wants_state": True,
             "wants_prompt": True,
         }
@@ -507,7 +533,20 @@ class OrchestratorTaskspacePolicy:
             "lane": self.lane,
             "action_chunk_size": self.ACTION_CHUNK,
             "obs_chunk_size": self.OBS_CHUNK,
-            "camera_keys": ["ego_view", "left_wrist", "right_wrist"],
+            # 運営 package 2026.09.21 で `ego_view_left` / `ego_view_right` が
+            # 追加された (head の実ステレオ)。宣言した key しか client が
+            # 送らないので、ここに書かないと届かない。
+            # **pick の expert (groot_pick_legs) は HEAD_RIGHT を使う**
+            # (`policies/groot_pick_legs.py:70` の 4 cam)。宣言しないと
+            # 左眼の複製が右眼として渡り、学習と違う入力になる。
+            # mono の `ego_view` も従来どおり来るので fallback は残せる。
+            "camera_keys": [
+                "ego_view",
+                "ego_view_left",
+                "ego_view_right",
+                "left_wrist",
+                "right_wrist",
+            ],
             "wants_state": True,
             "wants_prompt": True,
         }
