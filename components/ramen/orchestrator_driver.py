@@ -4,9 +4,9 @@
 orchestrator_io のアダプタに差し替え、boundary act(obs) 毎に tick を1回回して
 (T,25) を返す。skill 遷移 (perception[YOLO]+dwell+is_complete) は原さんの実装のまま。
 
-skill→variant (leg round):
-  rotate_table_base = RAMEN-Ori 141_c32_state_dropout / pick = groot_pick_legs_v2 (38D) /
-  insert = groot_insert_leg_200k (53D) / rotate_leg = groot_rotate_leg_200k (53D)
+skill→variant (leg round) の正本は **`policy_config.yaml` の
+`default_variant_by_skill`**。自前経路 (entrypoint) と同じ節を読む (Issue #148)。
+会場での差し替えは `RAMEN_VARIANT_<SKILL>` が勝つ。
 
 worker env: pick=RAMEN_WORKER_PYTHON (lerobot0.6.0) / 53D=RAMEN_WORKER_PYTHON_53D (0.6.1)。
 YOLO weight: RAMEN_YOLO_WEIGHT (dev 既定 outputs/yolo_obb/weights/m_lowaug_v4_flat.pt)。
@@ -50,23 +50,19 @@ from .taskspace_adapter import groot_chunk_to_taskspace
 
 _VENDOR_DESKTOP = str(Path(__file__).resolve().parent / "vendor" / "desktop")
 
-# leg round の skill → (VlaSkill class 名, policy_config variant)
+# leg round の skill → VlaSkill class 名。
 #
-# rotate_table_base は **RAMEN-Ori に確定** (2026-09-21)。GR00T の overlay 版は
-# 会場では使わない。
+# **どの ckpt で走るかの正本は `policy_config.yaml` の `default_variant_by_skill`**
+# (Issue #148)。自前経路 (`entrypoint.fill_policy_variants_from_config`) と同じ節を
+# 同じ規則で読む。ここに variant を書くと二重管理になり、実際に 2026-09-21 まで
+# pick が v2 (submit) と v1 (本体 config) で食い違っていた。
 #
-# この variant は `cams: [head_left, wrist_left, wrist_right]` の 3 カメラ版なので、
-# boundary が単一 head を複製する件 (4 cam 版だと HEAD_RIGHT が HEAD_LEFT と
-# 同じ画像になる) には当たらない。
+# 会場での差し替えは `RAMEN_VARIANT_<SKILL>` が勝つ (`_variant_override`)。
 _STAGE_SKILLS = (
-    (
-        "rotate_table_base",
-        "RotateTableBaseVlaSkill",
-        "rotate_table_base_ramen_ori_141_c32_state_dropout",
-    ),
-    ("pick_table_leg", "PickTableLegVlaSkill", "groot_pick_legs_v2"),
-    ("insert_table_leg", "InsertTableLegVlaSkill", "groot_insert_leg_200k"),
-    ("rotate_leg_to_tighten", "RotateLegToTightenVlaSkill", "groot_rotate_leg_200k"),
+    ("rotate_table_base", "RotateTableBaseVlaSkill"),
+    ("pick_table_leg", "PickTableLegVlaSkill"),
+    ("insert_table_leg", "InsertTableLegVlaSkill"),
+    ("rotate_leg_to_tighten", "RotateLegToTightenVlaSkill"),
 )
 # 脚 1 本ぶんの列を 4 回まわす。`rotate_leg_to_tighten` から `rotate_table_base` へ
 # 戻すことで `SkillState.transition()` が **n_legs_completed を +1** し、
@@ -176,7 +172,7 @@ def _resume_settings() -> _Resume:
       >= 4  entry 系が全部 False を返す
     自前経路も `orch.state.n_legs_completed = stage - 1` と種を入れている。
     """
-    names = [name for name, _cls, _v in _STAGE_SKILLS]
+    names = [name for name, _cls in _STAGE_SKILLS]
 
     def _leg(key: str, default: int) -> int:
         raw = os.environ.get(key, "").strip()
@@ -320,6 +316,29 @@ def _load_skill_config(vendor_desktop: str) -> dict:
         return yaml.safe_load(fh) or {}
 
 
+def _stage_variants(cfg_path: str) -> dict[str, str]:
+    """`policy_config.yaml` の `default_variant_by_skill` を読む (Issue #148)。
+
+    **どの ckpt で走るかの正本はこの節。** 自前経路の
+    `entrypoint.fill_policy_variants_from_config` と同じものを読む。
+
+    無い skill があれば起動時に落とす。会場で「なぜか古い ckpt で走っていた」に
+    なるより、起動しない方が安全。`RAMEN_VARIANT_<SKILL>` は後段で上書きする。
+    """
+    from inference.desktop.lower_policy.policies.config_loader import (
+        load_default_variant_by_skill,
+    )
+
+    defaults = load_default_variant_by_skill(cfg_path)
+    missing = [name for name, _cls in _STAGE_SKILLS if name not in defaults]
+    if missing:
+        raise ValueError(
+            f"{cfg_path}: default_variant_by_skill に {missing} が無い。"
+            "leg round の 4 skill は全部ここで既定を持つこと"
+        )
+    return defaults
+
+
 def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
     """`skill_config.yaml` の `max_seconds_hard` / `on_timeout` を読む。
 
@@ -358,7 +377,7 @@ def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
 
     hard: dict[str, float] = {}
     actions: dict[str, str] = {}
-    for skill_name, _cls, _variant in _STAGE_SKILLS:
+    for skill_name, _cls in _STAGE_SKILLS:
         section = skills.get(skill_name) or {}
         if "max_seconds_hard" not in section:
             continue
@@ -518,10 +537,11 @@ class OrchestratorDriver:
         #: hybrid は Dex1 の実測が要る。実測は obs 経由なのでここでは判定できず、
         #: `act()` の `_wait_for_measured_dex1` が毎 tick 見る。
         self._hybrid_needs_measured_dex1 = hybrid_pick is not None
+        stage_variants = _stage_variants(cfg_path)
         registry = {}
         policies = {}
-        for skill_name, cls_name, variant in _STAGE_SKILLS:
-            variant = _variant_override(skill_name, variant)
+        for skill_name, cls_name in _STAGE_SKILLS:
+            variant = _variant_override(skill_name, stage_variants[skill_name])
             entry = load_policy_variant(cfg_path, variant)
             skill_cls = getattr(_vla, cls_name)
             extra_skill_kwargs = None
@@ -653,7 +673,7 @@ class OrchestratorDriver:
         # (rotate_table_base 始まり) のままだと「1 本目に使わない rotate」を
         # 読んで「次に要る insert」を読まない = 最初の切替で丸ごとブロックする。
         # `RAMEN_START_LEG` / `RAMEN_START_SKILL` で再開するときも同じ。
-        names = [name for name, _cls, _v in _STAGE_SKILLS]
+        names = [name for name, _cls in _STAGE_SKILLS]
         start = names.index(self._resume.start_skill)
         order = (names[start:] + names[:start]) * _LEGS
         print(

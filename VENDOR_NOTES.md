@@ -40,10 +40,13 @@ python3 -m pytest components/ramen/tests -q
 行番号つきの diff は近傍が 1 行動いただけで当たらなくなり、しかも気付かずに image を
 焼く事故になる。完全一致のアンカー文字列で置換し、**見つからなければ同期を失敗させる**。
 
-現在 1 件:
+現在 2 件:
 - `lower_policy/policies/groot.py` — GR00T 53D worker を `RAMEN_WORKER_PYTHON_53D`
   （lerobot 0.6.1 の python）で直接起動する。container に pixi は無いので本家の
   `pixi run` 経路は fallback に回す。`Dockerfile.thor.groot` の同名 ENV と対。
+- `lower_policy/policies/groot_pick_legs.py` — pick worker の repo root 解決と
+  `RAMEN_WORKER_PYTHON`（lerobot 0.6.0 の python）起動。vendor tree では
+  `parents[4]` が vendor/desktop を指すので、worker script を持つ方を root にする。
 
 > ⚠️ `components/` 直下の自作パッチ（`transport.py` / `client.py` / `README.md`）は
 > **この script の対象外**（vendor/desktop の外）。下記「upstream 追従」節のとおり手で守る。
@@ -129,7 +132,9 @@ python3 -m pytest components/ramen/tests -q
   - `pip install lerobot[groot]==0.6.0`（torch 制約 >=2.7,<2.12 = NGC torch を保持）+ numpy 2.2.6 +
     submission reqs。inference は `[groot]` のみで足りる（dataset/training 不要 = torchcodec aarch64 回避）。
   - `ENV RAMEN_POLICY=groot_pick_real RAMEN_WORKER_PYTHON=python3`（同一 env で worker spawn）。
-  - weights（ver2-lora, private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
+  - weights（private）は runtime に HF 取得 → `docker run -e HF_TOKEN=...` 必須。
+    大会経路の pick は **ver1**（`policy_config.yaml` の `default_variant_by_skill` が正本）、
+    `RAMEN_POLICY=groot_pick_real` の単体経路は contract 固定の ver2-lora。
   - build: `docker buildx build --builder armbuilder --platform linux/arm64 \
     -f docker/Dockerfile.thor.groot -t <registry>/ramen-thor-groot:<tag> --push .`
   - ⚠️ **旧 25.08 build 検証ログ（無効化、2026-08-31）**: 当初 `nvcr.io/nvidia/pytorch:25.08-py3`

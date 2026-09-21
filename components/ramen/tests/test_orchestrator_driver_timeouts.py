@@ -36,7 +36,7 @@ def test_every_stage_skill_has_a_hard_timeout():
     """4 skill 全てに受け皿があること。1 つでも欠けるとそこで止まる。"""
     hard, actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
 
-    missing = [name for name, _cls, _variant in _STAGE_SKILLS if name not in hard]
+    missing = [name for name, _cls in _STAGE_SKILLS if name not in hard]
     assert missing == [], f"timeout が無い skill: {missing}"
     for name in hard:
         assert hard[name] > 0, f"{name}: {hard[name]}"
@@ -81,7 +81,7 @@ def test_the_orchestrator_accepts_the_maps_the_driver_builds():
     from inference.desktop.perception.stream import DetectionStream
 
     hard, actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
-    registry = {name: MockSkill(name) for name, _cls, _v in _STAGE_SKILLS}
+    registry = {name: MockSkill(name) for name, _cls in _STAGE_SKILLS}
 
     orch = Orchestrator(
         _StubPerception(),
@@ -95,7 +95,7 @@ def test_the_orchestrator_accepts_the_maps_the_driver_builds():
         ),
         SkillDispatchLowerPolicy(registry),
         initial_skill="rotate_table_base",
-        transitions={name: [] for name, _c, _v in _STAGE_SKILLS},
+        transitions={name: [] for name, _c in _STAGE_SKILLS},
         enter_check={},
         hard_timeout_by_skill=hard,
         timeout_action_by_skill=actions,

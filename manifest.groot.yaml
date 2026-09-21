@@ -294,7 +294,10 @@ thor_orin_port: 8765
 # Stage 5 の flip は RAMEN_POLICY=groot_53d_real 側:
 #   hf://Team-RAMEN/... (policy_config.yaml の groot_flip_table_n17_2_baseline)
 # pick を hybrid にするなら Qwen/Qwen3-VL-8B-Instruct も (INSTRUCTIONS.md)。
-weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1"
+# ⚠️ この値は `policy_config.yaml` の `default_variant_by_skill.pick_table_leg` と
+#    一致させること。2026-09-21 まで submit が v2、本体 config が v1 を指していた。
+#    v1 は subdir 配置なので `checkpoint_subdir: checkpoint-40000` で読む。
+weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a"
 
 # Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。
 peak_gpu_memory_thor_gb: "TBD"   # 実機測定待ち (128 GB unified)

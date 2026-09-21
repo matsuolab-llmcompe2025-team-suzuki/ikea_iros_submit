@@ -86,7 +86,7 @@ def test_residency_preloads_the_next_expert(monkeypatch):
     読み込み 約 8 秒 < 各 skill の 21〜58 秒 なので、次の 1 つで間に合う。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
 
     residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
@@ -106,7 +106,7 @@ def test_residency_preloads_the_next_expert(monkeypatch):
 def test_residency_respects_the_env_override(monkeypatch):
     """`RAMEN_GPU_MODELS=2` なら今の skill と次だけを載せる。"""
     monkeypatch.setenv("RAMEN_GPU_MODELS", "2")
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
 
     residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
     assert residency.resident == 2
@@ -158,7 +158,7 @@ def test_four_leg_loop_advances_the_counter_and_then_stops():
     from inference.desktop.orchestrator import Orchestrator, enter_never
     from inference.desktop.perception.stream import DetectionStream
 
-    names = [name for name, _c, _v in _STAGE_SKILLS]
+    names = [name for name, _c in _STAGE_SKILLS]
     orch = Orchestrator(
         _NoDetections(),
         DetectionStream(
@@ -286,7 +286,7 @@ def test_the_driver_wires_the_residency_and_tick_hook(built_driver):
 def test_the_driver_passes_the_hard_timeouts(built_driver):
     """時間切れの受け皿が 4 skill 分渡っていること。"""
     hard = built_driver._orch.hard_timeout_by_skill
-    for name, _cls, _variant in _STAGE_SKILLS:
+    for name, _cls in _STAGE_SKILLS:
         assert name in hard, name
         assert hard[name] > 0
 
@@ -323,7 +323,7 @@ def test_residency_keeps_every_expert_at_every_point_of_the_leg(monkeypatch):
     実測では脚ごとに 8.5 秒のスパイクが出ていた (2026-09-21、pod)。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
     residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     try:
@@ -346,7 +346,7 @@ def test_the_next_skill_is_always_ready_before_it_starts(monkeypatch):
     なく「必要になった時点で載っているか」。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    names = [name for name, _c, _v in _STAGE_SKILLS]
+    names = [name for name, _c in _STAGE_SKILLS]
     policies = {name: _StubPolicy(name) for name in names}
     residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
@@ -492,7 +492,7 @@ def test_the_preload_order_starts_at_the_initial_skill(monkeypatch):
     読まない = 最初の切替で丸ごとブロックする。
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    policies = {name: _StubPolicy(name) for name, _c in _STAGE_SKILLS}
 
     residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
     try:
