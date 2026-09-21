@@ -349,6 +349,8 @@ class Orchestrator:
         self.perception = perception
         self.cleaner = cleaner
         self.dispatcher = dispatcher
+        # `reset_episode()` が最初の skill に戻すために覚えておく。
+        self._initial_skill = initial_skill
         self.state = SkillState(
             current_skill=initial_skill,
             n_legs_completed=0,
@@ -799,6 +801,35 @@ class Orchestrator:
                 )
 
         return SkillAdvance()
+
+    def reset_episode(self) -> None:
+        """次の episode を最初からやり直せる状態に戻す。
+
+        **model は解放しない。** 読み直すと skill 切替と同じ待ちが発生するので、
+        `ModelResidency` が持っている常駐はそのままにする。
+
+        boundary の server は 1 本の process が動き続け、運営が episode 間に
+        `reset` を呼ぶ (`components/transport.py` の route)。ここを戻さないと
+        2 本目が **skill を一切進めないまま終わる**:
+          - `n_legs_completed` が 4 のままだと `enter_pick_table_leg` が常に False
+          - `base_rotation_start_table_top_verts` が残ると 1 本目の天板が基準になる
+          - `dispatcher` が前の skill を握ったままだと initial_skill に戻らない
+
+        自前経路 (`run_live`) は stage ごとに `Orchestrator` を作り直すので
+        呼ぶ必要は無い (呼んでも害は無い)。
+        """
+        self.dispatcher.stop()
+        self.state = SkillState(
+            current_skill=self._initial_skill,
+            n_legs_completed=0,
+        )
+        self._table_top_ring.clear()
+        self._last_frame_t = None
+        self._policy_cleaned = None
+        self._active_skill_name = None
+        self._active_skill_started_at = None
+        self._active_skill_dwell_fired = False
+        print("[orch] episode reset", file=sys.stderr)
 
     # ---- 内部 helpers ----
     def _seed_base_rotation_reference_if_needed(self) -> None:

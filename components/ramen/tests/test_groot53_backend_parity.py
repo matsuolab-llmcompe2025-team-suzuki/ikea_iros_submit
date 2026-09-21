@@ -47,7 +47,7 @@ _POLICY_CFG = str(
 
 
 def _task(variant: str) -> str | None:
-    return _variant_task(_REPO, variant, load_policy_variant(_POLICY_CFG, variant))
+    return _variant_task(variant, load_policy_variant(_POLICY_CFG, variant))
 
 
 @pytest.mark.parametrize("variant", sorted(_VARIANT_SKILL))
@@ -81,7 +81,7 @@ def test_unknown_variant_keeps_the_previous_behaviour():
     # override を持たない entry を使う (持っていると表を見る前に override が返る)。
     entry = load_policy_variant(_POLICY_CFG, "groot_insert_leg_200k")
     assert entry.policy_config.language_prompt is None
-    assert _variant_task(_REPO, "not_a_variant", entry) is None
+    assert _variant_task("not_a_variant", entry) is None
     assert _variant_dispatch_waist(_REPO, "not_a_variant") is True
 
 

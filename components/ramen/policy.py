@@ -141,7 +141,7 @@ _VARIANT_SKILL: dict[str, tuple[str, str]] = {
 }
 
 
-def _variant_task(repo: str, variant: str, entry) -> str | None:
+def _variant_task(variant: str, entry) -> str | None:
     """VlaSkill と同じ規約で prompt を決める: variant の override → class の LANGUAGE。
 
     `vla_skill.py` の `self._language_override or self.LANGUAGE`。運営から来る
@@ -251,7 +251,7 @@ class Groot53Backend(InferenceBackend):
         # した task 文字列と違うもので推論する。flip は Stage 5 の唯一の skill で、
         # 大会経路ではこの backend でしか動かせない。
         if self._task is None:
-            self._task = _variant_task(repo, variant, entry)
+            self._task = _variant_task(variant, entry)
         # waist を出すかも skill_config に従う。VlaSkill は dispatch_waist=False の
         # skill では waist actuator を叩かず、boundary の (T,25) 腰列は 0 になる。
         # ここで常に model の waist を載せると、出してはいけない skill で腰が動く。

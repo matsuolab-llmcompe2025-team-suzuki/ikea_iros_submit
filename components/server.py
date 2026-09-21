@@ -36,25 +36,22 @@ from pathlib import Path
 
 
 # --- 53D checkpoint は lerobot 0.6.1 の **親プロセス** でないと読めない -----------
-# full orchestrator (RAMEN_POLICY=groot_orchestrator) は 53D expert を
-# `assembly.load_policy` → `Gr00tPolicy.from_ckpt` → `GrootConfig.from_pretrained`
-# で **この process 内**に読む。lerobot 0.6.0 だと draccus が checkpoint の
-# config.json を弾いて
+#
+# 53D を **この process 内**に読む RAMEN_POLICY は 2 つ:
+#   groot_orchestrator … expert を assembly.load_policy で読む
+#   groot_53d_real     … RAMEN_VARIANT の 53D を直接読む
+#
+# どちらも lerobot 0.6.0 だと draccus が checkpoint の config.json を弾く。
+# エラー文言は checkpoint の型で変わるが原因は同じ (RunPod の A100 で実測):
 #     DecodingError: The fields `type` are not valid for GrootConfig
-# になる (RunPod の A100 で実測、2026-09-20)。
+#     DecodingError: The fields `type` are not valid for FurnitureGrootRuntimeConfig
 #
 # RAMEN_WORKER_PYTHON_53D は **worker にしか渡らない**ので親には効かない。
 # image の CMD は 0.6.0 の python なので、放っておくと推奨経路が丸ごと死ぬ。
 # しかも warmup の例外は下で握りつぶされるため **起動したように見える**。
 #
 # → 必要なときだけ 0.6.1 の interpreter へ張り替えて同じ引数で入り直す。
-#   (pick(38D) は 0.6.0 の親で動くので既定は変えない)
-# 53D checkpoint を **この process 内**に読む RAMEN_POLICY。
-#   groot_orchestrator … expert を assembly.load_policy で読む
-#   groot_53d_real     … RAMEN_VARIANT の 53D を直接読む
-# どちらも lerobot 0.6.1 でないと draccus が config.json を弾く。実測のエラーは
-# checkpoint の型で変わる (GrootConfig / FurnitureGrootRuntimeConfig) が同じ原因。
-# pick(38D) は worker を別 process に出すので 0.6.0 の親のままでよい。
+#   pick(38D) は worker を別 process に出すので 0.6.0 の親のままでよい。
 _POLICIES_NEEDING_LEROBOT_061 = frozenset({"groot_orchestrator", "groot_53d_real"})
 
 

@@ -386,3 +386,45 @@ def test_ramen_ori_brings_its_own_cameras_and_state_dim():
     assert len(RamenOriPolicy.CAMERAS) == 4
     assert len(GROOT_CAMERAS) == 3
     assert callable(RamenOriPolicy.build_state_from_raw)
+
+
+# ---------------------------------------------------- episode 間の reset
+def test_reset_clears_the_halt_and_the_leg_counter(built_driver):
+    """運営が episode 間に呼ぶ `reset` が停止状態を戻すこと。
+
+    戻さないと 1 本走り切った後の 2 本目が skill を一切進めないまま終わる
+    (`_advance_halted` が True のままで `advance_finished_skill` が呼ばれず、
+    `n_legs_completed` も 4 のままで `enter_pick_table_leg` が常に False)。
+    `reset` は boundary 契約の一部で `transport.py` が route している。
+    """
+    built_driver._advance_halted = True
+    built_driver._orch.state.n_legs_completed = _LEGS
+    built_driver._orch.state.transition("pick_table_leg")
+
+    built_driver.reset()
+
+    assert built_driver._advance_halted is False
+    assert built_driver._orch.state.n_legs_completed == 0
+    assert built_driver._orch.state.current_skill == "rotate_table_base"
+    assert built_driver._orch.dispatcher.active_skill_name is None
+
+
+def test_reset_keeps_the_models_resident(built_driver):
+    """reset で model を解放しないこと (読み直すと切替と同じ待ちが出る)。"""
+    before = built_driver._residency
+
+    built_driver.reset()
+
+    assert built_driver._residency is before
+
+
+def test_enter_check_fails_loudly_on_an_unregistered_skill():
+    """YOLO 判定を持たない skill は明示する。書き忘れを黙って通さない。"""
+    from components.ramen.orchestrator_driver import _YOLO_FREE_ENTRY
+    from inference.desktop.orchestrator import DEFAULT_ENTER_CHECK
+
+    candidates = {c for cands in _TRANSITIONS.values() for c in cands}
+    for c in candidates:
+        assert c in _YOLO_FREE_ENTRY or c in DEFAULT_ENTER_CHECK, c
+    # 明示リストは実在の遷移先だけであること (typo 検出)
+    assert _YOLO_FREE_ENTRY <= candidates

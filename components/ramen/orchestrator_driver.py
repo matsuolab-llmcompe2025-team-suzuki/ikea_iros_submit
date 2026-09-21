@@ -54,6 +54,10 @@ _TRANSITIONS = {
 }
 # 1 脚の skill 数 x 4。ModelResidency に渡す順序 (先読みの範囲を決める)。
 _LEGS = 4
+# YOLO の enter 条件を持たない遷移先。`rotate_table_base` は自前経路では stage の
+# 先頭なので DEFAULT_ENTER_CHECK に無い。脚のループでは「前の脚が終わったら入る」
+# ので、advance_finished_skill (dwell/timeout) に任せる。
+_YOLO_FREE_ENTRY = frozenset({"rotate_table_base"})
 # GPU に置く model の既定数 (RAMEN_GPU_MODELS で上書き)。自前経路の
 # entrypoint.DEFAULT_RESIDENT_MODELS と揃える。
 _DEFAULT_RESIDENT_MODELS = 2
@@ -190,16 +194,13 @@ class OrchestratorDriver:
 
         # skills (lazy DeferredPolicy + interceptor actuators)
         #
-        # DeferredPolicy を直接組み立てず **vendor 側の assembly.load_policy を通す**。
-        # Issue #141 で DeferredPolicy の signature が変わり
-        # (policy_cls, policy_config, label=...) → (policy_cls, *, label, loader)
-        # ここが追従できずに TypeError で起動不能になっていた
-        # (2026-09-20、RAMEN_POLICY=groot_orchestrator が丸ごと死んでいた)。
-        # 公開 API を通せば同じ事故が再発しないうえ、load 直後の warmup も付く
-        # (付けないと skill 切替の初回 forward をロボットが動いている最中に払う)。
-        # **VlaSkill を直接組み立てず assembly.build_vla_skill を通す。**
-        # 直接 `VlaCls(...)` を呼んでいた頃は、assembly が入れる 6 つが丸ごと
-        # 抜けていた (2026-09-21 に自前経路と突き合わせて判明):
+        # **VlaSkill も policy も、vendor 側の assembly.build_vla_skill を通して組む。**
+        # 自前で組むと 2 種類の事故が起きる:
+        #   - DeferredPolicy を直接呼ぶと signature 変更に追従できない
+        #     (Issue #141 の変更で TypeError になり groot_orchestrator が丸ごと
+        #      起動不能だった、2026-09-20)
+        #   - VlaCls を直接呼ぶと、assembly が入れる 6 つが丸ごと抜ける
+        #     (2026-09-21 に自前経路と突き合わせて判明):
         #   - language_override … rotate_table_base の variant は specialist 用の
         #     'rotate table base'。渡さないと class の
         #     "rotate and move table base (combined 5+7)" で推論してしまう
@@ -248,12 +249,14 @@ class OrchestratorDriver:
         # boundary 経路だけ何も残らなかった。path を渡されたときだけ書く。
         log_sink = self._build_log_sink()
         # enter_check は「候補(遷移先)skill」で引かれるので、_TRANSITIONS の values を key に。
-        # `rotate_table_base` は DEFAULT_ENTER_CHECK に無い (自前経路では stage の
-        # 先頭なので YOLO 判定を持たない)。脚のループでは「前の脚が終わったら入る」
-        # ので enter_never にして、advance_finished_skill (dwell/timeout) に任せる。
+        #
+        # ⚠️ `.get(c, enter_never)` にはしない。それだと **enter 条件の書き忘れ**まで
+        # 静かに「YOLO では永久に発火しない」に化ける。YOLO 判定を持たない skill は
+        # ここで明示し、それ以外は登録が無ければ KeyError で落とす。
         _candidates = {c for cands in _TRANSITIONS.values() for c in cands}
         enter_check = {
-            c: DEFAULT_ENTER_CHECK.get(c, enter_never) for c in _candidates
+            c: enter_never if c in _YOLO_FREE_ENTRY else DEFAULT_ENTER_CHECK[c]
+            for c in _candidates
         }
 
         self._orch = Orchestrator(
@@ -283,9 +286,12 @@ class OrchestratorDriver:
     def _build_residency(self, policies: dict):
         """次の expert を background で先読みする管理を作る (Issue #141 D7-2)。
 
-        GPU に置く数は `RAMEN_GPU_MODELS` (既定 = 全部)。Thor は 128GB unified で
-        53D は推論時 5.9GiB なので 4 つ載せても余る。全部にしておけば、最初の
-        skill が走り始めた直後から残りが裏で読まれ、切替が待ち無しになる。
+        GPU に置く数は `RAMEN_GPU_MODELS` (既定は `_DEFAULT_RESIDENT_MODELS` = 2 =
+        今の skill + 次の 1 つ)。切替を隠すのにこれで足りる: 読み込みは約 8 秒で、
+        各 skill は 21〜58 秒走るので、次の skill が始まるまでに間に合う。
+
+        **全部 (53D×4 + pick) 載せると約 26 GiB になり、機体によっては入らない。**
+        増やすときは env で明示する。
 
         これが無いと `act()` が model load でブロックする (実測 pick 24.7s /
         insert 92s / rotate_leg 69s)。その間 boundary へ (T,25) を返せない。
@@ -394,10 +400,7 @@ class OrchestratorDriver:
         self._waist.reset()
         self._hand.reset()
         result = self._orch.tick(frame)
-        # tick() は YOLO の enter_check しか見ない。is_complete / max_seconds_hard /
-        # max_dwell_sec の受け皿を自前経路と同じ method で回す。
-        # 会場は学習データと違うシーンなので、YOLO が落としたときにここが無いと
-        # skill が進まないまま stage が終わる。
+
         # 4 脚まわり切ったら止める。時間切れ前進は enter_check を見ないので、
         # 放っておくと `n_legs_completed >= 4` で enter_pick_table_leg が False を
         # 返しても timeout がループを回し続けてしまう。
@@ -410,6 +413,9 @@ class OrchestratorDriver:
                 f"[orch-driver] {_LEGS} 脚完了。以後は skill を進めない",
                 file=sys.stderr,
             )
+        # tick() は YOLO の enter_check しか見ない。is_complete / max_seconds_hard /
+        # max_dwell_sec の受け皿を自前経路と同じ method で回す。会場は学習データと
+        # 違うシーンなので、YOLO が落としたときにここが無いと skill が進まない。
         try:
             if not self._advance_halted:
                 self._orch.advance_finished_skill()
@@ -441,7 +447,16 @@ class OrchestratorDriver:
         }
 
     def reset(self) -> None:
+        """運営が episode 間に呼ぶ (`components/transport.py` の route)。
+
+        **`_advance_halted` と orchestrator 側の state を必ず戻す。** 戻さないと
+        1 本走り切った後の 2 本目が skill を一切進めないまま終わる
+        (4 脚完了で halt したまま、`n_legs_completed` も 4 のままになる)。
+        model は解放しない (読み直すと切替と同じ待ちが出る)。
+        """
         self._t = 0
+        self._advance_halted = False
+        self._orch.reset_episode()
 
     def close(self) -> None:
         for a in (self._arm, self._waist, self._hand):
