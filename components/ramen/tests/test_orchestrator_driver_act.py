@@ -460,3 +460,39 @@ def test_a_half_present_stereo_falls_back_instead_of_guessing():
     frame = drv._orch.frames[-1]
     half = frame.rgb.shape[1] // 2
     assert np.array_equal(frame.rgb[:, :half], frame.rgb[:, half:])
+
+
+# ---------------------------------------------------------------- 骨盤高さ (col 21)
+#
+# 運営の adapter は col [21] を WBC へ**リテラル転送**する
+# (`wbc_adapter/wbc_driver.py:455` の `base_height_command=[[float(r[21])]]`)。
+# 0 は「指定なし」ではなく **骨盤高さ 0 m** = 床まで沈む指令。運営側の既定は
+# `wbc_adapter/wbc_goal.py:46` の `DEFAULT_BASE_HEIGHT = 0.74`。
+# driver は `groot_chunk_to_taskspace` に base_height を渡さないので、
+# ここが実際に会場のワイヤへ出る値そのものになる。
+_NEUTRAL_BASE_HEIGHT = 0.74
+
+
+def test_the_wire_carries_a_neutral_base_height_not_zero():
+    """通常 tick の `(T,25)` が col 21 = 0.74 を載せること。"""
+    drv = _driver()
+    out = drv.act(_obs(t=1.0))
+
+    actions = np.asarray(out["actions"])
+    assert actions.shape[1] == 25
+    assert actions[:, 21] == pytest.approx(_NEUTRAL_BASE_HEIGHT)
+
+
+def test_a_held_action_also_carries_the_neutral_base_height():
+    """HOLD 中も 0 を出さないこと。
+
+    HOLD は「腕を動かさない」であって「骨盤を床へ」ではない。go-live 直後や
+    カメラ停止で最初に出るのが HOLD なので、ここが 0 だと 1 通目から沈む。
+    """
+    drv = _driver()
+    drv._orch.tick_raises = RuntimeError("expert exploded")
+    out = drv.act(_obs(t=1.0))
+
+    assert drv._hold_reason is not None
+    actions = np.asarray(out["actions"])
+    assert actions[:, 21] == pytest.approx(_NEUTRAL_BASE_HEIGHT)

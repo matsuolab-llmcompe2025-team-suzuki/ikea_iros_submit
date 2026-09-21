@@ -30,6 +30,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from inference.desktop.lower_policy.policies.taskspace_adapter import (
+    DEFAULT_BASE_HEIGHT_M,
     TASKSPACE_DIM,
     dex1_model_to_taskspace,
 )
@@ -128,11 +129,11 @@ def slerp(q0: np.ndarray, q1: np.ndarray, s: float) -> np.ndarray:
     a = np.asarray(q0, dtype=np.float64)
     b = np.asarray(q1, dtype=np.float64)
     dot = float(np.dot(a, b))
-    if dot < 0.0:                      # 近い方の回転を選ぶ
+    if dot < 0.0:  # 近い方の回転を選ぶ
         b = -b
         dot = -dot
     dot = min(1.0, max(-1.0, dot))
-    if dot > 0.9995:                   # ほぼ同じ → 線形で十分
+    if dot > 0.9995:  # ほぼ同じ → 線形で十分
         out = a + s * (b - a)
         return out / np.linalg.norm(out)
     theta = np.arccos(dot)
@@ -158,12 +159,14 @@ def taskspace_row(
     hand_left_model: float,
     hand_right_model: float,
     navigate_cmd: Sequence[float] = (0.0, 0.0, 0.0),
-    base_height_cmd: float = 0.0,
+    base_height_cmd: float = DEFAULT_BASE_HEIGHT_M,
     torso_rpy_cmd: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> np.ndarray:
     """手先姿勢と Dex1 開度から boundary の `(25,)` 1 行を作る。
 
     列割りは `taskspace_adapter` と同一。下半身は pick 系なので既定 0-hold。
+    ただし `base_height_cmd` は 0 が「0 m へ沈め」の意味になるので既定は
+    中立の `DEFAULT_BASE_HEIGHT_M` (= 0.74 m)。
 
     Args:
         left / right: 手先姿勢。
