@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-stage-dds-fix"
-    digest: "sha256:5f2d9e3aeae638a2fce288d039ebc6de1d68e11ce50716c73814827a167d0ba4"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-advance-backup"
+    digest: "sha256:8e6d54b3e92d1da6d17ea4e36c7b70bbf233a47339192633c6eb465db99390ef"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -105,8 +105,23 @@ images:
     #      → Tracing block を剥がし、build assert に
     #        `ChannelFactoryInitialize(0, "lo")` を追加した
     #
+    #  14. **大会経路に skill 前進の受け皿が無かったのを修正。**
+    #      `tick()` は YOLO の enter_check しか見ず、is_complete /
+    #      max_seconds_hard / max_dwell_sec は `run_live()` (自前経路) の局所変数に
+    #      閉じていた。boundary の driver は `tick()` を直接回すので、YOLO が
+    #      落とすと skill が進まないまま stage が終わる。会場は学習データと違う
+    #      シーンなので現実的なリスク。
+    #      → `advance_finished_skill()` に切り出して両経路から呼ぶ。driver は
+    #        skill_config.yaml の値を自前経路と同じ規約で読む
+    #        (rotate_table_base 30s / pick 21s / insert 21s / rotate_leg 58s、
+    #         いずれも on_timeout: advance)
+    #      ⚠️ 時間切れ前進は「うまくいった証拠ではない」。掴めていない脚を持った
+    #        まま insert へ進む可能性は残る。YOLO が主で、これは止まり続けるより
+    #        マシという位置づけ
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260921-orch-seedfix        … 上記 12-13 が無い。**自前経路が起動しない**
+    #      20260921-stage-dds-fix       … 上記 14 が無い。**YOLO が落ちると止まったまま**
+    #      20260921-orch-seedfix        … 上記 12-14 が無い。**自前経路が起動しない**
     #      20260920-pickfix-unbuffered  … 上記 10-13 が無い。**orchestrator が
     #        rotate_table_base から進めず、flip も起動しない**
     #      20260920-orch-lerobot61      … 上記 8-11 が無い。**pick_table_leg が必ず落ちる**
