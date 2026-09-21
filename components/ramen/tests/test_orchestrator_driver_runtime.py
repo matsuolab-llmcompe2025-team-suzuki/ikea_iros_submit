@@ -279,3 +279,44 @@ def test_the_log_sink_is_opt_in(monkeypatch, tmp_path):
     finally:
         sink.close()
     assert path.read_text(encoding="utf-8").strip() == '{"probe": 1}'
+
+
+def test_residency_keeps_every_expert_at_every_point_of_the_leg(monkeypatch):
+    """脚の末尾でも 4 つとも常駐し続けること。
+
+    ModelResidency は order を **直線**として扱い `order[i:i+resident]` を保つ。
+    1 脚ぶんの列だけを渡すと末尾 (`rotate_leg_to_tighten`、index 3) で keep が
+    自分 1 つになり、他の 3 つを毎周回解放して次の脚で読み直す。
+    実測では脚ごとに 8.5 秒のスパイクが出ていた (2026-09-21、pod)。
+    """
+    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
+    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    residency = OrchestratorDriver._build_residency(None, policies)
+
+    try:
+        for name in policies:
+            index = residency._order.index(name)
+            keep = set(residency._order[index : index + residency.resident])
+            assert keep == set(policies), (
+                f"{name} に居るとき keep が {sorted(keep)} しか無い"
+            )
+    finally:
+        residency.close()
+
+
+def test_a_full_leg_never_releases_a_model(monkeypatch):
+    """1 脚まわしても close() が呼ばれないこと (解放 = 読み直しのコスト)。"""
+    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
+    policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
+    residency = OrchestratorDriver._build_residency(None, policies)
+
+    try:
+        for _ in range(2):  # 2 脚ぶん回す
+            for name, _c, _v in _STAGE_SKILLS:
+                residency.on_skill_started(name)
+                _drain(residency)
+        assert all(p.closed == 0 for p in policies.values()), {
+            n: p.closed for n, p in policies.items()
+        }
+    finally:
+        residency.close()

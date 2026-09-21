@@ -271,7 +271,14 @@ class OrchestratorDriver:
             return None
         raw = os.environ.get("RAMEN_GPU_MODELS", "").strip()
         resident = int(raw) if raw else len(loadable)
-        order = [name for name, _cls, _v in _STAGE_SKILLS]
+        # ⚠️ ModelResidency は order を **直線**として扱う (`order[i:i+resident]` を
+        # 保ち、外れたものを解放する)。1 脚ぶんの列だけを渡すと、脚の末尾
+        # (rotate_leg_to_tighten、index 3) で keep が自分 1 つだけになり、
+        # **他の 3 つを毎周回解放して次の脚で読み直す**。実測では脚ごとに
+        # 8.5 秒のスパイクが出ていた (2026-09-21、pod 実測)。
+        # 列を 4 脚ぶんに伸ばすと、どの skill に居ても keep が 4 つを覆う
+        # (`_order.index()` は先頭の一致を返すので index は 0..3 のまま)。
+        order = [name for name, _cls, _v in _STAGE_SKILLS] * _LEGS
         print(
             f"[orch-driver] gpu models resident={resident} of {len(loadable)} "
             f"({', '.join(order)})",
