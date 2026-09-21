@@ -14,6 +14,9 @@ YOLO weight: RAMEN_YOLO_WEIGHT (dev 既定 outputs/yolo_obb/weights/m_lowaug_v4_
 会場で焼き直さずに変えられるもの (env):
   RAMEN_VARIANT_<SKILL>   expert の差し替え (例: rotate_table_base を RAMEN-Ori に)
   RAMEN_GPU_MODELS        GPU に置く model 数 (既定 2 = 今 + 次)
+  RAMEN_PICK_HYBRID=1     pick を VLM/VLA/MP の hybrid にする (Issue #148、既定 off)
+  RAMEN_PICK_VLM_ENDPOINT hybrid の VLM endpoint (既定は同梱 yaml の値)
+  RAMEN_PICK_VLM_MODEL    hybrid の served model 名
   RAMEN_ON_TIMEOUT        時間切れの動き (advance/stop)。既定は advance =
                           YOLO が外しても先へ進む。詳細は _load_stage_timeouts
 """
@@ -23,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -98,6 +102,98 @@ def _variant_override(skill_name: str, default: str) -> str:
     return override
 
 
+def _env_flag(key: str) -> bool:
+    """`1` / `true` / `yes` / `on` を真とみなす (大小文字は問わない)。"""
+    return os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class _HybridPick(NamedTuple):
+    """pick を hybrid に差し替えるのに要るもの一式。"""
+
+    skill_cls: type
+    extra_kwargs: dict
+    #: hybrid 自身の予算 (`pick_leg_hybrid.yaml` の `runtime.hard_timeout_sec`)。
+    #: skill_config の `pick_table_leg.max_seconds_hard` を **上書きする**。
+    hard_timeout_sec: float
+
+
+def _hybrid_pick_settings(skill_config: dict):
+    """`RAMEN_PICK_HYBRID=1` のとき、pick を hybrid に差し替える材料を返す。
+
+    返り値は `_HybridPick` か、env が無ければ `None`。
+    `None` のときは今までどおり GR00T の `PickTableLegVlaSkill` が使われる
+    = **既定の挙動は一切変わらない**。
+
+    会場での切り替え:
+
+        -e RAMEN_PICK_HYBRID=1
+        -e RAMEN_PICK_VLM_ENDPOINT=http://127.0.0.1:8000/v1/chat/completions
+        -e RAMEN_PICK_VLM_MODEL=Qwen/Qwen3-VL-8B-Instruct
+
+    自前経路 (`entrypoint.py` の `--pick-leg-hybrid`) と同じ構成にする:
+
+    - `phase3_executor` は `rule_based` 固定。VLA の区間 3 には有限の完了条件が
+      無く、本番では `_validate_phase3_config` も rule_based しか許さない
+    - `dispatch_waist` を **False** にする。hybrid は腰を一切出さず Regular Mode に
+      残す。`build_vla_skill` より先に潰さないと MotionLimiter の包絡と
+      `BuiltSkill` の契約が食い違う
+    - 区間 3 の終点は `insert_table_leg` の frame-0 姿勢 (正本は skill_config.yaml)
+    - pick の時間切れは **hybrid 自身の予算** (30s) と `stop` で上書きする。
+      skill_config の 21s は従来 pick 用で、VLM の揺らぎを見込んでいない。
+      `stop` なのは hybrid が有限 FSM だから: 持ち替えを確認できないまま insert へ
+      進むと、脚を落とすか腕同士がぶつかる (自前経路 entrypoint.py と同じ判断)
+
+    **endpoint は skill を組む前に probe する。** VLM が居ないことに気付けるのが
+    `pick_table_leg` に入った後だと、会場では「掴まない」としか見えない
+    (hybrid は境界が立たないまま `hard_timeout_sec` で HOLD 停止する)。
+    """
+    if not _env_flag("RAMEN_PICK_HYBRID"):
+        return None
+
+    from inference.desktop.lower_policy.initial_pose import initial_pose_from_config
+    from inference.desktop.pick_leg_hybrid.real_skill import (
+        RealPickLegHybridVlaSkill,
+        load_reference_images,
+        probe_vlm_endpoint,
+    )
+    from inference.desktop.pick_leg_hybrid.config import DEFAULT_CONFIG_PATH
+
+    config_path = os.environ.get("RAMEN_PICK_HYBRID_CONFIG", "").strip() or str(
+        DEFAULT_CONFIG_PATH
+    )
+    endpoint = os.environ.get("RAMEN_PICK_VLM_ENDPOINT", "").strip() or None
+    model = os.environ.get("RAMEN_PICK_VLM_MODEL", "").strip() or None
+
+    cfg, references = load_reference_images(
+        config_path, endpoint_override=endpoint, model_override=model
+    )
+    served = probe_vlm_endpoint(cfg, references)
+    print(
+        f"[orch-driver] pick_table_leg=hybrid (VLM {cfg.vlm.model} @ "
+        f"{cfg.vlm.endpoint}, served={sorted(served)})",
+        file=sys.stderr,
+    )
+
+    # hybrid は腰を出さない。`build_vla_skill` が読む前に潰しておく。
+    skills = skill_config.setdefault("skills", {})
+    skills.setdefault("pick_table_leg", {})["dispatch_waist"] = False
+
+    insert_initial = initial_pose_from_config(skill_config, "insert_table_leg")
+    extra = {
+        "hybrid_config_path": config_path,
+        "hybrid_vlm_endpoint": endpoint,
+        "hybrid_vlm_model": model,
+        "phase3_executor": "rule_based",
+        "next_initial_arm_target": insert_initial.arm_position_rad,
+        "next_initial_hand_target": insert_initial.dex1_target_rad,
+    }
+    return _HybridPick(
+        skill_cls=RealPickLegHybridVlaSkill,
+        extra_kwargs=extra,
+        hard_timeout_sec=float(cfg.runtime.hard_timeout_sec),
+    )
+
+
 def _load_skill_config(vendor_desktop: str) -> dict:
     """`skill_config.yaml` を丸ごと読む (`assembly` が期待する形)。
 
@@ -136,6 +232,9 @@ def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
 
     会場で危ないと判断したら `-e RAMEN_ON_TIMEOUT=stop` で YAML 側に戻せる。
     どちらで走っているかは起動ログの `actions={...}` に出る。
+
+    ⚠️ hybrid の `pick_table_leg` はこの後で 30s / `stop` に上書きされる
+    (有限 FSM なので、持ち替えを確認できないまま進まない方が正しい)。
     """
     skills = _load_skill_config(vendor_desktop).get("skills") or {}
 
@@ -256,14 +355,22 @@ class OrchestratorDriver:
         #   - skill_id_override / progress_monitor / z_ceiling / retry (現状は全て未設定)
         # assembly を通せば、今後 skill_config に設定が増えても自動で入る。
         fk_factory = _assembly.FkFactory()
+        # `RAMEN_PICK_HYBRID=1` のときだけ pick が VLM/VLA/MP に替わる (Issue #148)。
+        # env が無ければ None = 既定の GR00T のまま。
+        hybrid_pick = _hybrid_pick_settings(skill_cfg_raw)
         registry = {}
         policies = {}
         for skill_name, cls_name, variant in _STAGE_SKILLS:
             variant = _variant_override(skill_name, variant)
             entry = load_policy_variant(cfg_path, variant)
+            skill_cls = getattr(_vla, cls_name)
+            extra_skill_kwargs = None
+            if hybrid_pick is not None and skill_name == "pick_table_leg":
+                skill_cls = hybrid_pick.skill_cls
+                extra_skill_kwargs = hybrid_pick.extra_kwargs
             built = _assembly.build_vla_skill(
                 skill_name=skill_name,
-                vla_skill_cls=getattr(_vla, cls_name),
+                vla_skill_cls=skill_cls,
                 variant=entry,
                 skill_config=skill_cfg_raw,
                 waist_actuator=self._waist,
@@ -271,11 +378,24 @@ class OrchestratorDriver:
                 fk_factory=fk_factory,
                 # 先読み (ModelResidency) が読み込みと解放を握る。
                 deferred=True,
+                extra_skill_kwargs=extra_skill_kwargs,
             )
             registry[skill_name] = built.skill
             policies[skill_name] = built.policy
         dispatcher = SkillDispatchLowerPolicy(registry)
         hard_timeouts, timeout_actions = _load_stage_timeouts(_VENDOR_DESKTOP)
+        if hybrid_pick is not None:
+            # hybrid は従来 pick とは別の有限手順で、予算も別 (21s -> 30s)。
+            # YAML 側を上書きしないと、hybrid が自分の予算を使い切る前に
+            # skill 側の時間切れで切られる。`stop` も hybrid の設計どおり
+            # (確認できない持ち替えで insert へ進まない)。
+            hard_timeouts["pick_table_leg"] = hybrid_pick.hard_timeout_sec
+            timeout_actions["pick_table_leg"] = "stop"
+            print(
+                "[orch-driver] pick_table_leg timeout="
+                f"{hybrid_pick.hard_timeout_sec:g}s action=stop/HOLD (hybrid)",
+                file=sys.stderr,
+            )
 
         # policy が見る検出は planner 用とは別の、**遅れの無い** filter を通す
         # (Issue #141 D3)。渡さないと cleaner の median filter 越しの検出が
