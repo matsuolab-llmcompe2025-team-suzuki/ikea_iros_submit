@@ -102,6 +102,12 @@ rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/model/subtask_policy_training/gr00t/" \
   "${VENDOR_DESKTOP}/model/subtask_policy_training/gr00t/"
 
+# `perception/g1_urdf_fk_torch.py` が module 直下で import する。いま vendor 内に
+# その FK を使う箇所は無いが、**`inference/` 配下のコードが import している**ので
+# 入れておく。欠けていると誰かが触った瞬間に会場で ImportError になる (4 KB)。
+cp "${SOURCE_REPO}/model/subtask_policy_training/joint_layout.py" \
+   "${VENDOR_DESKTOP}/model/subtask_policy_training/joint_layout.py"
+
 # --- model/ramen_ori (RAMEN-Ori の nn.Module + Hydra config) -------------------
 #
 # `policies/ramen_ori.py` の `from_ckpt` が
