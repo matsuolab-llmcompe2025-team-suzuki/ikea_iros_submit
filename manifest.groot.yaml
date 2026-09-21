@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-ramenori"
-    digest: "sha256:6846a25500f151bdc155c3dbb45b8f7c0ad44284dd9d591701ae96690ba7563f"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-reset"
+    digest: "sha256:5c204079385559aa9e4dcc4b0778030aab18e5ae06a1cbcfefd3e77a3cf40d65"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -168,8 +168,17 @@ images:
     #      ⚠️ boundary は単一 head を複製するので HEAD_RIGHT は HEAD_LEFT と同じ
     #        画像になる (4 cam で学習した model には劣化入力だが動く)。
     #
+    #  19. 🔴 **episode 間の `reset` で停止状態が戻らなかったのを修正。**
+    #      `reset` は boundary 契約の一部で運営が episode 間に呼ぶが、
+    #      `_advance_halted` と `n_legs_completed` が残るため **1 本走り切った後の
+    #      2 本目が skill を一切進めないまま終わる**状態だった
+    #      (18 の「4 脚で止める」処理が作り込んだ)。
+    #      `Orchestrator.reset_episode()` を足して driver から呼ぶ。model は
+    #      解放しない (読み直すと切替と同じ待ちが出る)。
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260921-residency           … 上記 18 が無い (RAMEN-Ori を選べない)
+    #      20260921-ramenori            … 上記 19 が無い。**2 本目が動かない**
+    #      20260921-residency           … 上記 18-19 が無い (RAMEN-Ori を選べない)
     #      20260921-parity              … 上記 17-18 が無い。**切替のたびに 8 秒止まる**
     #      20260921-advance-backup      … 上記 15-17 が無い。**別 prompt で推論し、
     #        skill 切替のたびに 25〜92 秒止まり、脚が 1 本しか回らない**
