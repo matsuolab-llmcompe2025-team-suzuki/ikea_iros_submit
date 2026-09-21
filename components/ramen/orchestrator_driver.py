@@ -19,6 +19,10 @@ YOLO weight: RAMEN_YOLO_WEIGHT (dev 既定 outputs/yolo_obb/weights/m_lowaug_v4_
   RAMEN_PICK_VLM_MODEL    hybrid の served model 名
   RAMEN_ON_TIMEOUT        時間切れの動き (advance/stop)。既定は advance =
                           YOLO が外しても先へ進む。詳細は _load_stage_timeouts
+  RAMEN_START_LEG         何本目の脚から始めるか (既定 1)。自前経路の
+                          --phase3-start-stage 相当
+  RAMEN_END_LEG           何本目を終えたらやめるか (既定 4)。--phase3-end-stage 相当
+  RAMEN_START_SKILL       脚の途中から戻すとき。通常は RAMEN_START_LEG だけでよい
 """
 
 from __future__ import annotations
@@ -126,6 +130,77 @@ def _variant_override(skill_name: str, default: str) -> str:
 def _env_flag(key: str) -> bool:
     """`1` / `true` / `yes` / `on` を真とみなす (大小文字は問わない)。"""
     return os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class _Resume(NamedTuple):
+    """どの脚から始めてどこでやめるか。"""
+
+    start_skill: str
+    legs_done: int  # 開始時点の `n_legs_completed`
+    end_legs: int  # この本数に達したら以後 skill を進めない
+
+
+def _resume_settings() -> _Resume:
+    """`RAMEN_START_LEG` / `RAMEN_END_LEG` / `RAMEN_START_SKILL` を読む。
+
+    自前経路の `--phase3-start-stage` / `--phase3-end-stage` に相当する。
+    boundary の server は 1 本の process が走り続けるので stage を分けられないが、
+    **会場で 3 本目からやり直せないと困る**ので、同じ粒度を env で持たせる。
+
+        -e RAMEN_START_LEG=3     3 本目から (n_legs_completed=2、卓を回してから pick)
+        -e RAMEN_END_LEG=3       3 本目を終えたらそこで止める
+        -e RAMEN_START_SKILL=insert_table_leg
+                                 脚の途中から戻すとき。**物理的な前提は運用側の責任**
+                                 (insert から始めるなら既に脚を握っている必要がある)
+
+    脚番号から開始 skill が決まるのは `STAGE_SKILL_SEQUENCES` と同じ規則:
+    1 本目は卓を回さず pick から、2 本目以降は rotate_table_base から。
+
+    `n_legs_completed` は表示用の数ではなく **判定に効く**:
+      0     `enter_pick_table_leg` が Kabsch で判定
+      1..3  aspect 規則に切り替わる
+      >= 4  entry 系が全部 False を返す
+    自前経路も `orch.state.n_legs_completed = stage - 1` と種を入れている。
+    """
+    names = [name for name, _cls, _v in _STAGE_SKILLS]
+
+    def _leg(key: str, default: int) -> int:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{key} must be an integer 1..{_LEGS}, got {raw!r}")
+        if not 1 <= value <= _LEGS:
+            raise ValueError(f"{key} must be 1..{_LEGS}, got {value}")
+        return value
+
+    start_leg = _leg("RAMEN_START_LEG", 1)
+    end_leg = _leg("RAMEN_END_LEG", _LEGS)
+    if end_leg < start_leg:
+        raise ValueError(
+            f"RAMEN_END_LEG ({end_leg}) must be >= RAMEN_START_LEG ({start_leg})"
+        )
+
+    # 1 本目は卓を回さない (STAGE_SKILL_SEQUENCES[1] と同じ)。
+    start_skill = _INITIAL_SKILL if start_leg == 1 else "rotate_table_base"
+    override = os.environ.get("RAMEN_START_SKILL", "").strip()
+    if override:
+        if override not in names:
+            raise ValueError(
+                f"RAMEN_START_SKILL must be one of {names}, got {override!r}"
+            )
+        start_skill = override
+
+    resume = _Resume(start_skill=start_skill, legs_done=start_leg - 1, end_legs=end_leg)
+    if resume != _Resume(_INITIAL_SKILL, 0, _LEGS):
+        print(
+            f"[orch-driver] 再開: 脚 {start_leg}..{end_leg} / 開始 skill "
+            f"{start_skill} / n_legs_completed={resume.legs_done}",
+            file=sys.stderr,
+        )
+    return resume
 
 
 class _HybridPick(NamedTuple):
@@ -338,6 +413,8 @@ class OrchestratorDriver:
         self._ee_frame_transform = ee_frame_transform
         self._t = 0
         self._advance_halted = False
+        # どの脚から始めてどこでやめるか。env が無ければ 1..4 を頭から。
+        self._resume = _resume_settings()
         # vendor tree は __init__ で sys.path に入れるので module 直下では import
         # できない。act() から使う例外クラスをここで捕まえておく。
         self._LiveSourceSafetyError = LiveSourceSafetyError
@@ -447,7 +524,7 @@ class OrchestratorDriver:
             perception,
             cleaner,
             dispatcher,
-            initial_skill=_INITIAL_SKILL,
+            initial_skill=self._resume.start_skill,
             transitions=_TRANSITIONS,
             enter_check=enter_check,
             actuator_send_fn=self._arm.send_action,
@@ -462,6 +539,7 @@ class OrchestratorDriver:
             log_sink=log_sink,
             on_tick=self._on_tick,
         )
+        self._seed_resume_state()
         print(
             f"[orch-driver] hard timeouts={hard_timeouts} actions={timeout_actions}",
             file=sys.stderr,
@@ -501,12 +579,13 @@ class OrchestratorDriver:
         # 列を 4 脚ぶんに伸ばすと、どの skill に居ても keep が 4 つを覆う
         # (`_order.index()` は先頭の一致を返すので index は 0..3 のまま)。
         #
-        # ⚠️ 列は **`_INITIAL_SKILL` から**並べる。ModelResidency は構築時に
+        # ⚠️ 列は **実際に最初に走る skill から**並べる。ModelResidency は構築時に
         # `order[0:resident]` を先読みするので、`_STAGE_SKILLS` の並び順
         # (rotate_table_base 始まり) のままだと「1 本目に使わない rotate」を
         # 読んで「次に要る insert」を読まない = 最初の切替で丸ごとブロックする。
+        # `RAMEN_START_LEG` / `RAMEN_START_SKILL` で再開するときも同じ。
         names = [name for name, _cls, _v in _STAGE_SKILLS]
-        start = names.index(_INITIAL_SKILL)
+        start = names.index(self._resume.start_skill)
         order = (names[start:] + names[:start]) * _LEGS
         print(
             f"[orch-driver] gpu models resident={resident} of {len(loadable)} "
@@ -592,13 +671,15 @@ class OrchestratorDriver:
         self._hand.reset()
         result = self._orch.tick(frame)
 
-        # 4 脚まわり切ったら止める。時間切れ前進は enter_check を見ないので、
+        # 決めた本数まで回り切ったら止める。時間切れ前進は enter_check を見ないので、
         # 放っておくと `n_legs_completed >= 4` で enter_pick_table_leg が False を
         # 返しても timeout がループを回し続けてしまう。
-        if not self._advance_halted and self._orch.state.n_legs_completed >= _LEGS:
+        # 既定は 4 本。`RAMEN_END_LEG` で減らせる (自前経路の --phase3-end-stage 相当)。
+        end_legs = self._resume.end_legs
+        if not self._advance_halted and self._orch.state.n_legs_completed >= end_legs:
             self._advance_halted = True
             print(
-                f"[orch-driver] {_LEGS} 脚完了。以後は skill を進めない",
+                f"[orch-driver] {end_legs} 脚完了。以後は skill を進めない",
                 file=sys.stderr,
             )
         # tick() は YOLO の enter_check しか見ない。is_complete / max_seconds_hard /
@@ -648,6 +729,24 @@ class OrchestratorDriver:
         self._t = 0
         self._advance_halted = False
         self._orch.reset_episode()
+        # `reset_episode()` は n_legs_completed を 0 に戻す。3 本目から再開する
+        # 構成でそのままにすると、reset のたびに 1 本目の規則 (Kabsch) に落ちる。
+        self._seed_resume_state()
+
+    def _seed_resume_state(self) -> None:
+        """`RAMEN_START_LEG` に対応する `n_legs_completed` を入れる。
+
+        自前経路の `orch.state.n_legs_completed = stage - 1` と同じ。表示用の数では
+        なく判定に効く (0 なら Kabsch、1..3 なら aspect、>=4 で entry が全部 False)。
+        """
+        legs_done = self._resume.legs_done
+        if legs_done:
+            self._orch.state.n_legs_completed = legs_done
+            print(
+                f"[orch-driver] n_legs_completed を {legs_done} で開始 "
+                f"(脚 {legs_done + 1} 本目から)",
+                file=sys.stderr,
+            )
 
     def close(self) -> None:
         for a in (self._arm, self._waist, self._hand):

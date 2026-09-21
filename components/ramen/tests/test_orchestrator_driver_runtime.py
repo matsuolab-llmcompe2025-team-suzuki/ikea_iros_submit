@@ -28,6 +28,21 @@ from components.ramen.orchestrator_driver import (  # noqa: E402
 )
 
 
+def _driver_stub(start_skill: str | None = None):
+    """`_build_residency` だけを呼ぶための最小の self。
+
+    `_resume` (どの脚から始めるか) を見るようになったので、素の None では呼べない。
+    """
+    from components.ramen.orchestrator_driver import _LEGS as _L
+    from components.ramen.orchestrator_driver import _Resume
+
+    stub = OrchestratorDriver.__new__(OrchestratorDriver)
+    stub._resume = _Resume(
+        start_skill=start_skill or _INITIAL_SKILL, legs_done=0, end_legs=_L
+    )
+    return stub
+
+
 # ---------------------------------------------------------------- 先読み
 class _StubPolicy:
     """`prepare()` / `close()` を持つ DeferredPolicy の代役。"""
@@ -73,7 +88,7 @@ def test_residency_preloads_the_next_expert(monkeypatch):
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
     policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
 
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     assert residency is not None
     assert residency.resident == 2  # 全部載せると 53D×4 + pick で約 26 GiB
@@ -93,7 +108,7 @@ def test_residency_respects_the_env_override(monkeypatch):
     monkeypatch.setenv("RAMEN_GPU_MODELS", "2")
     policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
 
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
     assert residency.resident == 2
     residency.on_skill_started("rotate_table_base")
     _drain(residency)
@@ -246,8 +261,15 @@ def built_driver(monkeypatch):
     monkeypatch.setattr(
         OrchestratorDriver, "_resolve_yolo_weight", staticmethod(lambda ref: "stub.pt")
     )
-    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
-    monkeypatch.delenv("RAMEN_ORCH_LOG", raising=False)
+    for key in (
+        "RAMEN_GPU_MODELS",
+        "RAMEN_ORCH_LOG",
+        "RAMEN_START_LEG",
+        "RAMEN_END_LEG",
+        "RAMEN_START_SKILL",
+        "RAMEN_PICK_HYBRID",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
     drv = OrchestratorDriver()
     yield drv
@@ -302,7 +324,7 @@ def test_residency_keeps_every_expert_at_every_point_of_the_leg(monkeypatch):
     """
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
     policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     try:
         for name in policies:
@@ -326,7 +348,7 @@ def test_the_next_skill_is_always_ready_before_it_starts(monkeypatch):
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
     names = [name for name, _c, _v in _STAGE_SKILLS]
     policies = {name: _StubPolicy(name) for name in names}
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
 
     try:
         for leg in range(2):
@@ -472,7 +494,7 @@ def test_the_preload_order_starts_at_the_initial_skill(monkeypatch):
     monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
     policies = {name: _StubPolicy(name) for name, _c, _v in _STAGE_SKILLS}
 
-    residency = OrchestratorDriver._build_residency(None, policies)
+    residency = OrchestratorDriver._build_residency(_driver_stub(), policies)
     try:
         assert residency._order[0] == _INITIAL_SKILL
         assert residency._order[1] == _TRANSITIONS[_INITIAL_SKILL][0]
@@ -480,3 +502,120 @@ def test_the_preload_order_starts_at_the_initial_skill(monkeypatch):
         assert len(residency._order) == len(_STAGE_SKILLS) * _LEGS
     finally:
         residency.close()
+
+
+# ---------------------------------------------------- 途中の脚から再開する
+#
+# 自前経路の `--phase3-start-stage` / `--phase3-end-stage` に相当する。boundary の
+# server は 1 本の process が走り続けるので stage を分けられないが、**会場で
+# 3 本目からやり直せないと困る**ので同じ粒度を env で持たせている。
+@pytest.fixture
+def clean_resume_env(monkeypatch):
+    for key in ("RAMEN_START_LEG", "RAMEN_END_LEG", "RAMEN_START_SKILL"):
+        monkeypatch.delenv(key, raising=False)
+    return monkeypatch
+
+
+def test_the_default_is_the_whole_run_from_the_first_leg(clean_resume_env):
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    resume = _resume_settings()
+
+    assert resume.start_skill == _INITIAL_SKILL
+    assert resume.legs_done == 0
+    assert resume.end_legs == _LEGS
+
+
+def test_starting_at_a_later_leg_rotates_the_table_first(clean_resume_env):
+    """2 本目以降は卓を回してから pick (STAGE_SKILL_SEQUENCES[2] と同じ)。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "3")
+    resume = _resume_settings()
+
+    assert resume.start_skill == "rotate_table_base"
+    # 判定に効く数。0 だと `enter_pick_table_leg` が 1 本目の Kabsch に落ちる。
+    assert resume.legs_done == 2
+    assert resume.end_legs == _LEGS
+
+
+def test_the_end_leg_can_stop_the_run_early(clean_resume_env):
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "2")
+    clean_resume_env.setenv("RAMEN_END_LEG", "2")
+    resume = _resume_settings()
+
+    assert (resume.legs_done, resume.end_legs) == (1, 2)
+
+
+def test_a_leg_inside_a_leg_can_be_resumed(clean_resume_env):
+    """脚の途中 (insert から等) に戻す口。物理的な前提は運用側の責任。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    clean_resume_env.setenv("RAMEN_START_LEG", "2")
+    clean_resume_env.setenv("RAMEN_START_SKILL", "insert_table_leg")
+    resume = _resume_settings()
+
+    assert resume.start_skill == "insert_table_leg"
+    assert resume.legs_done == 1
+
+
+@pytest.mark.parametrize(
+    "env, match",
+    [
+        ({"RAMEN_START_LEG": "0"}, "RAMEN_START_LEG"),
+        ({"RAMEN_START_LEG": "5"}, "RAMEN_START_LEG"),
+        ({"RAMEN_START_LEG": "two"}, "RAMEN_START_LEG"),
+        ({"RAMEN_END_LEG": "9"}, "RAMEN_END_LEG"),
+        ({"RAMEN_START_LEG": "3", "RAMEN_END_LEG": "2"}, "RAMEN_END_LEG"),
+        ({"RAMEN_START_SKILL": "flip_table"}, "RAMEN_START_SKILL"),
+    ],
+)
+def test_bad_resume_settings_fail_at_startup(clean_resume_env, env, match):
+    """typo で黙って 1 本目から回り直さないこと。"""
+    from components.ramen.orchestrator_driver import _resume_settings
+
+    for key, value in env.items():
+        clean_resume_env.setenv(key, value)
+
+    with pytest.raises(ValueError, match=match):
+        _resume_settings()
+
+
+def test_the_built_driver_resumes_at_the_requested_leg(monkeypatch):
+    """組み立てまで通して、state と先読みの列が再開点に揃っていること。"""
+    import inference.desktop.perception.yolo_obb as yolo
+
+    class _StubYolo:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def predict(self, rgb):  # noqa: ANN001
+            return []
+
+    monkeypatch.setattr(yolo, "YoloObbPerception", _StubYolo)
+    monkeypatch.setattr(
+        OrchestratorDriver, "_resolve_yolo_weight", staticmethod(lambda ref: "stub.pt")
+    )
+    for key in ("RAMEN_GPU_MODELS", "RAMEN_ORCH_LOG", "RAMEN_START_SKILL",
+                "RAMEN_END_LEG", "RAMEN_PICK_HYBRID"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("RAMEN_START_LEG", "3")
+
+    drv = OrchestratorDriver()
+    try:
+        assert drv._orch.state.current_skill == "rotate_table_base"
+        assert drv._orch.state.n_legs_completed == 2
+        assert drv._residency._order[0] == "rotate_table_base"
+
+        # reset は「1 本目から」ではなく **再開点** に戻すこと。戻さないと
+        # reset のたびに enter_pick_table_leg が 1 本目の規則 (Kabsch) に落ちる。
+        drv._advance_halted = True
+        drv._orch.state.n_legs_completed = _LEGS
+        drv.reset()
+        assert drv._advance_halted is False
+        assert drv._orch.state.n_legs_completed == 2
+        assert drv._orch.state.current_skill == "rotate_table_base"
+    finally:
+        drv.close()

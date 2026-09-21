@@ -122,7 +122,29 @@ curl -fsS http://127.0.0.1:8000/health    # これが通ってから policy serv
 | `RAMEN_GPU_MODELS` | `2` | GPU に載せる model 数（今 + 次）。苦しければ `1` |
 | `RAMEN_PICK_HYBRID` | 未設定（GR00T） | `1` で pick を VLM/VLA/MP hybrid に |
 | `RAMEN_ON_TIMEOUT` | `advance` | `stop` で「時間切れなら止める」に。既定は YOLO が外しても先へ進む |
+| `RAMEN_START_LEG` | `1` | 何本目の脚から始めるか。途中で止まった run の続きをやる |
+| `RAMEN_END_LEG` | `4` | 何本目を終えたらやめるか |
+| `RAMEN_START_SKILL` | 未設定 | 脚の**途中**から戻すとき（`insert_table_leg` など） |
 | `RAMEN_ORCH_LOG` | 未設定 | `(T,25)` を JSONL に残す |
+
+### 途中の脚から再開する
+
+大会経路は 1 本の process が `pick → insert → rotate_leg → rotate_table_base → …`
+を回し続ける構成で、自前経路のように stage で切れていない。会場で 2 本目まで
+終わった状態から続けたいときは脚番号を渡す。
+
+```bash
+-e RAMEN_START_LEG=3     # 3 本目から。卓を回してから pick に入る
+```
+
+これで `n_legs_completed` が 2 で始まる。この数は表示用ではなく**判定に効く**:
+`0` だと 1 本目用の規則（Kabsch）で脚を探し、`1..3` で 2 本目以降の規則に切り替わる。
+運営が `reset` を呼んでも 1 本目には戻らず、**この再開点に戻る**。
+
+1 本目は卓を回さず `pick_table_leg` から始まる（自前経路の
+`STAGE_SKILL_SEQUENCES[1]` と同じ）。脚の途中で止まった場合だけ
+`-e RAMEN_START_SKILL=insert_table_leg` のように skill を直接指定できるが、
+**その skill が前提とする物理状態（脚を握っている等）は運用側の責任**。
 
 ## 提出時に添えるもの（運営チェックリスト、2026-08 訂正）
 1. Git repo link（無改変 `boundary/` + 各コンテナの Dockerfile）
