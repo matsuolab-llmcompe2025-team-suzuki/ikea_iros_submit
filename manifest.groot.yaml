@@ -16,10 +16,29 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-reset"
-    digest: "sha256:5c204079385559aa9e4dcc4b0778030aab18e5ae06a1cbcfefd3e77a3cf40d65"
-    #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
-    #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-venuefix"
+    digest: "sha256:59221f60c9be2456771850a59c5e804c8ecad120063d8c8f0d46eeb38715d5f6"
+    #   単一 platform (linux/arm64) の manifest。index ではないので digest はこれ 1 本。
+    #   GHCR 上で mediaType=manifest.v2+json / manifests キー無し / layers 102 を確認済み。
+    #   (buildx は既定で attestation を付けて index 化するので --provenance=false --sbom=false)
+    #   旧 tag 20260921-reset (sha256:5c204079...) は温存。
+    #
+    # --- 2026-09-21 venuefix で入ったもの (運営 interface package 2026.09.21 対応) ---
+    #   1. base_height_cmd の既定を 0.0 -> 0.74。運営 adapter は col[21] を WBC へ
+    #      リテラル転送する (wbc_adapter/wbc_driver.py:455)。0 は「指定なし」ではなく
+    #      骨盤高さ 0m = 床まで沈む指令だった。呼出側は誰も渡していないので、
+    #      既定値がそのまま go-live の 1 通目から出ていた
+    #   2. head の実ステレオ (ego_view_left/right) を使う。運営 bridge が publish して
+    #      いるのに mono を複製して「偽の右眼」で pick の expert に渡していた
+    #   3. Dex1 の実測開度を :5557 の gripper_q から読む (2 本目の SUB)。
+    #      boundary/states.py が 4 キーしか decode しないので捨てられていた。
+    #      合成 (自分の指令のエコー) から実測に置換
+    #   4. カメラを **JPEG のまま**運ぶ。運営 bridge は JPEG を配っているのに
+    #      client が Orin で展開して生 RGB を流していた。実シーンで 4.61MB -> 0.338MB、
+    #      1 GbE 実効 101MB/s に対し 45.6ms -> 3.35ms。ピクセルは byte-identical
+    #   5. stage variant の正本を policy_config.yaml の default_variant_by_skill に統一。
+    #      pick が submit 側 v2 / 本体 config v1 で食い違っていた -> v1 に統一
+    #   6. vendor 同期の穴を 2 つ修正 (pick worker script / joint_layout)
     #
     # --- eeorigin (main、#128) に入っているもの -------------------------------
     #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
