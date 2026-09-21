@@ -63,6 +63,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from boundary import ActionSink, CameraStream, StateStream  # noqa: E402
 from boundary.actions import ActionError  # noqa: E402
 from components.ramen.gripper_state import GripperStateStream  # noqa: E402
+from components.ramen.raw_camera import RawCameraStream  # noqa: E402
 from components.transport import PolicyLink  # noqa: E402
 
 LANES = ("sonic", "decoupled")
@@ -102,12 +103,19 @@ class Inference:
         state = self._states.read(timeout_ms=0) or self._states.latest()
         if frame is None or state is None:
             return None
-        # Only the cameras the server declared: three 480x640x3 images is
-        # ~2.7 MB per step raw, so shipping ones the model ignores is pure
-        # latency.
+        # Only the cameras the server declared — shipping ones the model
+        # ignores is pure latency.
+        #
+        # **JPEG のまま運ぶ。** bridge は JPEG を配っている (CONTRACT.md:78) のに、
+        # 以前はここで decode 済みの RGB ndarray を送っていた。会場リグの実写では
+        # 1 枚 68〜97 KB の JPEG が raw 900 KB に膨らむ (x9〜13)。5 枚で 4.61 MB、
+        # Thor <-> PC2 の実効 101 MB/s (1 GbE、実測) では **転送だけで 45.6 ms** =
+        # 運営 adapter の 1 周期 50 ms をほぼ使い切っていた。
+        # 再エンコードはしないので server が展開したピクセルは以前と同一。
+        # 展開は components/server.py が policy に渡す直前で 1 回だけ行う。
         return {
-            "images": {
-                k: frame.images[k] for k in self._camera_keys if k in frame.images
+            "images_jpeg": {
+                k: frame.jpegs[k] for k in self._camera_keys if k in frame.jpegs
             },
             "body_q": state.body_q,
             "base_quat": state.base_quat,
@@ -285,7 +293,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # live 判定だけは運営の実装をそのまま使い、hot loop は JPEG のまま運ぶ方を使う。
     cameras = CameraStream(host=args.orin)
+    raw_cameras = RawCameraStream(host=args.orin)
     states = StateStream(host=args.orin)
     grippers = GripperStateStream(host=args.orin)
     sink = ActionSink.for_lane(args.lane)
@@ -319,7 +329,7 @@ def main():
     link.reset()
     inference = Inference(
         link,
-        cameras,
+        raw_cameras,
         states,
         args.prompt,
         link.metadata.get("camera_keys", ["ego_view"]),
@@ -342,6 +352,7 @@ def main():
         inference.close()
         sink.close()
         cameras.close()
+        raw_cameras.close()
         states.close()
         grippers.close()
 
