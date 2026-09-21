@@ -23,6 +23,8 @@ YOLO weight: RAMEN_YOLO_WEIGHT (dev 既定 outputs/yolo_obb/weights/m_lowaug_v4_
                           --phase3-start-stage 相当
   RAMEN_END_LEG           何本目を終えたらやめるか (既定 4)。--phase3-end-stage 相当
   RAMEN_START_SKILL       脚の途中から戻すとき。通常は RAMEN_START_LEG だけでよい
+  RAMEN_HEAD_MONO=1       head の左右キーを無視して mono を複製する。head カメラが
+                          3840x1080 で開けていないとき用 (詳細は _ingest_images)
 """
 
 from __future__ import annotations
@@ -460,8 +462,12 @@ class OrchestratorDriver:
         self._last_obs_t: object = None
         self._frame_received_ns = 0
         self._head_bgr: np.ndarray | None = None
-        self._head_packed_stereo = True
+        # mono の `ego_view` しか無い tick では左右に複製する。実ステレオが
+        # 来ている tick では既に 2W 幅なので複製しない。
+        self._head_duplicate_mono = True
         self._stereo_seen = False
+        #: `RAMEN_HEAD_MONO=1` = 左右キーを無視して必ず mono 複製にする。
+        self._head_mono = _env_flag("RAMEN_HEAD_MONO")
         self._head_generation = 0
         self._head_received_ns = 0
         self._missing_images = {"head": 0, "wrist_l": 0, "wrist_r": 0}
@@ -936,10 +942,24 @@ class OrchestratorDriver:
         #
         # 複製のままだと **pick の expert に偽の右眼を渡す**ことになる
         # (`policies/groot_pick_legs.py:70` は HEAD_LEFT/HEAD_RIGHT/両手首の 4 cam)。
+        #
+        # ⚠️ `RAMEN_HEAD_MONO=1` で強制的に mono 複製へ落とせる。head カメラが
+        # 3840x1080 で開けなかった場合、運営 bridge は **警告を出しつつ左右キーを
+        # publish し続ける**:
+        #     real_orin_cameras.py:166-169
+        #       WARNING: requested 3840x1080 but camera gave WxH -- eye split
+        #       below assumes a side-by-side stereo frame and will be wrong if
+        #       this mode isn't genuinely binocular
+        # このとき左右は「モノラル画像の左半分と右半分」になる。中身は違うので
+        # 運営 preflight の byte-identical 検査 (`preflight_sensors.py:163-167`) も
+        # 通ってしまい、**こちらからは見分けが付かない**。bridge の起動ログで
+        # `head camera live at 3840x1080` を確認し、違ったらこの env を立てる。
         left, right = _bgr("ego_view_left"), _bgr("ego_view_right")
+        if self._head_mono:
+            left = right = None
         if left is not None and right is not None:
             head = np.concatenate([left, right], axis=1)  # packed (H, 2W, 3)
-            packed = False  # 既に packed
+            duplicate_mono = False  # 既に 2W 幅。複製しない
             if not self._stereo_seen:
                 self._stereo_seen = True
                 print(
@@ -948,7 +968,7 @@ class OrchestratorDriver:
                 )
         else:
             head = _bgr("ego_view")
-            packed = True  # mono を左右に複製する
+            duplicate_mono = True  # mono を左右に複製する
             if head is not None and self._stereo_seen:
                 self._stereo_seen = False
                 print(
@@ -973,7 +993,7 @@ class OrchestratorDriver:
             self._missing_images[slot] = 0
             if slot == "head":
                 self._head_bgr = bgr
-                self._head_packed_stereo = packed
+                self._head_duplicate_mono = duplicate_mono
                 self._head_generation = generation
                 self._head_received_ns = received_ns
             else:
@@ -997,7 +1017,7 @@ class OrchestratorDriver:
             self._head_bgr,
             t=self._head_generation,
             # 実ステレオを連結済みなら複製しない。mono しか無いときだけ複製する。
-            packed_stereo=self._head_packed_stereo,
+            packed_stereo=self._head_duplicate_mono,
             received_monotonic_ns=self._head_received_ns,
         )
 
@@ -1056,6 +1076,11 @@ class OrchestratorDriver:
         self._advance_halted = False
         self._hold_reason = None
         self._last_step19 = None
+        # Dex1 の実測は episode ごとに取り直す。warmup の dummy obs で入った値や
+        # 前 episode の最後のサンプルを「新鮮な実測」として持ち越さないため。
+        # ⚠️ 属性の張り替えでは駄目 (orchestrator が構築時の instance を持つ)。
+        self._dex1_src.reset()
+        self._dex1_was_measured = False
         self._orch.reset_episode()
         # `reset_episode()` は n_legs_completed を 0 に戻す。3 本目から再開する
         # 構成でそのままにすると、reset のたびに 1 本目の規則 (Kabsch) に落ちる。

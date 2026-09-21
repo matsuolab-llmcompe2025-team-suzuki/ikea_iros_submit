@@ -261,6 +261,15 @@ def _warmup_policy(policy, label: str, iters: int = 2) -> None:
             "left_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
             "right_wrist": np.zeros((480, 640, 3), dtype=np.uint8),
         },
+        # Dex1 の実測 (運営 :5557 の gripper_q と同じ生モータ角、0.0=閉)。
+        # **これが無いと `RAMEN_PICK_HYBRID=1` のとき warmup が空振りする** —
+        # hybrid は実測が無い間 expert を 1 度も走らせないので、model の compile が
+        # serve 前に済まず、本番 1 tick 目で 45 秒待つことになる。
+        # driver の `reset()` がこの値を捨てるので、本番の判定には残らない。
+        "gripper_q": {
+            "left": {"q": 0.0, "dq": 0.0, "tau_est": 0.0},
+            "right": {"q": 0.0, "dq": 0.0, "tau_est": 0.0},
+        },
         "prompt": "warmup",
     }
     t0 = time.time()

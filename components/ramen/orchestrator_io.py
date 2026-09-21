@@ -211,6 +211,20 @@ class MeasuredDex1StateSource:
         self.ever_measured = True
         return True
 
+    def reset(self) -> None:
+        """episode 間で実測の記憶を捨てる。
+
+        **差し替えではなく in-place で消すこと。** `Orchestrator` は構築時に
+        この instance を受け取って持ち続けるので、driver 側で属性を張り替えても
+        orchestrator は古い方を読み続ける。
+
+        `ever_measured` は残す (「この run で一度でも実測が取れたか」は episode を
+        またいだ診断情報として使う)。
+        """
+        self._latest = None
+        self._latest_obs_t = None
+        self._obs_t = None
+
     @property
     def measured_is_fresh(self) -> bool:
         """いま返すのが実測かどうか。"""

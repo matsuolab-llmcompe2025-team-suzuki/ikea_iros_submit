@@ -101,8 +101,9 @@ def _driver(initial_hand2=_INSERT_HAND) -> OrchestratorDriver:
     drv._last_obs_t = None
     drv._frame_received_ns = 0
     drv._head_bgr = None
-    drv._head_packed_stereo = True
+    drv._head_duplicate_mono = True
     drv._stereo_seen = False
+    drv._head_mono = False
     drv._head_generation = 0
     drv._head_received_ns = 0
     drv._missing_images = {"head": 0, "wrist_l": 0, "wrist_r": 0}
@@ -586,3 +587,59 @@ def test_the_default_path_is_not_blocked_by_a_missing_gripper():
 
     assert drv._orch.ticks == 1
     assert drv._hold_reason is None
+
+
+def test_the_stereo_keys_can_be_ignored_on_demand():
+    """`RAMEN_HEAD_MONO=1` で左右キーを無視して mono 複製に落とせること。
+
+    head カメラが 3840x1080 で開けなかった場合、運営 bridge は警告を出しつつ
+    **左右キーを publish し続ける** (`real_orin_cameras.py:166-169`)。その左右は
+    「モノラル画像の左半分と右半分」で、中身は違うので運営 preflight の
+    byte-identical 検査 (`preflight_sensors.py:163-167`) も通る。
+    こちらからは見分けが付かないので、手で落とせる必要がある。
+    """
+    drv = _driver()
+    drv._head_mono = True
+
+    drv.act(
+        _obs(
+            t=1.0,
+            images={
+                "ego_view": np.full((480, 640, 3), 50, np.uint8),
+                "ego_view_left": np.full((480, 640, 3), 10, np.uint8),
+                "ego_view_right": np.full((480, 640, 3), 200, np.uint8),
+                "left_wrist": np.zeros((480, 640, 3), np.uint8),
+                "right_wrist": np.zeros((480, 640, 3), np.uint8),
+            },
+        )
+    )
+
+    frame = drv._orch.frames[-1]
+    half = frame.rgb.shape[1] // 2
+    assert np.array_equal(frame.rgb[:, :half], frame.rgb[:, half:]), (
+        "RAMEN_HEAD_MONO=1 なのにステレオが使われている"
+    )
+    assert int(frame.rgb.max()) == 50, "ego_view ではなく左右キーを使っている"
+
+
+def test_reset_drops_the_measured_gripper_state():
+    """episode をまたいで「実測が取れている」を持ち越さないこと。
+
+    warmup の dummy obs (`server._warmup_policy`) は hybrid を空振りさせないために
+    `gripper_q` を持つ。それを本番 1 tick 目まで新鮮な実測として残すと、実機で
+    実測が来ていなくても hybrid が走り出してしまう。
+    """
+    drv = _driver()
+    obs = _obs(t=1.0)
+    obs["gripper_q"] = _gripper(0.0, -5.30)
+    drv.act(obs)
+    assert drv._dex1_src.measured_is_fresh is True
+
+    drv._orch.reset_episode = lambda: None
+    drv._seed_resume_state = lambda: None
+    drv.reset()
+
+    assert drv._dex1_src.measured_is_fresh is False
+    assert drv._dex1_was_measured is False
+    # 「この run で一度は取れた」は診断用に残す。
+    assert drv._dex1_src.ever_measured is True
