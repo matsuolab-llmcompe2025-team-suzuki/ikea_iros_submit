@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import NamedTuple
 
@@ -397,6 +399,12 @@ class OrchestratorDriver:
         )
         from inference.desktop.perception.stream import DetectionStream
         from inference.desktop.perception.yolo_obb import YoloObbPerception
+        from inference.desktop.lower_policy.initial_pose import (
+            initial_pose_from_config,
+        )
+        from inference.desktop.perception.dex1_state_source import (
+            SyntheticDex1StateSource,
+        )
 
         weight = self._resolve_yolo_weight(
             yolo_weight
@@ -413,20 +421,48 @@ class OrchestratorDriver:
         self._ee_frame_transform = ee_frame_transform
         self._t = 0
         self._advance_halted = False
+        #: HOLD の理由 (None = 通常運転)。`reset` で解ける。
+        self._hold_reason: str | None = None
+        self._last_step19: np.ndarray | None = None
+        # カメラ: 運営の obs["t"] が変わった瞬間を「届いた瞬間」として刻む。
+        self._last_obs_t: object = None
+        self._frame_received_ns = 0
+        self._head_bgr: np.ndarray | None = None
+        self._head_generation = 0
+        self._head_received_ns = 0
+        self._missing_images = {"head": 0, "wrist_l": 0, "wrist_r": 0}
         # どの脚から始めてどこでやめるか。env が無ければ 1..4 を頭から。
         self._resume = _resume_settings()
+        # 開始 skill の frame-0 の手の開度。hand state の seed と、手が未 dispatch
+        # の tick の fallback に使う (0 埋めだと `+1.0` = 全閉になる)。
+        self._initial_hand2 = tuple(
+            float(v)
+            for v in initial_pose_from_config(
+                skill_cfg_raw, self._resume.start_skill
+            ).dex1_target_rad
+        )
         # vendor tree は __init__ で sys.path に入れるので module 直下では import
         # できない。act() から使う例外クラスをここで捕まえておく。
         self._LiveSourceSafetyError = LiveSourceSafetyError
 
         # I/O adapters
         self._joint_src = BoundaryJointStateSource()
-        self._dex1_src = BoundaryDex1StateSource(dex1_open_fraction)
         self._wrist_l = BoundaryWristSource()
         self._wrist_r = BoundaryWristSource()
         self._arm = InterceptorActuator("arm")
         self._waist = InterceptorActuator("waist")
         self._hand = InterceptorActuator("hand")
+        # hand state は **自前経路と同じ合成 source** を使う。会場のリグは Dex1 の
+        # state を配信せず (`boundary/states.py`)、運営 obs にも入っていない。
+        # 以前は `BoundaryDex1StateSource((1.0, 1.0))` = 常に全開 4.5 rad の定数で、
+        # `update()` を一度も呼んでいなかった。`insert_table_leg` /
+        # `rotate_leg_to_tighten` は **脚を握った状態が frame 0** なので、
+        # 「握っているのに開いている」と毎 tick model に伝えていた (4 脚とも通る)。
+        # `command_source` に hand actuator を繋ぐと、以後は指令をエコーする。
+        self._dex1_src = SyntheticDex1StateSource(
+            self._initial_hand2, command_source=self._hand
+        )
+        _ = dex1_open_fraction  # signature 後方互換 (合成 source では使わない)
 
         # perception (YOLO) + cleaner
         perception = YoloObbPerception(weight, device=device)
@@ -646,54 +682,51 @@ class OrchestratorDriver:
         self._t += 1
         body_q = np.asarray(obs["body_q"], dtype=np.float64)
         self._joint_src.update(body_q, t=self._t)
-        images = obs.get("images", {})
-        ego = images.get("ego_view")
-        head_bgr = (
-            np.ascontiguousarray(np.asarray(ego, np.uint8)[:, :, ::-1])
-            if ego is not None
-            else np.zeros((480, 640, 3), np.uint8)
-        )
-        frame = build_frame_data(head_bgr, t=self._t, packed_stereo=True)
 
-        def _bgr(key):
-            im = images.get(key)
-            return (
-                np.ascontiguousarray(np.asarray(im, np.uint8)[:, :, ::-1])
-                if im is not None
-                else np.zeros((480, 640, 3), np.uint8)
-            )
+        # 保持中は推論しない。**`tick()` を呼び続けると、時間切れした expert が
+        # そのまま腕を動かし続ける。** 自前経路の `on_timeout: stop` は
+        # 「最後の安全 target を保持して動きを止める」なので、ここも合わせる。
+        if self._hold_reason is not None:
+            return self._held_action(body_q)
 
-        self._wrist_l.update(_bgr("left_wrist"), t=self._t)
-        self._wrist_r.update(_bgr("right_wrist"), t=self._t)
+        self._ingest_images(obs)
+        frame = self._head_frame()
 
         self._arm.reset()
         self._waist.reset()
-        self._hand.reset()
-        result = self._orch.tick(frame)
+        # ⚠️ hand は reset しない。実 publisher は最後の target を持ち続けるし、
+        # `SyntheticDex1StateSource` もここを読んで state を合成する。毎 tick
+        # None に戻すと (a) 未 dispatch tick で「全閉」を出し、(b) 握っている
+        # のに「手は開いている」と model に伝えることになる。
+        try:
+            result = self._orch.tick(frame)
+        except BaseException as exc:  # noqa: BLE001
+            # 推論の一過性エラー / worker 死亡 / shape 不一致。ここで素通りさせると
+            # transport が client 接続を切って run が終わる。自前経路は保持して
+            # operator を待つので、同じく保持に倒す。
+            self._enter_hold(f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            return self._held_action(body_q)
 
-        # 決めた本数まで回り切ったら止める。時間切れ前進は enter_check を見ないので、
-        # 放っておくと `n_legs_completed >= 4` で enter_pick_table_leg が False を
-        # 返しても timeout がループを回し続けてしまう。
+        # 決めた本数まで回り切ったら止める (以後は保持)。時間切れ前進は enter_check を
+        # 見ないので、放っておくと最後の skill が永久に締め続ける。
         # 既定は 4 本。`RAMEN_END_LEG` で減らせる (自前経路の --phase3-end-stage 相当)。
         end_legs = self._resume.end_legs
-        if not self._advance_halted and self._orch.state.n_legs_completed >= end_legs:
-            self._advance_halted = True
-            print(
-                f"[orch-driver] {end_legs} 脚完了。以後は skill を進めない",
-                file=sys.stderr,
-            )
+        if self._orch.state.n_legs_completed >= end_legs:
+            self._enter_hold(f"{end_legs} 脚完了")
+            return self._held_action(body_q)
         # tick() は YOLO の enter_check しか見ない。is_complete / max_seconds_hard /
         # max_dwell_sec の受け皿を自前経路と同じ method で回す。会場は学習データと
         # 違うシーンなので、YOLO が落としたときにここが無いと skill が進まない。
         try:
-            if not self._advance_halted:
-                self._orch.advance_finished_skill()
+            self._orch.advance_finished_skill()
         except self._LiveSourceSafetyError as exc:
-            # server は運営に (T,25) を返し続ける必要があるので落とさない。
-            # 以後は最後の skill を保持したまま進まなくなる (= `on_timeout: stop`)。
-            if not self._advance_halted:
-                self._advance_halted = True
-                print(f"[orch-driver] advance halted: {exc}", file=sys.stderr)
+            # `on_timeout: stop` / dwell 上限で遷移先が無い / カメラが止まった。
+            # server は運営に (T,25) を返し続ける必要があるので落とさず、
+            # **最後の安全 target を保持する** (自前経路の HOLD と同じ意味)。
+            self._enter_hold(str(exc))
+            return self._held_action(body_q)
+
         arms14 = (
             result.action
             if (result is not None and result.action is not None)
@@ -702,18 +735,139 @@ class OrchestratorDriver:
         if arms14 is None:
             # buffer 充填中など: 現在姿勢保持で (T,25)
             arms14 = body_q[15:29]
-        step19 = assemble_19d(self._waist.last, arms14, self._hand.last)
+        step19 = assemble_19d(
+            self._waist.last,
+            arms14,
+            self._hand.last,
+            measured_waist3=body_q[12:15],
+            fallback_hand2=self._initial_hand2,
+        )
+        self._last_step19 = step19
+        return {
+            "actions": self._taskspace(step19, body_q),
+            "current_skill": getattr(result, "current_skill", None) if result else None,
+        }
 
+    # ---------------------------------------------------------------- 観測
+    def _ingest_images(self, obs: dict) -> None:
+        """運営の `obs["images"]` を source へ流す。
+
+        **`obs["t"]` を捨てないこと。** 運営 client はここに `frame.received_at`
+        (カメラの実受信時刻) を入れている (`components/client.py`):
+
+            frame = self._cameras.read(timeout_ms=0) or self._cameras.latest()
+            return {..., "t": frame.received_at}
+
+        新しい frame が無ければ `latest()` が返るので **`t` は変わらない**。
+        つまり「カメラが止まった」がこの値で分かる。以前はここで自前のカウンタ
+        (`self._t`) を入れていたため、
+
+          - `camera_stale_roles` の年齢が常に「今」= 鮮度チェックが発火しない
+          - `detection_refreshed` が常に True = カメラが 30Hz を割っても
+            median filter が「新しい frame が来た」と誤認する
+
+        の 2 つが同時に起きていた。
+
+        受信時刻は **こちらの monotonic** で持つ。`received_at` は Orin の
+        wall clock なので、Thor と時計がずれていると年齢を直接は計算できない。
+        「`t` が変わった瞬間 = 届いた瞬間」として自前の時計で刻む。
+
+        画像が欠けた tick は **直前の画像を保持する** (以前は無言で真っ黒画像を
+        入れていた。YOLO は検出 0、policy は真っ黒 wrist で推論を続けるので、
+        症状が「動いているのに掴まない」になり切り分けられない)。
+        """
+        obs_t = obs.get("t")
+        if obs_t is not None and obs_t != self._last_obs_t:
+            self._last_obs_t = obs_t
+            self._frame_received_ns = time.monotonic_ns()
+        # 運営が t を入れない構成でも止まらないよう、未設定なら今を使う。
+        received_ns = self._frame_received_ns or time.monotonic_ns()
+        generation = int(float(obs_t) * 1e9) if obs_t is not None else int(received_ns)
+
+        images = obs.get("images") or {}
+        for key, slot in (
+            ("ego_view", "head"),
+            ("left_wrist", "wrist_l"),
+            ("right_wrist", "wrist_r"),
+        ):
+            raw = images.get(key)
+            if raw is None:
+                if self._missing_images[slot] == 0:
+                    print(
+                        f"[orch-driver] {key} が obs に無い。直前の画像を保持する",
+                        file=sys.stderr,
+                    )
+                self._missing_images[slot] += 1
+                continue
+            self._missing_images[slot] = 0
+            bgr = np.ascontiguousarray(np.asarray(raw, np.uint8)[:, :, ::-1])
+            if slot == "head":
+                self._head_bgr = bgr
+                self._head_generation = generation
+                self._head_received_ns = received_ns
+            else:
+                source = self._wrist_l if slot == "wrist_l" else self._wrist_r
+                source.update(bgr, t=generation, received_monotonic_ns=received_ns)
+
+    def _head_frame(self):
+        """head の `FrameData`。まだ 1 枚も来ていなければ真っ黒 + 受信時刻 0。
+
+        受信時刻 0 は `camera_stale_roles` が `inf` (= 来ていない) と扱うので、
+        「画像はあるが古い」と「一度も来ていない」が区別できる。
+        """
+        if self._head_bgr is None:
+            return build_frame_data(
+                np.zeros((480, 640, 3), np.uint8),
+                t=0,
+                packed_stereo=True,
+                received_monotonic_ns=0,
+            )
+        return build_frame_data(
+            self._head_bgr,
+            t=self._head_generation,
+            packed_stereo=True,
+            received_monotonic_ns=self._head_received_ns,
+        )
+
+    # ---------------------------------------------------------------- 保持
+    def _enter_hold(self, reason: str) -> None:
+        """以後 `tick()` を呼ばず、最後の安全 target を返し続ける。
+
+        自前経路は `run_live` を抜けて HOLD ハンドラ → controlled release に入るが、
+        boundary の server は運営へ `(T,25)` を返し続ける必要があり process を
+        抜けられない。**「返し続けるが新しい動きは作らない」**がこちらの HOLD。
+        `reset` で解ける。
+        """
+        if self._hold_reason is not None:
+            return
+        self._hold_reason = reason
+        self._advance_halted = True
+        print(f"[orch-driver] HOLD: {reason}", file=sys.stderr)
+        sink = getattr(self._orch, "log_sink", None)
+        if sink is not None:
+            # 障害直前のログが buffer に残ったまま container が落ちるのを防ぐ。
+            try:
+                sink.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _held_action(self, body_q: np.ndarray) -> dict:
+        """現在の実測姿勢 + 直近の手指令で `(T,25)` を組む (新しい動きは作らない)。"""
+        hand2 = self._hand.last if self._hand.last is not None else self._initial_hand2
+        step19 = assemble_19d(None, body_q[15:29], hand2, measured_waist3=body_q[12:15])
+        return {
+            "actions": self._taskspace(step19, body_q),
+            "current_skill": self._orch.state.current_skill,
+        }
+
+    def _taskspace(self, step19: np.ndarray, body_q: np.ndarray) -> np.ndarray:
+        """19D (waist3 + arms14 + hand2) → 運営の `(T,25)`。"""
         body29 = np.concatenate([body_q[:12], step19[0:3], step19[3:17]])
         root = np.array([0, 0, 0.70, 1, 0, 0, 0], dtype=np.float64)
         action38 = np.concatenate([root, body29, step19[17:19]])[None, :]  # (1,38)
-        actions = groot_chunk_to_taskspace(
+        return groot_chunk_to_taskspace(
             action38, self._fk, ee_frame_transform=self._ee_frame_transform
         )
-        return {
-            "actions": actions,
-            "current_skill": getattr(result, "current_skill", None) if result else None,
-        }
 
     def reset(self) -> None:
         """運営が episode 間に呼ぶ (`components/transport.py` の route)。
@@ -728,6 +882,8 @@ class OrchestratorDriver:
         """
         self._t = 0
         self._advance_halted = False
+        self._hold_reason = None
+        self._last_step19 = None
         self._orch.reset_episode()
         # `reset_episode()` は n_legs_completed を 0 に戻す。3 本目から再開する
         # 構成でそのままにすると、reset のたびに 1 本目の規則 (Kabsch) に落ちる。
