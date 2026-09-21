@@ -42,6 +42,7 @@ from .orchestrator_io import (
     BoundaryJointStateSource,
     BoundaryWristSource,
     InterceptorActuator,
+    MeasuredDex1StateSource,
     assemble_19d,
     build_frame_data,
 )
@@ -109,6 +110,10 @@ _CAMERA_STALE_TIMEOUT_S = 0.50
 # `dispatcher.start()` の同期ロード (起動直後 45s / 切替 8〜16s) を挟むので、
 # 0.5s のままだと model を読むたびに誤発火する。
 _ORCH_CAMERA_STALE_TIMEOUT_S = 120.0
+# `RAMEN_PICK_HYBRID=1` のとき、Dex1 の実測が来るのを待つ tick 数。運営 client は
+# 20 Hz 前後で act() を叩くので 100 tick ≒ 5 秒。bridge は 50 Hz なので、
+# 正常なら 1 tick 目から入っている。
+_DEX1_HYBRID_GRACE_TICKS = 100
 
 
 def _variant_override(skill_name: str, default: str) -> str:
@@ -462,17 +467,25 @@ class OrchestratorDriver:
         self._arm = InterceptorActuator("arm")
         self._waist = InterceptorActuator("waist")
         self._hand = InterceptorActuator("hand")
-        # hand state は **自前経路と同じ合成 source** を使う。会場のリグは Dex1 の
-        # state を配信せず (`boundary/states.py`)、運営 obs にも入っていない。
+        # hand state は **実測優先、来なければ合成**。
+        #
+        # 実測は運営 bridge が `:5557` に載せている `gripper_q` (2026-09-21 版から)。
+        # `boundary/states.py` が捨てるので `components/client.py` が 2 本目の SUB で
+        # 拾って `obs["gripper_q"]` に入れる (`components/ramen/gripper_state.py`)。
+        #
+        # 合成 (`SyntheticDex1StateSource`) は **自分の hand 指令のエコー**。
         # 以前は `BoundaryDex1StateSource((1.0, 1.0))` = 常に全開 4.5 rad の定数で、
         # `update()` を一度も呼んでいなかった。`insert_table_leg` /
         # `rotate_leg_to_tighten` は **脚を握った状態が frame 0** なので、
         # 「握っているのに開いている」と毎 tick model に伝えていた (4 脚とも通る)。
         # `command_source` に hand actuator を繋ぐと、以後は指令をエコーする。
-        self._dex1_src = SyntheticDex1StateSource(
+        self._dex1_synth = SyntheticDex1StateSource(
             self._initial_hand2, command_source=self._hand
         )
-        _ = dex1_open_fraction  # signature 後方互換 (合成 source では使わない)
+        self._dex1_src = MeasuredDex1StateSource(fallback=self._dex1_synth)
+        #: 実測に切り替わった/戻ったログを 1 度だけ出すための直近状態。
+        self._dex1_was_measured = False
+        _ = dex1_open_fraction  # signature 後方互換 (source 側が値を持つ)
 
         # perception (YOLO) + cleaner
         perception = YoloObbPerception(weight, device=device)
@@ -502,6 +515,9 @@ class OrchestratorDriver:
         # `RAMEN_PICK_HYBRID=1` のときだけ pick が VLM/VLA/MP に替わる (Issue #148)。
         # env が無ければ None = 既定の GR00T のまま。
         hybrid_pick = _hybrid_pick_settings(skill_cfg_raw)
+        #: hybrid は Dex1 の実測が要る。実測は obs 経由なのでここでは判定できず、
+        #: `act()` の `_wait_for_measured_dex1` が毎 tick 見る。
+        self._hybrid_needs_measured_dex1 = hybrid_pick is not None
         registry = {}
         policies = {}
         for skill_name, cls_name, variant in _STAGE_SKILLS:
@@ -699,11 +715,16 @@ class OrchestratorDriver:
         self._t += 1
         body_q = np.asarray(obs["body_q"], dtype=np.float64)
         self._joint_src.update(body_q, t=self._t)
+        self._ingest_gripper(obs)
 
         # 保持中は推論しない。**`tick()` を呼び続けると、時間切れした expert が
         # そのまま腕を動かし続ける。** 自前経路の `on_timeout: stop` は
         # 「最後の安全 target を保持して動きを止める」なので、ここも合わせる。
         if self._hold_reason is not None:
+            return self._held_action(body_q)
+
+        # hybrid は実測が要る (理由は `_wait_for_measured_dex1`)。取れるまで動かない。
+        if self._hybrid_needs_measured_dex1 and not self._wait_for_measured_dex1():
             return self._held_action(body_q)
 
         self._ingest_images(obs)
@@ -766,6 +787,70 @@ class OrchestratorDriver:
             "actions": self._taskspace(step19, body_q),
             "current_skill": getattr(result, "current_skill", None) if result else None,
         }
+
+    # ---------------------------------------------------------------- Dex1 実測
+    def _ingest_gripper(self, obs: dict) -> None:
+        """`obs["gripper_q"]` (運営 `:5557` の実測) を state source へ流す。
+
+        `components/client.py` が 2 本目の SUB で拾って入れている
+        (`boundary/states.py` は 4 キーしか decode しないため)。キーが無いのは
+        旧 client、値が None なのは bridge が旧版かリグが 35 スロット未満の場合。
+        どちらも合成 (指令のエコー) に落ちるだけで run は止めない。
+        """
+        self._dex1_src.update(obs.get("gripper_q"), t=self._t, obs_t=obs.get("t"))
+        measured = self._dex1_src.measured_is_fresh
+        if measured == self._dex1_was_measured:
+            return
+        self._dex1_was_measured = measured
+        if measured:
+            print(
+                "[orch-driver] Dex1 は実測 state を使う (:5557 の gripper_q)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[orch-driver] Dex1 の実測が来ていない -> 合成 (自分の指令のエコー) "
+                "にする。hybrid は使えない",
+                file=sys.stderr,
+            )
+
+    def _wait_for_measured_dex1(self) -> bool:
+        """hybrid が動いてよいか。実測が無ければ False (呼び出し側は保持)。
+
+        hybrid の区間 1->2 は **実測 - 指令** で把持を判定する (`interlock.py`)。
+        合成 state は指令のエコーなので差が恒等的に 0 になり、`is_grasping` は
+        永久に False。`boundary.require_interlock: true` なので VLM 単独でも
+        進めず、境界が立たないまま `hard_timeout_sec` (30s) で HOLD する。
+        **会場では「掴まない」としか見えない**ので、実測が無いうちは expert を
+        1 度も走らせない。
+
+        判定を起動時ではなくここで行うのは、実測が `obs` 経由で来るから。
+        driver を組む時点ではまだ 1 通も届いていない。
+
+        猶予を過ぎても来なければ sticky な HOLD に倒す。復旧不能な設定ミス
+        (bridge が旧版 / client が `gripper_q` を載せていない) を、運営スロットの
+        中で延々と待ち続けないため。
+        """
+        if self._dex1_src.measured_is_fresh:
+            return True
+        if self._t <= _DEX1_HYBRID_GRACE_TICKS:
+            if self._t == 1:
+                print(
+                    "[orch-driver] RAMEN_PICK_HYBRID=1: Dex1 の実測を待っている "
+                    f"(最大 {_DEX1_HYBRID_GRACE_TICKS} tick)",
+                    file=sys.stderr,
+                )
+            return False
+        self._enter_hold(
+            "RAMEN_PICK_HYBRID=1 は Dex1 の実測 state を要求するが、"
+            f"{_DEX1_HYBRID_GRACE_TICKS} tick 待っても obs['gripper_q'] が来ない。"
+            "把持判定 (interlock) は 実測 - 指令 の差を見るので、合成 "
+            "(自分の指令のエコー) では差が恒等的に 0 になり一度も発火しない。"
+            " 運営 bridge (real_orin_state.py) が 2026-09-21 版か確認するか、"
+            "RAMEN_PICK_HYBRID を外して既定の GR00T pick で走らせること "
+            "(docs/handoff/connection_test_20260927.md)"
+        )
+        return False
 
     # ---------------------------------------------------------------- 観測
     def _ingest_images(self, obs: dict) -> None:

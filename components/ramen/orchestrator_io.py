@@ -6,6 +6,8 @@ Ros2FrameSource) に密結合しているので、それらを boundary obs/acti
 
 - `BoundaryJointStateSource`: boundary body_q(29) を注入し get() で JointStateData 互換を返す。
 - `BoundaryDex1StateSource`: Dex1 開度を注入し get() で Dex1StateData 互換を返す。
+- `MeasuredDex1StateSource`: 運営 `:5557` の `gripper_q` (実測) を注入。来ない間は
+  fallback (合成) に委譲する。
 - `InterceptorActuator`: send_action(a) で最新 action を捕捉 (robot へ送らない)。
   VlaSkill は 19D を waist3→waist_actuator / arms14→dispatcher return / hand2→hand_actuator に
   分配するので、waist・hand を interceptor 化し、arms は tick 結果 (TickResult.action) から取る。
@@ -57,6 +59,32 @@ G1_JOINT_NAMES: tuple[str, ...] = (
 )
 
 DEX1_OPEN_VALUE = 4.5  # Dex1 physical open [rad]
+
+# 運営リグの Dex1-1 生モータ角。`tools/run_wbc_with_dex1.py:49-50,65-66`:
+#     q =  0.00  CLOSED
+#     q = -5.30  OPEN     <- sign is FLIPPED vs Unitree's reference
+# 我々の model 空間 (0=閉 .. DEX1_OPEN_VALUE=全開) とは **全開の表し方が違うだけ**で、
+# 比率で写せば端点も中間も一致する (両方とも「その手の全開」を指している)。
+DEX1_ORGANIZER_CLOSED_Q = 0.0
+DEX1_ORGANIZER_OPEN_Q = -5.30
+
+# 実測が途切れたとみなすまでの時間。カメラと同じ基準 (_CAMERA_STALE_TIMEOUT_S)。
+# bridge は 50 Hz なので、これを超えるのは bridge 自体が止まったとき。
+DEX1_MEASURED_STALE_S = 0.5
+
+
+def gripper_q_to_model_rad(q: float) -> float:
+    """運営の生モータ角 → こちらの model 空間 [0(閉) .. DEX1_OPEN_VALUE(全開)]。
+
+    `taskspace_adapter.dex1_model_to_taskspace` →
+    `run_wbc_with_dex1.hand_norm_to_dex1_q` の逆写像。往復すると元に戻る:
+
+        model 4.5 → norm -1 → q -5.30 → model 4.5   (全開)
+        model 0.0 → norm +1 → q  0.00 → model 0.0   (全閉)
+    """
+    span = DEX1_ORGANIZER_OPEN_Q - DEX1_ORGANIZER_CLOSED_Q
+    frac_open = (float(q) - DEX1_ORGANIZER_CLOSED_Q) / span
+    return float(np.clip(frac_open, 0.0, 1.0) * DEX1_OPEN_VALUE)
 
 
 @dataclass
@@ -117,6 +145,85 @@ class BoundaryDex1StateSource:
             right_received_monotonic_ns=self._t,
             t=self._t,
         )
+
+
+class MeasuredDex1StateSource:
+    """`:5557` の `gripper_q` (実測) を注入 → get() で Dex1StateData 互換を返す。
+
+    実測がまだ来ていない / 途切れた間は `fallback` に委譲する。`fallback` は
+    `SyntheticDex1StateSource` (= 自分の hand 指令のエコー) を想定していて、
+    **会場で bridge が古い版だったときも今までどおり動く**ようにしてある。
+
+    実測が入ると何が変わるか:
+      - `insert_table_leg` / `rotate_leg_to_tighten` の `hand_state` が
+        「指令どおり閉じた仮定」ではなく実際の開度になる
+      - `pick_leg_hybrid` の interlock (`実測 - 指令`) が意味を持つ。
+        合成では差が恒等的に 0 なので一度も発火しない
+
+    Args:
+        fallback: 実測が無い間に使う source。`get()` を持てば何でもよい。
+        stale_after_s: 最後の実測からこの時間を超えたら fallback に戻る。
+    """
+
+    def __init__(
+        self, fallback: Any = None, *, stale_after_s: float = DEX1_MEASURED_STALE_S
+    ) -> None:
+        self._fallback = fallback
+        self._stale_after_s = float(stale_after_s)
+        self._latest: _Dex1StateData | None = None
+        self._latest_obs_t: float | None = None
+        self._obs_t: float | None = None
+        #: 一度でも実測が取れたか。起動診断とログに使う (途切れても False に戻さない)。
+        self.ever_measured = False
+
+    def update(self, gripper_q: Any, t: int, *, obs_t: float | None = None) -> bool:
+        """`obs["gripper_q"]` を取り込む。取り込めたら True。
+
+        Args:
+            gripper_q: `gripper_state.GripperStateStream.poll()` が返す生の dict、
+                または None (bridge が載せていない / 旧 client)。
+            t: 世代カウンタ (Dex1StateData.t に入れる)。
+            obs_t: 運営 client の frame 時刻。鮮度判定に使う。None なら
+                「常に新鮮」とみなす (時刻が取れない経路での退行を避ける)。
+        """
+        self._obs_t = obs_t
+        if not isinstance(gripper_q, dict):
+            return False
+        try:
+            positions = np.asarray(
+                [
+                    gripper_q_to_model_rad(gripper_q[side]["q"])
+                    for side in ("left", "right")
+                ],
+                dtype=np.float64,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not np.all(np.isfinite(positions)):
+            return False
+        self._latest = _Dex1StateData(
+            position_rad=positions,
+            left_received_monotonic_ns=int(t),
+            right_received_monotonic_ns=int(t),
+            t=int(t),
+        )
+        self._latest_obs_t = obs_t
+        self.ever_measured = True
+        return True
+
+    @property
+    def measured_is_fresh(self) -> bool:
+        """いま返すのが実測かどうか。"""
+        if self._latest is None:
+            return False
+        if self._latest_obs_t is None or self._obs_t is None:
+            return True
+        return (self._obs_t - self._latest_obs_t) <= self._stale_after_s
+
+    def get(self) -> Any:
+        if self.measured_is_fresh:
+            return self._latest
+        return self._fallback.get() if self._fallback is not None else None
 
 
 class InterceptorActuator:

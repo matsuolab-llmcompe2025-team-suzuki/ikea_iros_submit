@@ -39,6 +39,7 @@ from components.ramen.orchestrator_io import (  # noqa: E402
     BoundaryJointStateSource,
     BoundaryWristSource,
     InterceptorActuator,
+    MeasuredDex1StateSource,
 )
 from inference.desktop.perception.dex1_state_source import (  # noqa: E402
     SyntheticDex1StateSource,
@@ -114,9 +115,12 @@ def _driver(initial_hand2=_INSERT_HAND) -> OrchestratorDriver:
     drv._arm = InterceptorActuator("arm")
     drv._waist = InterceptorActuator("waist")
     drv._hand = InterceptorActuator("hand")
-    drv._dex1_src = SyntheticDex1StateSource(
+    drv._dex1_synth = SyntheticDex1StateSource(
         drv._initial_hand2, command_source=drv._hand
     )
+    drv._dex1_src = MeasuredDex1StateSource(fallback=drv._dex1_synth)
+    drv._dex1_was_measured = False
+    drv._hybrid_needs_measured_dex1 = False
     drv._fk = G1WristFK.from_urdf()
     drv._ee_frame_transform = None
     drv._orch = _FakeOrch()
@@ -496,3 +500,89 @@ def test_a_held_action_also_carries_the_neutral_base_height():
     assert drv._hold_reason is not None
     actions = np.asarray(out["actions"])
     assert actions[:, 21] == pytest.approx(_NEUTRAL_BASE_HEIGHT)
+
+
+# ---------------------------------------------------------------- Dex1 実測 state
+#
+# 運営 bridge は 2026-09-21 版から `:5557` に `gripper_q` を載せている
+# (`reference/orin_bridge/real_orin_state.py:41-46,67`)。`boundary/states.py` が
+# 捨てるので client が 2 本目の SUB で拾い、`obs["gripper_q"]` で渡してくる。
+def _gripper(left_q: float, right_q: float) -> dict:
+    return {
+        "left": {"q": left_q, "dq": 0.0, "tau_est": 0.1},
+        "right": {"q": right_q, "dq": 0.0, "tau_est": 0.2},
+    }
+
+
+def test_the_measured_gripper_replaces_the_synthetic_hand_state():
+    """実測が来たら合成ではなくそれを model に渡すこと。
+
+    合成は**自分の指令のエコー**なので、滑りも把持失敗も見えない。実測が
+    来ているのに使わないと、insert / rotate_leg の state が学習分布から外れる。
+    """
+    drv = _driver()
+    obs = _obs(t=1.0)
+    obs["gripper_q"] = _gripper(0.0, -5.30)  # 左が全閉、右が全開
+    drv.act(obs)
+
+    state = drv._dex1_src.get()
+    assert state.position_rad == pytest.approx([0.0, 4.5])
+    assert drv._dex1_src.measured_is_fresh is True
+
+
+def test_without_a_measured_gripper_the_synthetic_source_still_runs():
+    """旧 bridge / 旧 client でも今までどおり動くこと。"""
+    drv = _driver()
+    drv.act(_obs(t=1.0))  # gripper_q のキー自体が無い
+
+    assert drv._dex1_src.measured_is_fresh is False
+    state = drv._dex1_src.get()
+    # 合成は開始 skill の frame-0 値から始まる (定数 4.5 ではない)。
+    assert state.position_rad == pytest.approx(_INSERT_HAND, abs=1e-3)
+
+
+def test_the_hybrid_holds_until_the_measured_gripper_arrives():
+    """hybrid は実測が来るまで expert を 1 度も走らせないこと。
+
+    区間 1->2 の判定は `実測 - 指令` を見る (interlock.py)。合成は指令のエコーな
+    ので差が恒等的に 0 になり `is_grasping` が一度も発火せず、境界が立たないまま
+    30 秒で HOLD する。会場では「掴まない」としか見えない。
+    """
+    drv = _driver()
+    drv._hybrid_needs_measured_dex1 = True
+
+    drv.act(_obs(t=1.0))  # 実測なし
+    assert drv._orch.ticks == 0
+    assert drv._hold_reason is None, "まだ猶予中なので sticky HOLD にはしない"
+
+    obs = _obs(t=2.0)
+    obs["gripper_q"] = _gripper(0.0, -5.30)
+    drv.act(obs)
+    assert drv._orch.ticks == 1
+
+
+def test_the_hybrid_gives_up_after_the_grace_period():
+    """猶予を過ぎても実測が来なければ sticky な HOLD に倒すこと。
+
+    復旧不能な設定ミス (bridge が旧版 / client が載せていない) を、運営スロットの
+    中で延々と待ち続けないため。
+    """
+    from components.ramen.orchestrator_driver import _DEX1_HYBRID_GRACE_TICKS
+
+    drv = _driver()
+    drv._hybrid_needs_measured_dex1 = True
+    for i in range(_DEX1_HYBRID_GRACE_TICKS + 1):
+        drv.act(_obs(t=1.0 + i * 0.05))
+
+    assert drv._orch.ticks == 0
+    assert drv._hold_reason is not None
+    assert "gripper_q" in drv._hold_reason
+
+
+def test_the_default_path_is_not_blocked_by_a_missing_gripper():
+    """hybrid を使わない既定の GR00T pick は実測が無くても走ること。"""
+    drv = _driver()  # _hybrid_needs_measured_dex1 = False
+    drv.act(_obs(t=1.0))
+
+    assert drv._orch.ticks == 1
+    assert drv._hold_reason is None
