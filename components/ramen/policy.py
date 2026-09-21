@@ -15,6 +15,7 @@ boundary Policy 契約 (`components/server.py`):
 from __future__ import annotations
 
 import abc
+import sys
 
 import numpy as np
 
@@ -128,6 +129,52 @@ class GrootWorkerBackend(InferenceBackend):
         self._worker.close()
 
 
+# 53D variant → その skill を担う VlaSkill class 名。prompt と dispatch_waist を
+# 自前経路と同じ場所から引くために要る (variant だけでは skill 名が判らない)。
+_VARIANT_SKILL: dict[str, tuple[str, str]] = {
+    "groot_overlay": ("rotate_table_base", "RotateTableBaseVlaSkill"),
+    "groot_insert_leg_200k": ("insert_table_leg", "InsertTableLegVlaSkill"),
+    "groot_rotate_leg_200k": ("rotate_leg_to_tighten", "RotateLegToTightenVlaSkill"),
+    "groot_flip_table_n17_2_baseline": ("flip_table", "FlipTableVlaSkill"),
+    "groot_flip_table_n17_4": ("flip_table", "FlipTableVlaSkill"),
+    "groot_flip_table_insertion_candidate": ("flip_table", "FlipTableVlaSkill"),
+}
+
+
+def _variant_task(repo: str, variant: str, entry) -> str | None:
+    """VlaSkill と同じ規約で prompt を決める: variant の override → class の LANGUAGE。
+
+    `vla_skill.py` の `self._language_override or self.LANGUAGE`。運営から来る
+    prompt をそのまま使うと、model が学習した task 文字列と違うもので推論する。
+    """
+    override = entry.policy_config.language_prompt
+    if override:
+        return str(override)
+    mapping = _VARIANT_SKILL.get(variant)
+    if mapping is None:
+        return None  # 未知の variant は従来どおり obs の prompt に任せる
+    from inference.desktop.lower_policy.skills import vla_skill as _vla
+
+    return getattr(getattr(_vla, mapping[1]), "LANGUAGE", None)
+
+
+def _variant_dispatch_waist(repo: str, variant: str) -> bool:
+    """`skill_config.yaml` の `dispatch_waist`。未知の variant は従来どおり True。"""
+    mapping = _VARIANT_SKILL.get(variant)
+    if mapping is None:
+        return True
+    import os
+
+    import yaml
+
+    path = os.path.join(
+        repo, "inference/desktop/lower_policy/configs/skill_config.yaml"
+    )
+    with open(path, encoding="utf-8") as fh:
+        skills = (yaml.safe_load(fh) or {}).get("skills") or {}
+    return bool((skills.get(mapping[0]) or {}).get("dispatch_waist", True))
+
+
 class Groot53Backend(InferenceBackend):
     """53D LeRobot GR00T backend (rotate_table_base / insert / rotate_leg / flip)。
 
@@ -199,6 +246,22 @@ class Groot53Backend(InferenceBackend):
         cls = resolve_policy_class(entry.policy_type)
         self._policy = cls.from_ckpt(entry.policy_config)
 
+        # prompt は VlaSkill と同じ規約で決める (vla_skill.py: `self._language_override
+        # or self.LANGUAGE`)。ここを運営から来る prompt 任せにすると、model が学習
+        # した task 文字列と違うもので推論する。flip は Stage 5 の唯一の skill で、
+        # 大会経路ではこの backend でしか動かせない。
+        if self._task is None:
+            self._task = _variant_task(repo, variant, entry)
+        # waist を出すかも skill_config に従う。VlaSkill は dispatch_waist=False の
+        # skill では waist actuator を叩かず、boundary の (T,25) 腰列は 0 になる。
+        # ここで常に model の waist を載せると、出してはいけない skill で腰が動く。
+        self._dispatch_waist = _variant_dispatch_waist(repo, variant)
+        print(
+            f"[53d] variant={variant} task={self._task!r} "
+            f"dispatch_waist={self._dispatch_waist}",
+            file=sys.stderr,
+        )
+
     @staticmethod
     def _bgr(images: dict, key: str) -> np.ndarray:
         img = images.get(key)
@@ -235,7 +298,12 @@ class Groot53Backend(InferenceBackend):
         legs12 = body_q[:12].astype(np.float64)
         rows = []
         for row in action19:
-            body29 = np.concatenate([legs12, row[self._WAIST], row[self._ARMS]])
+            waist3 = (
+                row[self._WAIST]
+                if self._dispatch_waist
+                else np.zeros(3, dtype=np.float64)
+            )
+            body29 = np.concatenate([legs12, waist3, row[self._ARMS]])
             rows.append(
                 np.concatenate([_ROOT_PROXY_XYZ_WXYZ, body29, row[self._HANDS]])
             )
