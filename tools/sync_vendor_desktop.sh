@@ -102,6 +102,20 @@ rsync -a "${RSYNC_EXCLUDES[@]}" \
   "${SOURCE_REPO}/model/subtask_policy_training/gr00t/" \
   "${VENDOR_DESKTOP}/model/subtask_policy_training/gr00t/"
 
+# --- model/ramen_ori (RAMEN-Ori の nn.Module + Hydra config) -------------------
+#
+# `policies/ramen_ori.py` の `from_ckpt` が
+#   from model.ramen_ori.model import RamenOriPolicy
+#   from model.ramen_ori.vision_backbone import load_vision_backbone
+# を import し、Hydra が `configs/` を読む。推論に lerobot は要らない
+# (training env の pixi.toml が fork を使うだけで、推論側は torch +
+# huggingface_hub + hydra + lingbot_vision のみ)。
+#
+# `rotate_table_base` を GR00T ではなく RAMEN-Ori で回す選択肢を残すために入れる。
+rsync -a "${RSYNC_EXCLUDES[@]}" \
+  "${SOURCE_REPO}/model/ramen_ori/" \
+  "${VENDOR_DESKTOP}/model/ramen_ori/"
+
 # --- package marker の復元 ----------------------------------------------------
 
 for marker in "${VENDOR_ONLY_INIT[@]}"; do
@@ -113,6 +127,7 @@ done
 : >"${VENDOR_DESKTOP}/model/subtask_policy_training/__init__.py"
 : >"${VENDOR_DESKTOP}/model/subtask_policy_training/gr00t/__init__.py"
 : >"${VENDOR_DESKTOP}/model/subtask_policy_training/gr00t/assets/__init__.py"
+# ramen_ori は本家に __init__.py があるので置き直さない (rsync がそのまま運ぶ)。
 
 # --- 自作パッチの再適用 -------------------------------------------------------
 

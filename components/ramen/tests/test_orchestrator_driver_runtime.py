@@ -338,3 +338,51 @@ def test_the_next_skill_is_always_ready_before_it_starts(monkeypatch):
                 )
     finally:
         residency.close()
+
+
+# ---------------------------------------------------- variant の差し替え
+def test_variant_override_swaps_the_expert(monkeypatch):
+    """`RAMEN_VARIANT_<SKILL>` で expert を入れ替えられること。
+
+    会場で image を焼き直さずに rotate_table_base を RAMEN-Ori に振れるようにする。
+    """
+    from components.ramen.orchestrator_driver import _variant_override
+
+    monkeypatch.delenv("RAMEN_VARIANT_ROTATE_TABLE_BASE", raising=False)
+    assert _variant_override("rotate_table_base", "groot_overlay") == "groot_overlay"
+
+    monkeypatch.setenv(
+        "RAMEN_VARIANT_ROTATE_TABLE_BASE", "rotate_table_base_ramen_ori_141_c32"
+    )
+    assert (
+        _variant_override("rotate_table_base", "groot_overlay")
+        == "rotate_table_base_ramen_ori_141_c32"
+    )
+
+
+def test_the_override_target_exists_in_the_policy_config():
+    """差し替え先として案内する variant が実在すること (typo 防止)。"""
+    from inference.desktop.lower_policy.policies.config_loader import (
+        load_policy_variant,
+    )
+
+    cfg = str(
+        _VENDOR_DESKTOP / "inference/desktop/lower_policy/configs/policy_config.yaml"
+    )
+    entry = load_policy_variant(cfg, "rotate_table_base_ramen_ori_141_c32")
+
+    assert entry.policy_type == "ramen_ori"
+    assert entry.policy_config.ckpt_ref
+
+
+def test_ramen_ori_brings_its_own_cameras_and_state_dim():
+    """policy_type が違っても VlaSkill 側が policy に聞くので差し替えが効く。"""
+    from inference.desktop.lower_policy.policies.groot import (
+        CAMERAS as GROOT_CAMERAS,
+    )
+    from inference.desktop.lower_policy.policies.ramen_ori import RamenOriPolicy
+
+    assert RamenOriPolicy.STATE_DIM == 71
+    assert len(RamenOriPolicy.CAMERAS) == 4
+    assert len(GROOT_CAMERAS) == 3
+    assert callable(RamenOriPolicy.build_state_from_raw)

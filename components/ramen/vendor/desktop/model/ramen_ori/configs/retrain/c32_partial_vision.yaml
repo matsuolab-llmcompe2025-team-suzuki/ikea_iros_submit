@@ -1,0 +1,21 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: 32 + 一部解放 (backbone の最後の 4 block を学習、lr 0.2 倍、LLRD 0.75)。予算・時間に余裕があれば最後に回す
+# 起動: pixi run train --config-name=retrain/c32_partial_vision
+defaults:
+  - /retrain/common
+  - _self_
+
+model:
+  vision:
+    freeze: false
+optim:
+  partial_train:
+    enabled: true
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c32_partial_vision
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_partial_vision
+
+wandb:
+  run_name: ramen_ori_141_c32_partial_vision

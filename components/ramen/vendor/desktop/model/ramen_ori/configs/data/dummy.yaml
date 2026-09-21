@@ -1,0 +1,14 @@
+# dummy dataset (Issue #115、Phase 1 smoke default)
+# Issue #129 Phase A (2026-08-31): N_cams 4→3 (head_left+L/R wrist、head_right 除外)、
+# num_cams 6→4 (vocab、3 cam + 1 buffer)、action_dim 19→16 (arms 14 + hand 2、waist 除外)。
+_target_: model.ramen_ori.data.DummyRamenOriDataset
+num_samples: 1000
+N_cams: 3
+top_K: 4
+num_classes: 7
+num_cams: 4
+num_skills: 6
+state_dim: 71
+chunk_len: 16
+action_dim: 16
+img_size: 224

@@ -1,0 +1,67 @@
+# RAMEN-Ori Phase 2 real dataset (Issue #120 Phase A-4、Issue #122 で refactor)。
+# task 5 (rotate_table_base) + task 7 (move_table_base) の merged dataset。
+#
+# Issue #122 refactor: 元 9 chunk repos を _ConcatLeRobot で束ねる方式から、
+# GR00T と同じ merged_source (単一 LeRobot v3 dataset、crf=18 mp4) を直接 load
+# する方式に変更。効果:
+#   - GR00T ↔ RAMEN-Ori で **物理データ pixel-identical** (両者同じ mp4)、
+#     apples-to-apples が strict、比較の validity 保証
+#   - JPG frame cache を GR00T と共有 (precompute 1 回で両側に効く、~50GB 節約)
+#   - `MultiLeRobotDataset` aggregate_stats 非互換 workaround (data_lerobot.py 内で
+#     _ConcatLeRobot 使ってた元凶) が不要になり code cleanup
+#
+# 事前準備: prepare_multi_repo_source.py で 9 chunk repos を merge してから使う。
+# GR00T の train_lerobot.sh が既に merge 済みなら (=merged_source_root が存在)、
+# その dir を参照するだけ (再 merge 不要、cache 共有される)。
+_target_: model.ramen_ori.data_lerobot.RamenOriLerobotDataset
+merged_source_root: outputs/merged_sources/combined_task5_7
+repo_id: "local/ramen_ori_combined_task5_7"  # LeRobot 内部 logging 用 (実 HF アクセスなし)
+chunk_len: 16
+img_size: 224
+# Issue #129 Phase A (2026-08-31): 3 cam (head_left + L/R wrist、head_right 除外)。
+# 根拠: head_right は baseline 63mm で depth 冗長性、GR00T Run 1 と apples-to-apples
+# 比較性、compute -33%。cam_1 = head_right を除外、model 側 num_cams は vocab で
+# 4 (3 cam + 1 buffer)。
+camera_keys:
+  - observation.images.cam_0    # head_left
+  - observation.images.cam_2    # left_wrist
+  - observation.images.cam_3    # right_wrist
+top_K: 4
+num_classes: 7
+num_cams: 4
+obb_source: none    # D-2/D-3 (Issue #122): 'none' (OBB skip、default) | 'precomputed_token' (C-2 real) | 'overlay' (C-11)
+# D-2/D-3: obb_source in {'precomputed_token', 'overlay'} 時に precompute cache dir を指定。
+# 例: outputs/yolo_obb_cache (その下の <yolo_ckpt_hash>/ を auto-pick、複数あれば
+# obb_precomputed_hash で明示指定)。default null で obb_source=none との組合せで無視。
+obb_precomputed_root: null
+obb_precomputed_hash: null
+# D-3: overlay mode (C-11) 描画 param。obb_source=overlay 時のみ有効。
+overlay_conf_threshold: 0.30   # この conf 未満の det は描画しない (v11b + head_left 想定)
+overlay_line_thickness: 2      # cv2.polylines 太さ (preview mosaic で t=2 決定)
+overlay_class_filter: null     # null = 全 class 描画 (default)、list なら該当 class_id のみ (例: [3, 4] = hole + table_top)
+state_variant: 71d  # E-δ default (Alt-2 で "73d" = E-β + depth contact bit 追加、SGBM 前は placeholder)
+include_depth_target: false      # Alt-3 I-6 aux 用 depth_target placeholder。true で zeros 供給
+depth_target_size: [32, 32]      # aux head output と一致要
+depth_target_num_cams: 3         # RGB 3 cam 分 (Issue #129 Phase A: cam_1 除外で 3 cam に)
+# Issue #129 Phase F (2026-08-31): relative action space (Run 3/5 用)。
+# use_relative_action=true の時 arms 14 dim を Δq に、hand 2 dim は absolute pass-through。
+# relative_stats_path はscripts/compute_relative_action_stats.py の precompute output。
+# default false = 従来 absolute (Run 1/2/4/6 で使用)。
+use_relative_action: false
+relative_stats_path: null
+# Issue #129 Phase I-0-3 (2026-09-01): offline aug bake cache 選択機構。
+# - online (default): 従来挙動 = __getitem__ で aug pipeline を毎回 apply (backward compat)
+# - baked_token: token/ (photometric aug 済 + overlay 無し) baked cache を load、
+#                aug skip、raw OBB (identity affine 前提) を coord grounding に流す = Run 2/6 用
+# - baked_overlay: overlay/ (photometric + overlay + geometric aug 済) baked cache を load、
+#                  aug skip、OBB は使わない (画像に overlay bake 済) = Run 1/3/4/5 用
+frame_cache_mode: online
+# baked_* mode で使う cache root (precompute の --output-{token,overlay}-root)。
+# 例: /nvme/frame_cache_v2/token または /nvme/frame_cache_v2/overlay。
+# online mode では null。
+frame_cache_root_baked: null
+# v0 (raw) を除く baked variant 数。precompute の --num-variants と一致させる。
+# online mode では 1 (default)。baked_* mode では >=2 必須。
+frame_cache_num_variants: 1
+# skill_id は episode meta の source_task_index を skill_mapping.py の表で変換する (Issue #141 RO-1)。
+# config には対応表を持たない。

@@ -59,6 +59,31 @@ _LEGS = 4
 _DEFAULT_RESIDENT_MODELS = 2
 
 
+def _variant_override(skill_name: str, default: str) -> str:
+    """`RAMEN_VARIANT_<SKILL>` で variant を差し替える。
+
+    会場で image を焼き直さずに expert を入れ替えられるようにする。例えば
+    `rotate_table_base` を GR00T ではなく RAMEN-Ori で回したいとき:
+
+        -e RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32
+
+    policy_type が違っても `assembly.build_vla_skill` が
+    `resolve_policy_class` 経由で正しい class を選ぶので、名前を変えるだけでよい
+    (RAMEN-Ori は state 71D / 4 cam、GR00T は 49D / 3 cam。どちらも policy 自身が
+    `CAMERAS` と `build_state_from_raw` を持ち、VlaSkill はそれを使う)。
+    """
+    key = f"RAMEN_VARIANT_{skill_name.upper()}"
+    override = os.environ.get(key, "").strip()
+    if not override or override == default:
+        return default
+    print(
+        f"[orch-driver] {skill_name}: variant を {default} -> {override} に差し替え "
+        f"({key})",
+        file=sys.stderr,
+    )
+    return override
+
+
 def _load_skill_config(vendor_desktop: str) -> dict:
     """`skill_config.yaml` を丸ごと読む (`assembly` が期待する形)。
 
@@ -190,6 +215,7 @@ class OrchestratorDriver:
         registry = {}
         policies = {}
         for skill_name, cls_name, variant in _STAGE_SKILLS:
+            variant = _variant_override(skill_name, variant)
             entry = load_policy_variant(cfg_path, variant)
             built = _assembly.build_vla_skill(
                 skill_name=skill_name,

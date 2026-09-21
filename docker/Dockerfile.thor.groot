@@ -81,6 +81,38 @@ PY
 # full orchestrator の perception に ultralytics (YOLO-OBB、NGC torch を保持) が要る。
 RUN python3 -m pip install --no-cache-dir "pyyaml" "ultralytics"
 
+# --- RAMEN-Ori 推論の依存 (rotate_table_base を GR00T の代わりに回す選択肢) -----
+#
+# 推論に **lerobot fork は要らない**。`policies/ramen_ori.py` の from_ckpt が
+# import するのは torch / huggingface_hub / hydra / model.ramen_ori.* / lingbot_vision
+# だけ (fork を使うのは model/ramen_ori/pixi.toml = training env の方)。
+# nn.Module 本体と Hydra config は vendor/desktop/model/ramen_ori に同梱している。
+#
+#   hydra-core / omegaconf : from_ckpt が compose(config_name="base") で model を組む
+#   lingbot-vision         : configs/base.yaml の vision_backbone.variant=lingbot-base
+#                            (backbone の重みは runtime に HF から取る)
+#
+# ⚠️ torch / numpy を動かさせない。NGC の torch と numpy 2.2.6 は上で固定済みで、
+#    ここで巻き戻ると全推論が壊れる (base image の注意書き参照)。下の assert が
+#    毎回確かめる。
+ARG LINGBOT_VISION_REF=151e46321bae4399f8568829f190c7bdec216b49
+RUN python3 -m pip install --no-cache-dir \
+      "hydra-core==1.3.5" "omegaconf==2.3.1" \
+      "lingbot-vision @ git+https://github.com/robbyant/lingbot-vision.git@${LINGBOT_VISION_REF}" \
+    && python3 - <<'PY'
+import numpy, torch
+import hydra, omegaconf  # noqa: F401
+import lingbot_vision  # noqa: F401
+
+# ⚠️ ここで torch/numpy が入れ替わっていたら、この image の推論は全部壊れる。
+assert numpy.__version__ == "2.2.6", numpy.__version__
+maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
+import numpy as np
+torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+print("[build] RAMEN-Ori deps OK (hydra + omegaconf + lingbot_vision、torch/numpy 据置き)")
+PY
+
 # --- 53D skills 用 lerobot 0.6.1 env (pick=0.6.0 とは checkpoint 形式が違うため別 venv) ---
 # base torch(sm_110)を --system-site-packages で継承し、lerobot 0.6.1 + accelerate +
 # safetensors を venv に入れる (torch は制約 >=2.7,<2.12 を満たすので差し替わらない)。
