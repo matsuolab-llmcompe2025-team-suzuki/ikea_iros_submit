@@ -32,6 +32,7 @@ import numpy as np
 from inference.desktop.lower_policy.policies.taskspace_adapter import (
     DEFAULT_BASE_HEIGHT_M,
     TASKSPACE_DIM,
+    check_base_height,
     dex1_model_to_taskspace,
 )
 
@@ -184,7 +185,7 @@ def taskspace_row(
     out[SLICE_EE_RIGHT_POS] = right.pos
     out[SLICE_EE_RIGHT_QUAT] = right.quat
     out[SLICE_NAVIGATE] = np.asarray(navigate_cmd, dtype=np.float32)
-    out[IDX_BASE_HEIGHT] = float(base_height_cmd)
+    out[IDX_BASE_HEIGHT] = check_base_height(base_height_cmd)
     out[SLICE_TORSO_RPY] = np.asarray(torso_rpy_cmd, dtype=np.float32)
     return out
 
