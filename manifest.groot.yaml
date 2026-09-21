@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-parity"
-    digest: "sha256:ee665394e579174ee379408a081e29ab11ac0b4ec3b2234cee2bb8b481ed1047"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-residency"
+    digest: "sha256:04d308b5a59b9d364afb100f74ad23c68b0ca316031fc18d982c93632a36d848"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -142,8 +142,24 @@ images:
     #      常時出す、になっていた。flip は Stage 5 の唯一の skill で
     #      **大会経路ではこの backend でしか動かせない**
     #
+    #  17. **skill 切替のたびに 8 秒 act() が止まっていたのを直した。**
+    #      ModelResidency は自分が読んだものを集合で覚えているが、
+    #      `VlaSkill._on_stop()` が skill 停止時に `release_after_skill()` を呼び
+    #      **residency を通さず解放する**。集合だけを信じると「載っているつもりで
+    #      実は無い」になり、先読みが積まれず次に要る tick でその場で読む。
+    #      実 image で 4 脚まわして実測 (2026-09-21):
+    #        insert -> rotate_leg   8121 / 7779 / 7880 ms
+    #        他の切替                 23〜28 ms
+    #      → DeferredPolicy.is_loaded を見て、解放されていたら先読みし直す。
+    #      併せて **GPU に置く model の既定を「全部」から 2 に下げた**
+    #      (今 + 次で切替は隠れる。読み込み 約 8 秒 < 各 skill の 21〜58 秒)。
+    #      ズレを直した今、全部のままだと 53D×4 + pick で約 26 GiB を本当に
+    #      載せに行くため、機体によっては入らない。
+    #      増やすときは `-e RAMEN_GPU_MODELS=<n>` で明示する。
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260921-advance-backup      … 上記 15-16 が無い。**別 prompt で推論し、
+    #      20260921-parity              … 上記 17 が無い。**切替のたびに 8 秒止まる**
+    #      20260921-advance-backup      … 上記 15-17 が無い。**別 prompt で推論し、
     #        skill 切替のたびに 25〜92 秒止まり、脚が 1 本しか回らない**
     #      20260921-stage-dds-fix       … 上記 14-16 が無い。**YOLO が落ちると止まったまま**
     #      20260921-orch-seedfix        … 上記 12-14 が無い。**自前経路が起動しない**
@@ -185,6 +201,13 @@ images:
     #   - groot_53d_real + flip                40 accepted / 0 rejected (T=14〜16、age 0.012s)
     #   - groot_orchestrator                   mock カメラに卓が無く overlay が拒否
     #     → **conformance.py で推奨経路は検証できない**。実カメラが要る
+    # 4 脚まわしての実測 (実シーン 1 枚を回しながら 5700 tick、2026-09-21):
+    #   - n_legs_completed が 0->1->2->3->4 と進み、4 脚で停止する
+    #   - 遷移 16 回。切替 tick は 23〜28ms (通常 tick の median 31ms と同程度)
+    #   - act() latency median 31ms / p95 35ms
+    #   - 起動直後の 1〜2 回目の切替だけは先読みが間に合わず 10〜16 秒かかることがある
+    #     (HF cache が温まっていれば短い)。3 回目以降は隠れる
+    #
     # 自前経路の起動確認 (--interface lo、実機なしなので state 待ちで止まる、2026-09-21):
     #   - --stage 0 / 1 / 5 いずれも --action-sink boundary --synthetic-hand-state で
     #     起動して待機に入る (DDS 初期化を通過)
