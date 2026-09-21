@@ -72,6 +72,13 @@ def main():
     parser.add_argument("--timeout-s", type=float, default=90.0)
     parser.add_argument("--verbose", action="store_true",
                         help="Print every stage's output, pass or fail.")
+    # TEAM RAMEN addition (upstream にはない。vendor 追従時に守ること)。
+    parser.add_argument("--full-rig", action="store_true",
+                        help="Run the mock Orin the way the organizer's 2026-09-21 "
+                             "bridge actually publishes: wrists + head stereo + "
+                             "gripper_q. The default single-camera run only ever "
+                             "exercises our fallback paths (mono duplication and "
+                             "the synthetic hand state).")
     args = parser.parse_args()
 
     print(f"conformance: lane={args.lane}, need {args.messages} clean messages\n")
@@ -82,9 +89,12 @@ def main():
         # One camera at 10 Hz is plenty to validate the action contract, and
         # keeps four Python processes inside a laptop's memory budget. Use
         # mocks/mock_orin.py directly when you want the full three-camera rig.
-        stages.append(Stage("mock-orin", [
-            PYTHON, "mocks/mock_orin.py", "--no-wrists", "--fps", "10",
-        ]))
+        orin_cmd = [PYTHON, "mocks/mock_orin.py", "--fps", "10"]
+        if args.full_rig:
+            orin_cmd += ["--stereo", "--gripper-q"]
+        else:
+            orin_cmd += ["--no-wrists"]
+        stages.append(Stage("mock-orin", orin_cmd))
         time.sleep(2.0)     # let the PUB sockets bind before anyone subscribes
 
         stages.append(Stage("server", [

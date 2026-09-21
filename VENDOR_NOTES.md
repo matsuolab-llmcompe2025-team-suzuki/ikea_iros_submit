@@ -51,6 +51,18 @@ python3 -m pytest components/ramen/tests -q
 > ⚠️ `components/` 直下の自作パッチ（`transport.py` / `client.py` / `README.md`）は
 > **この script の対象外**（vendor/desktop の外）。下記「upstream 追従」節のとおり手で守る。
 
+### upstream template への自作追加（2026-09-21）
+
+運営 template を再取得したら、以下も手で戻すこと。**どれも既定の挙動は変えない**
+（既定で走らせた `conformance.py` は運営の想定どおりのまま）。
+
+- `mocks/mock_orin.py` — `--stereo` / `--gripper-q`。運営の 2026-09-21 bridge は
+  どちらも実機で publish するが、この mock は 2026-07-21 の vendor なので持たない。
+  無いと conformance は**我々の fallback 経路（mono 複製・合成 hand state）しか
+  通らず**、本命の経路が end-to-end で 1 度も走らない。
+- `conformance.py` — `--full-rig`。上の 2 つを立てて mock を起動する。
+- `components/client.py` — `:5557` の 2 本目 SUB（`gripper_q`）。
+
 ## Unitree SDK / CycloneDDS を image に同梱（Issue #1、2026-09-20）
 
 `docker/Dockerfile.thor.groot` は大会経路（`components/server.py`、ZMQ のみ）に加えて
