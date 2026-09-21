@@ -192,11 +192,14 @@ class G1HandActuator:
         self._lock = threading.Lock()
         self._target = _LatestHandTarget()
         self._commanded_positions: Optional[tuple[float, float]] = None
+        self._last_published_positions: Optional[tuple[float, float]] = None
         self._running = False
         self._left_publisher = left_publisher
         self._right_publisher = right_publisher
         self._publish_thread = publish_thread
         self._cmd_factory = cmd_factory  # test-injected MotorCmds_ factory
+        self._publish_error: Optional[BaseException] = None
+        self._successful_publish_count = 0
 
     def send_action(self, positions: Sequence[float]) -> None:
         arr = tuple(float(p) for p in positions)
@@ -234,11 +237,43 @@ class G1HandActuator:
             if self._running:
                 return
             self._running = True
+            self._publish_error = None
+            self._successful_publish_count = 0
         if self._left_publisher is None or self._right_publisher is None:
             self._init_publishers()
         if self._publish_thread is None:
             self._init_publish_thread()
         self._publish_thread.Start()  # type: ignore[attr-defined]
+
+    def raise_if_unhealthy(self) -> None:
+        """Raise a latched DDS publisher failure in the foreground thread.
+
+        ``RecurrentThread`` callbacks cannot safely propagate an exception to
+        the orchestration loop.  Previously a failed ``ChannelPublisher.Write``
+        was only printed (and a ``False`` return was ignored), so the evaluator
+        waited for a hand-motion timeout that looked like a mechanical fault.
+        """
+
+        with self._lock:
+            error = self._publish_error
+        if error is not None:
+            raise RuntimeError(f"Dex1 DDS publisher failed: {error}") from error
+
+    def read_last_commanded_positions(self) -> Optional[np.ndarray]:
+        """Return the latest 2-D command advanced by the 200 Hz publisher.
+
+        This is command-path telemetry, not measured motor state.  Model
+        boundary staging uses it together with the measured Dex1 state so a
+        transition cannot be declared complete while the publisher-side slew
+        limiter is still travelling toward the next model's frame-zero target.
+        """
+
+        with self._lock:
+            if self._last_published_positions is None:
+                return None
+            return np.asarray(
+                self._last_published_positions, dtype=np.float64
+            ).copy()
 
     def stop(self) -> None:
         with self._lock:
@@ -303,16 +338,34 @@ class G1HandActuator:
             if self._cmd_factory is None:
                 # DI 経路 (test) で cmd_factory 未注入なら生 tuple を書く
                 # (fake publisher が受け取る簡易 pattern)
-                self._left_publisher.Write((left,))  # type: ignore[attr-defined]
-                self._right_publisher.Write((right,))  # type: ignore[attr-defined]
+                left_ok = self._left_publisher.Write((left,))  # type: ignore[attr-defined]
+                right_ok = self._right_publisher.Write((right,))  # type: ignore[attr-defined]
             else:
                 left_cmd = self._cmd_factory()
                 right_cmd = self._cmd_factory()
                 left_cmd.cmds[0].q = float(left)  # type: ignore[attr-defined]
                 right_cmd.cmds[0].q = float(right)  # type: ignore[attr-defined]
-                self._left_publisher.Write(left_cmd)  # type: ignore[attr-defined]
-                self._right_publisher.Write(right_cmd)  # type: ignore[attr-defined]
+                # On the first write, wait for the Orin bridge DDS readers.
+                # Later writes stay non-blocking at 200 Hz.
+                timeout = 1.0 if self._successful_publish_count == 0 else None
+                left_ok = self._left_publisher.Write(  # type: ignore[attr-defined]
+                    left_cmd, timeout=timeout
+                )
+                right_ok = self._right_publisher.Write(  # type: ignore[attr-defined]
+                    right_cmd, timeout=timeout
+                )
+            if left_ok is False or right_ok is False:
+                raise RuntimeError(
+                    "DDS write was not matched by both Dex1 command readers "
+                    f"(left={left_ok!r}, right={right_ok!r})"
+                )
+            with self._lock:
+                self._successful_publish_count += 1
+                self._last_published_positions = (left, right)
         except Exception as exc:
+            with self._lock:
+                if self._publish_error is None:
+                    self._publish_error = exc
             print(f"[G1HandActuator] publish error: {exc!r}", file=sys.stderr)
 
 

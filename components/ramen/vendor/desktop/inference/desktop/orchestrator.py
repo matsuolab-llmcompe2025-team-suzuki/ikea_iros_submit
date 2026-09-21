@@ -139,12 +139,25 @@ STAGE_HEAD_SKILL: dict[int, str] = {
     4: "rotate_table_base",
     5: "flip_table",
 }
+LEARNED_STAGE_SKILLS = frozenset(
+    {
+        "rotate_table_base",
+        "pick_table_leg",
+        "insert_table_leg",
+        "rotate_leg_to_tighten",
+        "flip_table",
+    }
+)
 STAGE_MIN: int = 0
 STAGE_MAX: int = 5
 
 
 def build_stage_transitions(
-    stage: int, *, is_start_stage: bool = True, include_hand: bool = True
+    stage: int,
+    *,
+    is_start_stage: bool = True,
+    include_hand: bool = True,
+    skip_model_transition_pairs: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, list[str]]:
     """Stage の skill 列を SkillDispatchLowerPolicy 用の transition graph に展開。
 
@@ -166,7 +179,10 @@ def build_stage_transitions(
             f"stage {stage} not registered (valid: {sorted(STAGE_SKILL_SEQUENCES)})"
         )
     skills = build_stage_skill_sequence(
-        stage, is_start_stage=is_start_stage, include_hand=include_hand
+        stage,
+        is_start_stage=is_start_stage,
+        include_hand=include_hand,
+        skip_model_transition_pairs=skip_model_transition_pairs,
     )
     transitions: dict[str, list[str]] = {}
     for i, skill in enumerate(skills):
@@ -175,7 +191,11 @@ def build_stage_transitions(
 
 
 def build_stage_skill_sequence(
-    stage: int, *, is_start_stage: bool = True, include_hand: bool = True
+    stage: int,
+    *,
+    is_start_stage: bool = True,
+    include_hand: bool = True,
+    skip_model_transition_pairs: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[str]:
     """Stage で dispatch する skill 名の列 (頭の手順を含む、Issue #141 D7-1)。
 
@@ -192,13 +212,86 @@ def build_stage_skill_sequence(
         include_hand: Dex1 を実際に動かすか。False なら手の skill を列に入れない。
     """
     base = list(STAGE_SKILL_SEQUENCES[stage])
+    expanded: list[str] = []
+    for index, skill_name in enumerate(base):
+        expanded.append(skill_name)
+        if index + 1 >= len(base):
+            continue
+        next_skill = base[index + 1]
+        if (
+            skill_name not in LEARNED_STAGE_SKILLS
+            or next_skill not in LEARNED_STAGE_SKILLS
+        ):
+            continue
+        if (skill_name, next_skill) in skip_model_transition_pairs:
+            continue
+        expanded.extend(
+            model_transition_skill_names(
+                skill_name, next_skill, include_hand=include_hand
+            )
+        )
+    base = expanded
     head_skill = STAGE_HEAD_SKILL.get(stage)
     if stage == 1 and not is_start_stage:
         head_skill = None
+    if stage >= 2 and not is_start_stage and head_skill is not None:
+        previous_skill = STAGE_SKILL_SEQUENCES[stage - 1][-1]
+        pair = (previous_skill, head_skill)
+        if pair not in skip_model_transition_pairs:
+            return (
+                model_transition_skill_names(
+                    previous_skill, head_skill, include_hand=include_hand
+                )
+                + base
+            )
+        return base
     if head_skill is None:
         return base
     head = head_procedure_skill_names(head_skill, include_hand=include_hand)
     return base + head if stage == 0 else head + base
+
+
+def model_transition_skill_names(
+    previous_skill: str, next_skill: str, *, include_hand: bool = True
+) -> list[str]:
+    """Finite transition steps inserted between two learned models.
+
+    The arm path runs first while the existing Dex1 publisher retains its last
+    target.  Only after measured arm convergence is the next model's frame-zero
+    hand target applied.  This ordering prevents an object from being released
+    merely because a new model is being loaded.
+    """
+
+    suffix = f"{previous_skill}_to_{next_skill}"
+    names = [f"arm_transition_{suffix}"]
+    if include_hand:
+        names.append(f"hand_transition_{suffix}")
+    names.append(f"hold_transition_{suffix}")
+    return names
+
+
+def model_transition_pairs_for_stage(
+    stage: int,
+    *,
+    is_start_stage: bool,
+    skip_model_transition_pairs: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[tuple[str, str], ...]:
+    """Return model boundaries whose finite transition skills must be built."""
+
+    if stage not in STAGE_SKILL_SEQUENCES:
+        raise KeyError(
+            f"stage {stage} not registered (valid: {sorted(STAGE_SKILL_SEQUENCES)})"
+        )
+    base = STAGE_SKILL_SEQUENCES[stage]
+    pairs = [
+        pair
+        for pair in zip(base, base[1:])
+        if pair[0] in LEARNED_STAGE_SKILLS and pair[1] in LEARNED_STAGE_SKILLS
+    ]
+    head_skill = STAGE_HEAD_SKILL.get(stage)
+    if stage >= 2 and not is_start_stage and head_skill is not None:
+        pairs.insert(0, (STAGE_SKILL_SEQUENCES[stage - 1][-1], head_skill))
+    return tuple(pair for pair in pairs if pair not in skip_model_transition_pairs)
 
 
 # =========================================================================

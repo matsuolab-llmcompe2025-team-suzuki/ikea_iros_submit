@@ -46,7 +46,8 @@ class ModelResidency:
     ) -> None:
         if resident < 1:
             raise ValueError(f"resident must be >= 1, got {resident}")
-        self._order = [name for name in order if name in policies]
+        self._timeline = list(order)
+        self._order = [name for name in self._timeline if name in policies]
         self._policies = dict(policies)
         self._resident = int(resident)
         self._loaded: set[str] = set()
@@ -86,9 +87,20 @@ class ModelResidency:
         範囲から外れた model はその場で解放し (呼び出し元の thread)、範囲に入って
         まだ読んでいない model は worker thread に積む。
         """
-        if skill_name is None or skill_name not in self._order:
+        if skill_name is None or skill_name not in self._timeline:
             return
-        index = self._order.index(skill_name)
+        timeline_index = self._timeline.index(skill_name)
+        next_model = next(
+            (
+                name
+                for name in self._timeline[timeline_index:]
+                if name in self._policies
+            ),
+            None,
+        )
+        if next_model is None:
+            return
+        index = self._order.index(next_model)
         keep = self._order[index : index + self._resident]
         with self._lock:
             release = [name for name in self._loaded if name not in keep]

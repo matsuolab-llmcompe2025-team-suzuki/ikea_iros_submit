@@ -156,9 +156,10 @@ class G1ArmActuator:
             from unitree_sdk2py.utils.crc import CRC  # type: ignore
 
             # Pull 型 subscriber: handler なしで Init し、publish loop 内から
-            # `.Read()` で最新 sample を polling する。rate limiter が毎 tick 現在の
-            # arm pose を要求するので event-driven (SetReader(handler=...)) より
-            # pull 型が合う (Ros2FrameSource の push 型 pattern とは意図的に非対称)。
+            # `.Read()` で最新 sample を polling する。初回 command trajectory の
+            # bootstrap と read-only diagnostics に最新 pose が必要なので、
+            # event-driven (SetReader(handler=...)) より pull 型が合う
+            # (Ros2FrameSource の push 型 pattern とは意図的に非対称)。
             self._lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
             self._lowstate_subscriber.Init()
             first_state = self._wait_for_lowstate()
@@ -257,7 +258,8 @@ class G1ArmActuator:
         を返す想定 (SDK 実装の semantics)。250Hz publish loop の hot path で呼ぶが、
         DDS reader cache への O(1) access なので実測 overhead 無視できるレベル。
         SDK 側の Read() semantics が変わった (blocking / new-only 化) 場合は本
-        method の再設計が必要 (rate-limit の毎 tick current 要求と衝突するため)。
+        method の再設計が必要 (publish thread と read-only diagnostics の双方から
+        呼ばれるため)。
 
         本 method は lowstate 参照時に arm + waist 両方の latest cache を更新する
         (waist rate-limit も同じ lowstate snapshot から派生させるため)。
@@ -363,6 +365,23 @@ class G1ArmActuator:
             self._waist_target.positions = clamped
             self._waist_target.received = True
 
+    def clear_waist_action(self) -> None:
+        """Drop a previously dispatched waist target at an ownership boundary.
+
+        The latest measured waist pose becomes the neutral body-command value
+        before the explicit target is cleared.  This prevents the last learned
+        waist target from leaking into an arms-only skill such as flip_table.
+        Regular Mode remains responsible for balance and subsequent waist
+        motion; arm_sdk continues to hold only the arm trajectory.
+        """
+
+        measured = self._current_waist_positions()
+        with self._lock:
+            self._hold_positions[list(G1_WAIST_JOINT_INDICES)] = measured
+            self._waist_target.positions = None
+            self._waist_target.received = False
+            self._last_published_waist_positions = None
+
     def start(self) -> None:
         with self._lock:
             if self._running:
@@ -421,19 +440,36 @@ class G1ArmActuator:
             return float(self._motion_weight)
 
     def _rate_limited_target(self, target: np.ndarray) -> np.ndarray:
-        current = self._current_arm_positions()
+        # A velocity limiter must advance from the last command that actually
+        # reached DDS, not from the measured joint position on every 250 Hz
+        # publication.  The latter turns ``max_step`` into a permanent
+        # position-error cap: for a wrist with kp=40 and max_step=0.08 rad the
+        # controller can produce only about 3.2 Nm, so a loaded wrist stalls
+        # forever even though the requested target is valid.  Bootstrap from
+        # the measured pose once, then build a bounded command trajectory.
+        # ``_last_published_*`` is updated only after Write succeeds, so a DDS
+        # failure cannot advance this reference invisibly.
+        reference = (
+            self._current_arm_positions()
+            if self._last_published_arm_positions is None
+            else self._last_published_arm_positions.copy()
+        )
         max_step = self._limits.velocity_limit_rad_s / max(self._control_freq_hz, 1.0)
-        delta = target - current
+        delta = target - reference
         scale = max(float(np.max(np.abs(delta))) / max_step, 1.0)
-        return current + delta / scale
+        return reference + delta / scale
 
     def _rate_limited_waist_target(self, target: np.ndarray) -> np.ndarray:
         """Phase B-1: waist target を rate limit (arm と同 limits pattern)。"""
-        current = self._current_waist_positions()
+        reference = (
+            self._current_waist_positions()
+            if self._last_published_waist_positions is None
+            else self._last_published_waist_positions.copy()
+        )
         max_step = self._limits.velocity_limit_rad_s / max(self._control_freq_hz, 1.0)
-        delta = target - current
+        delta = target - reference
         scale = max(float(np.max(np.abs(delta))) / max_step, 1.0)
-        return current + delta / scale
+        return reference + delta / scale
 
     def _gains_for_joint(self, joint_index: int) -> tuple[float, float]:
         if joint_index in G1_WRIST_JOINT_INDICES:
@@ -460,8 +496,8 @@ class G1ArmActuator:
             waist_target = self._waist_target.positions.copy() if waist_received else None
         try:
             # arm target 無ければ init 時 hold pose を rate-limit にかけずそのまま使う
-            # (target 送出未経験 = 追従目標未確定なので rate-limit の "current→target"
-            # 遷移計算が不要、hold pose 定常維持で足りる)
+            # (target 送出未経験 = command trajectory 未確定なので遷移計算が不要、
+            # hold pose 定常維持で足りる)
             if arm_target is not None:
                 rate_limited_arm = self._rate_limited_target(arm_target)
             else:

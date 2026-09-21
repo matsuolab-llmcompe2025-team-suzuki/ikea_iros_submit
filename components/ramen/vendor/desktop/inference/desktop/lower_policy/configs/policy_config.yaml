@@ -224,7 +224,7 @@ policies:
     # base_model=GR00T-N1.7-3B、embodiment=NEW_EMBODIMENT (raw robot_q 38D)。
     # checkpoint_subdir=null は root load (ver2-lora) を意味するので、subdir 配置の
     # ver1 は明示指定する (未指定=root の規約は generic groot 経路と共通)。
-    ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ver1
+    ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a
     checkpoint_subdir: checkpoint-40000
     device: cuda
     dtype: bf16
@@ -315,7 +315,7 @@ policies:
   ramen_ori_default:
     policy_type: ramen_ori
     mode: none
-    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_default_100k_v1
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_default_100k_v1@fbef6ab022a95aa089edac8916dafcd6e76f1f69
     device: cuda
     dtype: fp32   # base.yaml:vision_backbone.dtype=fp32
 

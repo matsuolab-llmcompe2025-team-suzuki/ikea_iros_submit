@@ -40,6 +40,25 @@ from inference.desktop.lower_policy.skills.hand_ramp import (
     hand_target_completion_mode,
 )
 
+NO_MOTION_WATCHDOG_SEC = 2.0
+NO_MOTION_MIN_PROGRESS_RAD = 0.03
+
+DEX1_FAULT_DESCRIPTIONS = {
+    0x001: "overcurrent",
+    0x002: "transient overvoltage",
+    0x004: "continuous overvoltage",
+    0x008: "transient undervoltage",
+    0x010: "controller overheating",
+    0x020: "MOS temperature fault",
+    0x040: "MOS temperature sensor fault",
+    0x080: "housing overheating",
+    0x100: "housing temperature sensor fault",
+    0x200: "winding overheating",
+    0x400: "rotor encoder 1 fault",
+    0x800: "rotor encoder 2 fault",
+    0x1000: "output encoder fault",
+}
+
 TARGET_MODES = ("open", "pose", "grasp")
 
 
@@ -75,7 +94,7 @@ class HandPreMotionSkill(Skill):
         target_rad: tuple[float, float],
         allow_closing_contact: bool = False,
         velocity_limit_rad_s: float = 1.5,
-        tolerance_rad: float = 0.15,
+        tolerance_rad: float = 0.05,
         required_stable_samples: int = 5,
         minimum_timeout_sec: float = 5.0,
         timeout_margin_sec: float = 3.0,
@@ -171,6 +190,7 @@ class HandPreMotionSkill(Skill):
         self._complete = False
         self._completion_mode: Optional[str] = None
         self._failure_reason: Optional[str] = None
+        self._ramp_started_at: Optional[float] = None
 
     def _on_start(self, params: dict) -> None:
         self._reset()
@@ -185,6 +205,9 @@ class HandPreMotionSkill(Skill):
     # ---- per-tick ----
 
     def step(self, obs: dict) -> np.ndarray:
+        health_check = getattr(self._hand_actuator, "raise_if_unhealthy", None)
+        if health_check is not None:
+            health_check()
         if self._hold_arm is None:
             self._hold_arm = _measured_arm_14(obs)
         measured = self._measured_hand(obs)
@@ -196,6 +219,7 @@ class HandPreMotionSkill(Skill):
             self._hand_actuator.send_action(command)
         if measured is not None and not self._complete:
             self._update_completion(measured)
+            self._check_motion_watchdog(measured)
         if not self._complete:
             self._check_deadline()
         return self._hold_arm.copy()
@@ -215,6 +239,36 @@ class HandPreMotionSkill(Skill):
             self._history.clear()
             self._stable_samples = 0
             return None
+        if bool(getattr(state, "health_diagnostics_available", False)):
+            faults = np.asarray(getattr(state, "fault_code", (0, 0)), dtype=np.uint32)
+            if faults.shape != (2,):
+                self._failure_reason = (
+                    f"{self.name} received malformed Dex1 fault diagnostics: "
+                    f"shape={faults.shape}"
+                )
+                return None
+            failed = np.flatnonzero(faults)
+            if failed.size:
+                sides = ("left", "right")
+                details = []
+                for index in failed:
+                    code = int(faults[index])
+                    names = [
+                        text
+                        for bit, text in DEX1_FAULT_DESCRIPTIONS.items()
+                        if code & bit
+                    ]
+                    details.append(
+                        f"{sides[index]}=0x{code:x}"
+                        + (f" ({', '.join(names)})" if names else "")
+                    )
+                self._failure_reason = (
+                    f"{self.name} refused to command a faulted Dex1 motor: "
+                    f"{'; '.join(details)}. Clear the physical motor fault (a latched "
+                    "thermal fault requires a complete Dex1 motor-power cycle), then "
+                    "verify with smoke_hand_real before retrying"
+                )
+                return None
         return measured
 
     def _begin_ramp(self, measured: np.ndarray) -> None:
@@ -226,6 +280,7 @@ class HandPreMotionSkill(Skill):
             velocity_limit_rad_s=self._velocity_limit_rad_s,
         )
         self._ramp_index = 0
+        self._ramp_started_at = self._time_fn()
         travel_s = float(np.max(np.abs(self._target - measured))) / self._velocity_limit_rad_s
         self._deadline = self._time_fn() + max(
             self._minimum_timeout_sec, travel_s + self._timeout_margin_sec
@@ -236,9 +291,68 @@ class HandPreMotionSkill(Skill):
             file=sys.stderr,
         )
 
+    def _check_motion_watchdog(self, measured: np.ndarray) -> None:
+        """Fail early when fresh state is being republished but hardware is frozen."""
+
+        if (
+            self._failure_reason is not None
+            or self._complete
+            or self._start_measured is None
+            or self._ramp_started_at is None
+            or self._time_fn() - self._ramp_started_at < NO_MOTION_WATCHDOG_SEC
+            or np.max(np.abs(self._target - self._start_measured)) <= self._tolerance_rad
+        ):
+            return
+        requested_motion = np.abs(self._target - self._start_measured)
+        progress = np.abs(measured - self._start_measured)
+        stalled = np.flatnonzero(
+            (requested_motion > self._tolerance_rad)
+            & (progress < NO_MOTION_MIN_PROGRESS_RAD)
+        )
+        if stalled.size:
+            side_names = ("left", "right")
+            stalled_detail = ", ".join(
+                f"{side_names[index]}(requested={requested_motion[index]:.4f}rad, "
+                f"progress={progress[index]:.4f}rad)"
+                for index in stalled
+            )
+            self._failure_reason = (
+                f"{self.name} received fresh Dex1 state but the following hardware "
+                f"did not move after {NO_MOTION_WATCHDOG_SEC:.1f}s: {stalled_detail}. "
+                "The Orin dex1_1_gripper_server serial path is unhealthy; restart "
+                "the service and verify both Dex1 USB motors before retrying"
+            )
+
     def _update_completion(self, measured: np.ndarray) -> None:
         self._history.append(measured.copy())
         self._history = self._history[-STABLE_HISTORY_LEN:]
+        # Reaching the measured pose is insufficient when either the 30 Hz
+        # staging ramp or the actuator's 200 Hz publisher-side slew limiter is
+        # still moving.  In particular, contact used to complete early while
+        # the final frame-zero command had not yet been emitted.
+        command_complete = self._ramp_index >= len(self._ramp)
+        read_commanded = getattr(
+            self._hand_actuator, "read_last_commanded_positions", None
+        )
+        if callable(read_commanded):
+            commanded = read_commanded()
+            if commanded is None:
+                command_complete = False
+            else:
+                commanded_array = np.asarray(commanded, dtype=np.float64)
+                if (
+                    commanded_array.shape != (2,)
+                    or not np.isfinite(commanded_array).all()
+                ):
+                    self._failure_reason = (
+                        f"{self.name} received invalid Dex1 command telemetry: "
+                        f"{commanded!r}"
+                    )
+                    return
+                command_complete = command_complete and bool(
+                    np.max(np.abs(commanded_array - self._target))
+                    <= self._tolerance_rad
+                )
         mode = hand_target_completion_mode(
             start=self._start_measured,
             target=self._target,
@@ -246,8 +360,15 @@ class HandPreMotionSkill(Skill):
             tolerance_rad=self._tolerance_rad,
             allow_closing_contact=self._allow_closing_contact,
         )
-        self._stable_samples = self._stable_samples + 1 if mode == "target" else 0
-        if self._stable_samples >= self._required_stable_samples or mode == "closing_contact":
+        self._stable_samples = (
+            self._stable_samples + 1
+            if mode == "target" and command_complete
+            else 0
+        )
+        if command_complete and (
+            self._stable_samples >= self._required_stable_samples
+            or mode == "closing_contact"
+        ):
             self._complete = True
             self._completion_mode = mode
             print(

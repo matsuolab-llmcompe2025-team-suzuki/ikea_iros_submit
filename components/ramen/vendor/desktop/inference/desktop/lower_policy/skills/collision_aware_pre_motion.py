@@ -54,6 +54,17 @@ def _measured_arm(obs: dict) -> np.ndarray:
     return array[ARM_INDICES].copy()
 
 
+def _measured_arm_velocity(obs: dict) -> np.ndarray:
+    state = obs.get("joint_state")
+    velocities = None if state is None else getattr(state, "velocity", None)
+    array = np.asarray(velocities, dtype=np.float64) if velocities is not None else None
+    if array is None or array.shape != (29,) or not np.isfinite(array).all():
+        raise RuntimeError(
+            "live finite 29-D joint velocity is required for arm staging"
+        )
+    return array[ARM_INDICES].copy()
+
+
 def _measured_max_leg_speed(obs: dict) -> float:
     state = obs.get("joint_state")
     velocities = None if state is None else getattr(state, "velocity", None)
@@ -303,8 +314,11 @@ class CollisionAwareArmPreMotionSkill(Skill):
         velocity_limit_rad_s: float = 0.5,
         acceleration_limit_rad_s2: float = 1.0,
         measured_tolerance_rad: float = 0.10,
+        measured_velocity_tolerance_rad_s: float = 0.05,
+        command_tolerance_rad: float = 0.001,
         stage_timeout_s: float = 15.0,
         stable_samples_required: int = 5,
+        published_target_provider: Callable[[], Sequence[float] | None] | None = None,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
@@ -315,6 +329,11 @@ class CollisionAwareArmPreMotionSkill(Skill):
             ("velocity_limit_rad_s", velocity_limit_rad_s),
             ("acceleration_limit_rad_s2", acceleration_limit_rad_s2),
             ("measured_tolerance_rad", measured_tolerance_rad),
+            (
+                "measured_velocity_tolerance_rad_s",
+                measured_velocity_tolerance_rad_s,
+            ),
+            ("command_tolerance_rad", command_tolerance_rad),
             ("stage_timeout_s", stage_timeout_s),
         ):
             if not math.isfinite(value) or value <= 0.0:
@@ -329,8 +348,11 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._velocity_limit = float(velocity_limit_rad_s)
         self._acceleration_limit = float(acceleration_limit_rad_s2)
         self._tolerance = float(measured_tolerance_rad)
+        self._velocity_tolerance = float(measured_velocity_tolerance_rad_s)
+        self._command_tolerance = float(command_tolerance_rad)
         self._stage_timeout = float(stage_timeout_s)
         self._stable_samples_required = stable_samples_required
+        self._published_target_provider = published_target_provider
         self._time_fn = time_fn
         self._initial: np.ndarray | None = None
         self._targets: tuple[np.ndarray, ...] = ()
@@ -342,6 +364,7 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._last_diagnostic_at: float | None = None
         self._stable_samples = 0
         self._complete = False
+        self._failure_reason: str | None = None
 
     def _on_start(self, params: dict) -> None:
         self._initial = None
@@ -354,6 +377,7 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._last_diagnostic_at = None
         self._stable_samples = 0
         self._complete = False
+        self._failure_reason = None
 
     def _on_stop(self) -> None:
         pass
@@ -362,13 +386,23 @@ class CollisionAwareArmPreMotionSkill(Skill):
     def is_complete(self) -> bool:
         return self._complete
 
+    @property
+    def failure_reason(self) -> str | None:
+        return self._failure_reason
+
     def step(self, obs: dict) -> np.ndarray:
         measured = _measured_arm(obs)
+        measured_velocity = _measured_arm_velocity(obs)
         now = self._time_fn()
         if self._initial is None:
             self._initial = measured.copy()
             self._targets = tuple(w.resolve(self._initial) for w in self._waypoints)
-            self._command = measured.copy()
+            # A model boundary must begin from the target that actually reached
+            # DDS, not snap the target buffer back to the lagging measured pose.
+            # Startup paths have no provider and correctly bootstrap from the
+            # measured pose.
+            published = self._read_published_target()
+            self._command = measured.copy() if published is None else published
             self._stage_started_at = now
             self._last_at = now
             self._last_diagnostic_at = now
@@ -383,19 +417,22 @@ class CollisionAwareArmPreMotionSkill(Skill):
         assert self._last_at is not None
         if self._complete:
             return self._command.copy()
+        if self._failure_reason is not None:
+            return self._command.copy()
         if now - self._stage_started_at > self._stage_timeout:
             waypoint = self._waypoints[self._stage_index]
             goal = self._targets[self._stage_index]
             errors = np.abs(goal - measured)
             worst = int(np.argmax(errors))
             error = float(errors[worst])
-            raise TimeoutError(
+            self._failure_reason = (
                 f"pre-motion stage {waypoint.name!r} did not converge within "
                 f"{self._stage_timeout:g}s (max_arm_error={error:.4f}rad, "
                 f"worst_joint={ARM_JOINT_NAMES[worst]}, "
                 f"target={goal[worst]:+.4f}rad, measured={measured[worst]:+.4f}rad, "
                 f"command={self._command[worst]:+.4f}rad)"
             )
+            return self._command.copy()
 
         dt = min(max(now - self._last_at, 1e-4), 0.1)
         goal = self._targets[self._stage_index]
@@ -417,8 +454,20 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._last_at = now
 
         command_error = float(np.max(np.abs(goal - self._command)))
+        published = self._read_published_target()
+        published_error = (
+            command_error
+            if published is None
+            else float(np.max(np.abs(goal - published)))
+        )
         measured_error = float(np.max(np.abs(goal - measured)))
-        within_tolerance = command_error <= 1e-3 and measured_error <= self._tolerance
+        measured_speed = float(np.max(np.abs(measured_velocity)))
+        within_tolerance = (
+            command_error <= self._command_tolerance
+            and published_error <= self._command_tolerance
+            and measured_error <= self._tolerance
+            and measured_speed <= self._velocity_tolerance
+        )
         self._stable_samples = self._stable_samples + 1 if within_tolerance else 0
         assert self._last_diagnostic_at is not None
         if now - self._last_diagnostic_at >= 2.0 and not within_tolerance:
@@ -428,7 +477,7 @@ class CollisionAwareArmPreMotionSkill(Skill):
                 f"[pre-motion {self._stage_index + 1}/{len(self._waypoints)}] "
                 f"waiting: worst={ARM_JOINT_NAMES[worst]} "
                 f"target={goal[worst]:+.3f} measured={measured[worst]:+.3f} "
-                f"error={errors[worst]:.3f}rad",
+                f"error={errors[worst]:.3f}rad speed={measured_speed:.3f}rad/s",
                 file=sys.stderr,
             )
             self._last_diagnostic_at = now
@@ -453,3 +502,16 @@ class CollisionAwareArmPreMotionSkill(Skill):
                     file=sys.stderr,
                 )
         return self._command.copy()
+
+    def _read_published_target(self) -> np.ndarray | None:
+        if self._published_target_provider is None:
+            return None
+        target = self._published_target_provider()
+        if target is None:
+            return None
+        array = np.asarray(target, dtype=np.float64)
+        if array.shape != (14,) or not np.isfinite(array).all():
+            raise RuntimeError(
+                "published arm target provider must return finite 14-D or None"
+            )
+        return array.copy()

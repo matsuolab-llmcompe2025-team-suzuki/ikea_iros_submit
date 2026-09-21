@@ -129,6 +129,12 @@ PHASE1_13_HAND_VELOCITY_RAD_S = 1.0
 _DEFAULT_SKILL_CONFIG: Path = (
     Path(__file__).resolve().parent / "lower_policy" / "configs" / "skill_config.yaml"
 )
+_DEFAULT_PICK_LEG_HYBRID_CONFIG: Path = (
+    Path(__file__).resolve().parent
+    / "pick_leg_hybrid"
+    / "configs"
+    / "pick_leg_hybrid.yaml"
+)
 
 
 def _default_log_path() -> Path:
@@ -174,7 +180,13 @@ def _start_hand_during_registry_build(
     return phase1_profile != "1.13" and not phase3_active
 
 
-def _require_real_waist_and_hand(args: argparse.Namespace, label: str) -> None:
+def _require_real_waist_and_hand(
+    args: argparse.Namespace,
+    label: str,
+    *,
+    need_waist: bool = True,
+    need_hand: bool = True,
+) -> None:
     """Phase 3 は実 waist / 実 hand を要求する (#128 の段階的 smoke ガード)。
 
     例外は `--synthetic-hand-state` のときだけ。会場のリグは hand state を配信せず
@@ -188,6 +200,11 @@ def _require_real_waist_and_hand(args: argparse.Namespace, label: str) -> None:
     `_validate_phase3_config` が禁止している)。腰は指令が無ければ実測値で埋まる。
     **会場でグリッパを動かせるのはこの経路だけ**なので、ここを塞ぐと
     stage 1-4 が丸ごと起動できなくなる。
+
+    `need_waist` / `need_hand` は **選んだ Stage 範囲**で決まる (Issue #148)。
+    腰を使うのは脚 Stage 1..4 だけ、手を使うのは Stage 1..4 と flip の Stage 5 だけ
+    なので、Stage 0 だけ・Stage 5 だけの run では要求しないどころか**禁止する**
+    (要らない所有権を取ると、その関節が Regular Mode から外れたまま残る)。
     """
 
     if getattr(args, "action_sink", "sdk") == "boundary":
@@ -195,7 +212,10 @@ def _require_real_waist_and_hand(args: argparse.Namespace, label: str) -> None:
         # `--synthetic-hand-state` が無いと `_build_hand_actuator` が skill ごとに
         # **別 instance** を返すため、`.latest` が boundary sink に届かず
         # **グリッパ指令が黙って落ちる** (エラーは出ない)。ここで要求しておく。
-        if not getattr(args, "synthetic_hand_state", False):
+        #
+        # 実 actuator 側の可否は見なくてよい: boundary では `--use-real-waist` も
+        # `--use-real-hand` も `_validate_phase3_config` が既に禁止している。
+        if need_hand and not getattr(args, "synthetic_hand_state", False):
             raise ValueError(
                 f"{label} with --action-sink boundary requires"
                 " --synthetic-hand-state (otherwise each skill gets its own mock"
@@ -204,8 +224,17 @@ def _require_real_waist_and_hand(args: argparse.Namespace, label: str) -> None:
             )
         return
 
-    if not args.use_real_waist:
+    if need_waist and not args.use_real_waist:
         raise ValueError(f"{label} requires --use-real-waist")
+    if not need_waist and args.use_real_waist:
+        raise ValueError(
+            f"{label} keeps waist/legs under Regular Mode;"
+            " --use-real-waist is forbidden"
+        )
+    if not need_hand:
+        if args.use_real_hand:
+            raise ValueError(f"{label} owns arms only; --use-real-hand is forbidden")
+        return
     if args.use_real_hand:
         return
     if getattr(args, "synthetic_hand_state", False):
@@ -296,8 +325,42 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         "rotate_leg": args.policy_variant_rotate_leg,
         "flip": args.policy_variant_flip,
     }
+    hybrid_pick = bool(getattr(args, "pick_leg_hybrid", False))
+    if hybrid_pick:
+        selected_stages = (
+            set(range(args.phase3_start_stage, args.phase3_end_stage + 1))
+            if full
+            else ({stage} if stage is not None else set())
+        )
+        if not selected_stages.intersection({1, 2, 3, 4}):
+            raise ValueError("--pick-leg-hybrid requires a selected Stage in 1..4")
+        if args.no_wrist_cameras:
+            raise ValueError("--pick-leg-hybrid requires both wrist cameras")
+        if not args.use_real_hand:
+            raise ValueError("--pick-leg-hybrid requires --use-real-hand")
+        if variants["pick"] is None:
+            raise ValueError(
+                "--pick-leg-hybrid requires --policy-variant-pick for its "
+                "Phase 1 GR00T expert"
+            )
+        if getattr(args, "pick_leg_phase3_executor", "rule_based") != "rule_based":
+            raise ValueError(
+                "production --pick-leg-hybrid requires "
+                "--pick-leg-phase3-executor rule_based because the VLA Phase 3 "
+                "path has no finite completion contract"
+            )
     if full:
-        required = ("rotate_table", "pick", "insert", "rotate_leg", "flip")
+        if args.phase3_start_stage > args.phase3_end_stage:
+            raise ValueError("--phase3-start-stage must be <= --phase3-end-stage")
+        selected_stages = set(range(args.phase3_start_stage, args.phase3_end_stage + 1))
+        uses_leg_models = bool(selected_stages.intersection({1, 2, 3, 4}))
+        uses_rotate_table = bool(selected_stages.intersection({2, 3, 4}))
+        uses_flip = 5 in selected_stages
+        required = (
+            (("pick", "insert", "rotate_leg") if uses_leg_models else ())
+            + (("rotate_table",) if uses_rotate_table else ())
+            + (("flip",) if uses_flip else ())
+        )
         missing = [name for name in required if variants[name] is None]
         if missing:
             raise ValueError(
@@ -305,9 +368,22 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
             )
         if variants["move"] is not None:
             raise ValueError("Phase 3 full run must not load move_table_base")
-        _require_real_waist_and_hand(args, "Phase 3 full run")
-        if args.phase3_start_stage > args.phase3_end_stage:
-            raise ValueError("--phase3-start-stage must be <= --phase3-end-stage")
+        unused = [
+            name
+            for name in ("rotate_table", "pick", "insert", "rotate_leg", "flip")
+            if name not in required and variants[name] is not None
+        ]
+        if unused:
+            raise ValueError(
+                "Phase 3 full run includes unused policy variants: " + ",".join(unused)
+            )
+        _require_real_waist_and_hand(
+            args,
+            f"Phase 3 full run (stages {args.phase3_start_stage}"
+            f"..{args.phase3_end_stage})",
+            need_waist=uses_leg_models,
+            need_hand=uses_leg_models or uses_flip,
+        )
         return
     if stage == 0:
         if any(value is not None for value in variants.values()):
@@ -320,16 +396,23 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         return
 
     if stage in {1, 2, 3, 4}:
-        required = ("rotate_table", "pick", "insert", "rotate_leg")
+        required = ("pick", "insert", "rotate_leg") + (
+            ("rotate_table",) if stage in {2, 3, 4} else ()
+        )
         missing = [name for name in required if variants[name] is None]
         if missing:
             raise ValueError(
                 f"Phase 3 stage {stage} is missing policy variants: "
                 + ",".join(missing)
             )
-        if variants["move"] is not None or variants["flip"] is not None:
+        unused = [
+            name
+            for name in ("move", "rotate_table", "pick", "insert", "rotate_leg", "flip")
+            if name not in required and variants[name] is not None
+        ]
+        if unused:
             raise ValueError(
-                f"Phase 3 stage {stage} must not load unused move/flip policies"
+                f"Phase 3 stage {stage} includes unused policies: " + ",".join(unused)
             )
         _require_real_waist_and_hand(args, f"Phase 3 stage {stage}")
         return
@@ -761,6 +844,36 @@ def parse_args() -> argparse.Namespace:
             " embodiment)。未指定なら Issue #123 の CV + IK ルールベース実装。"
         ),
     )
+    p.add_argument(
+        "--pick-leg-hybrid",
+        action="store_true",
+        help=(
+            "Stage 1-4 の pick_table_leg を、VLM境界付きGR00T → G1 IK MP → "
+            "rule-based持ち替え → insert初期姿勢へ置換する。未指定なら従来の"
+            "policy-variant-pickをそのまま実行する"
+        ),
+    )
+    p.add_argument(
+        "--pick-leg-hybrid-config",
+        type=Path,
+        default=_DEFAULT_PICK_LEG_HYBRID_CONFIG,
+    )
+    p.add_argument(
+        "--pick-leg-phase3-executor",
+        choices=("vla", "rule_based"),
+        default="rule_based",
+        help=("本番Stageでは完了判定を持つrule_basedのみ許可する。vlaは単体評価用"),
+    )
+    p.add_argument(
+        "--pick-leg-vlm-endpoint",
+        default=None,
+        help="OpenAI-compatible chat-completions URL (default=hybrid YAML)",
+    )
+    p.add_argument(
+        "--pick-leg-vlm-model",
+        default=None,
+        help="served VLM model id (default=hybrid YAML)",
+    )
     # Issue #125: insert_table_leg VLA 選択 (未指定なら MockSkill fallback)
     p.add_argument(
         "--policy-variant-insert",
@@ -804,7 +917,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "flip_table に使う learned policy variant 名 (Issue #125)。"
-            " 例: groot_flip_table_n17_4 (suzuki n17_4、LeRobot GR00T)。未指定なら"
+            " 例: groot_flip_table_n17_2_baseline (suzuki baseline 20k、"
+            "Furniture-GR00T)。未指定なら"
             " MockSkill fallback。"
         ),
     )
@@ -1208,6 +1322,7 @@ def main() -> None:
         Orchestrator,
         build_stage_skill_sequence,
         build_stage_transitions,
+        model_transition_pairs_for_stage,
     )
     from inference.desktop.perception.cleaner import (
         load_cleanup_config,
@@ -1237,7 +1352,42 @@ def main() -> None:
         sys.exit(
             f"skill config invalid: 'skills' section missing in {args.skill_config}"
         )
+    from inference.desktop.lower_policy.initial_pose import (
+        apply_policy_variant_profile,
+    )
+
+    skill_cfg_raw = apply_policy_variant_profile(
+        skill_cfg_raw, "flip_table", args.policy_variant_flip
+    )
     skills_section: dict = skill_cfg_raw["skills"]
+    hybrid_pick_cfg = None
+    hybrid_pick_runtime: Optional[dict[str, object]] = None
+    if args.pick_leg_hybrid:
+        # Do the network/model/reference-image check before constructing any
+        # actuator.  A missing VLM can therefore never acquire arm_sdk/Dex1.
+        from inference.desktop.pick_leg_hybrid.real_skill import (
+            load_reference_images,
+            probe_vlm_endpoint,
+        )
+
+        hybrid_pick_cfg, references = load_reference_images(
+            args.pick_leg_hybrid_config,
+            endpoint_override=args.pick_leg_vlm_endpoint,
+            model_override=args.pick_leg_vlm_model,
+        )
+        endpoint = probe_vlm_endpoint(hybrid_pick_cfg, references)
+        hybrid_pick_runtime = {
+            "config": str(args.pick_leg_hybrid_config.resolve()),
+            "phase3_executor": args.pick_leg_phase3_executor,
+            "reference_count": len(references),
+            **endpoint,
+        }
+        print(
+            "[hybrid] production VLM/GR00T/MP preflight passed: "
+            f"model={endpoint['model']} references={len(references)} "
+            "phase3=rule_based; pick waist/legs=Regular",
+            file=sys.stderr,
+        )
     if args.phase1_11_arm_only:
         try:
             _validate_phase1_11_config(args, skills_section)
@@ -1376,7 +1526,9 @@ def main() -> None:
             _shared_mock_hand_instance = MockHandActuator()
         return _shared_mock_hand_instance
 
-    def _build_vla_skill_from_variant(variant, skill_name, VlaSkillClass):
+    def _build_vla_skill_from_variant(
+        variant, skill_name, VlaSkillClass, *, extra_skill_kwargs=None
+    ):
         """slot → VlaSkill (assembly が組み立て、policy を shutdown 対象に登録する)。"""
         built = assembly.build_vla_skill(
             skill_name=skill_name,
@@ -1389,6 +1541,7 @@ def main() -> None:
             # 先読み (ModelResidency) が読み込みと解放を握るので、stage 経路では
             # 必ず DeferredPolicy に包む。--gpu-models=all のときは起動時に全部読む。
             deferred=phase3_active and gpu_models is not None,
+            extra_skill_kwargs=extra_skill_kwargs,
         )
         _register_policy_resource(built.policy)
         print(
@@ -1399,7 +1552,9 @@ def main() -> None:
         )
         return built
 
-    def _build_vla_skill(variant_name, skill_name, VlaSkillClass):
+    def _build_vla_skill(
+        variant_name, skill_name, VlaSkillClass, *, extra_skill_kwargs=None
+    ):
         """CLI arg → VlaSkill instance (未指定なら MockSkill fallback)。"""
         if variant_name is None:
             return MockSkill(skill_name)
@@ -1410,7 +1565,12 @@ def main() -> None:
         if not args.policy_config.exists():
             sys.exit(f"policy config not found: {args.policy_config}")
         variant = _load_variant(args.policy_config, variant_name)
-        return _build_vla_skill_from_variant(variant, skill_name, VlaSkillClass).skill
+        return _build_vla_skill_from_variant(
+            variant,
+            skill_name,
+            VlaSkillClass,
+            extra_skill_kwargs=extra_skill_kwargs,
+        ).skill
 
     if args.policy_variant is not None:
         from inference.desktop.lower_policy.policies.config_loader import (
@@ -1502,8 +1662,37 @@ def main() -> None:
             file=sys.stderr,
         )
     elif args.policy_variant_pick is not None:
+        pick_skill_class = PickTableLegVlaSkill
+        pick_extra_kwargs = None
+        if args.pick_leg_hybrid:
+            from inference.desktop.pick_leg_hybrid.real_skill import (
+                RealPickLegHybridVlaSkill,
+            )
+
+            insert_initial = load_initial_pose(args.skill_config, "insert_table_leg")
+            # The hybrid never dispatches waist.  Apply this before assembly so
+            # both its MotionLimiter and returned BuiltSkill contract agree.
+            skills_section["pick_table_leg"]["dispatch_waist"] = False
+            pick_skill_class = RealPickLegHybridVlaSkill
+            pick_extra_kwargs = {
+                "hybrid_config_path": args.pick_leg_hybrid_config,
+                "hybrid_vlm_endpoint": args.pick_leg_vlm_endpoint,
+                "hybrid_vlm_model": args.pick_leg_vlm_model,
+                "phase3_executor": args.pick_leg_phase3_executor,
+                "next_initial_arm_target": insert_initial.arm_position_rad,
+                "next_initial_hand_target": insert_initial.dex1_target_rad,
+            }
+            print(
+                "[hybrid] Stage 1-4 pick_table_leg replaced with "
+                "VLM -> GR00T -> G1 IK MP -> rule-based handover -> "
+                "insert initial pose",
+                file=sys.stderr,
+            )
         pick_table_leg_skill = _build_vla_skill(
-            args.policy_variant_pick, "pick_table_leg", PickTableLegVlaSkill
+            args.policy_variant_pick,
+            "pick_table_leg",
+            pick_skill_class,
+            extra_skill_kwargs=pick_extra_kwargs,
         )
     else:
         pick_table_leg_skill = MockSkill("pick_table_leg")
@@ -1594,11 +1783,19 @@ def main() -> None:
         # rotate_table_base / flip_table の initial_pose を読み、CollisionAware
         # ArmPreMotionSkill の final_pose に渡す。Phase 1 profile と同じ
         # measured lowered walk + post_walk_settle も再利用 (安全境界維持)。
+        model_transition_skips = (
+            frozenset({("pick_table_leg", "insert_table_leg")})
+            if args.pick_leg_hybrid
+            else frozenset()
+        )
+        configured_model_transition_pairs: set[tuple[str, str]] = set()
+
         def _stage_sequence(stage: int) -> list[str]:
             return build_stage_skill_sequence(
                 stage,
                 is_start_stage=(stage == first_phase3_stage),
                 include_hand=include_hand_in_head,
+                skip_model_transition_pairs=model_transition_skips,
             )
 
         selected_skill_names = {
@@ -1618,7 +1815,7 @@ def main() -> None:
         # 評価経路と同じ関数で作る (Issue #141 D2 / D7-1)。
         for stage in selected_stages:
             head_skill = STAGE_HEAD_SKILL.get(stage)
-            if head_skill is None or (stage == 1 and stage != first_phase3_stage):
+            if head_skill is None or (stage != first_phase3_stage and stage != 0):
                 continue
             if any(
                 name in skill_registry
@@ -1636,6 +1833,38 @@ def main() -> None:
             ):
                 skill_registry[head.name] = head
 
+        # Insert a finite, measured transition before every subsequent model.
+        # The hybrid pick already performs and verifies pick->insert internally,
+        # so that one boundary is represented exactly once rather than moving
+        # the load-bearing arms out through the clearance route a second time.
+        for stage in selected_stages:
+            for previous_skill, next_skill in model_transition_pairs_for_stage(
+                stage,
+                is_start_stage=(stage == first_phase3_stage),
+                skip_model_transition_pairs=model_transition_skips,
+            ):
+                configured_model_transition_pairs.add((previous_skill, next_skill))
+                for transition_skill in assembly.build_model_transition_procedure(
+                    skill_config=skill_cfg_raw,
+                    previous_skill=previous_skill,
+                    next_skill=next_skill,
+                    initial_pose=load_initial_pose(args.skill_config, next_skill),
+                    hand_actuator=_build_hand_actuator(),
+                    hold_sec=args.setup_hold_sec,
+                    include_hand=include_hand_in_head,
+                    published_arm_target_provider=lambda: (
+                        arm_actuator.read_last_published_targets()[0]
+                    ),
+                ):
+                    existing = skill_registry.get(transition_skill.name)
+                    if existing is None:
+                        skill_registry[transition_skill.name] = transition_skill
+                    elif type(existing) is not type(transition_skill):
+                        raise RuntimeError(
+                            "model transition registry collision: "
+                            f"{transition_skill.name}"
+                        )
+
         # Stage の skill 列 → transition graph
         phase_transitions = (
             None
@@ -1644,11 +1873,20 @@ def main() -> None:
                 args.stage,
                 is_start_stage=True,
                 include_hand=include_hand_in_head,
+                skip_model_transition_pairs=model_transition_skips,
             )
         )
         # enter_check: DEFAULT_ENTER_CHECK に加え、新規 pre-motion / post_walk_settle
         # は timer + is_complete で進むので enter_check は常に False (dwell 経路)。
         phase_enter_check = dict(DEFAULT_ENTER_CHECK)
+        # Learned models may be entered only after their finite pose scaffold
+        # completes.  Perception predicates are moved to the *first* boundary
+        # skill below; otherwise a visible object could skip arm/hand staging.
+        learned_stage_names = {
+            name for stage in STAGE_SKILL_SEQUENCES.values() for name in stage
+        }
+        for learned_name in learned_stage_names:
+            phase_enter_check[learned_name] = lambda _dets, _state: False
         for extra in (
             "post_walk_settle",
             "arm_pre_motion_for_rotate_table_base",
@@ -1656,6 +1894,31 @@ def main() -> None:
             "rotate_table_base",
         ):
             phase_enter_check[extra] = lambda _dets, _state: False
+        for finite_name in selected_skill_names:
+            if finite_name.startswith(
+                (
+                    "hand_open_",
+                    "hand_pose_",
+                    "hand_grasp_",
+                    "arm_pre_motion_for_",
+                    "hold_pose_for_",
+                    "arm_transition_",
+                    "hand_transition_",
+                    "hold_transition_",
+                )
+            ):
+                phase_enter_check[finite_name] = lambda _dets, _state: False
+        from inference.desktop.orchestrator import model_transition_skill_names
+
+        for previous_skill, next_skill in configured_model_transition_pairs:
+            first_boundary = model_transition_skill_names(
+                previous_skill,
+                next_skill,
+                include_hand=include_hand_in_head,
+            )[0]
+            phase_enter_check[first_boundary] = DEFAULT_ENTER_CHECK.get(
+                next_skill, lambda _dets, _state: False
+            )
         print(
             (
                 f"[init] Phase 3 continuous stages="
@@ -1711,6 +1974,22 @@ def main() -> None:
                     f"got {action!r}"
                 )
             stage_timeout_actions[skill_name] = action
+        # The hybrid is a finite multi-controller state machine, not the old
+        # learned pick expert.  Its validated wall-clock budget therefore owns
+        # the pick timeout.  Most importantly, timeout must fail closed: moving
+        # on to insert with an unconfirmed grasp/handover can drop the part or
+        # drive the arms through one another.
+        if args.pick_leg_hybrid:
+            assert hybrid_pick_cfg is not None
+            stage_hard_timeouts["pick_table_leg"] = (
+                hybrid_pick_cfg.runtime.hard_timeout_sec
+            )
+            stage_timeout_actions["pick_table_leg"] = "stop"
+            print(
+                "[hybrid] pick_table_leg timeout="
+                f"{hybrid_pick_cfg.runtime.hard_timeout_sec:g}s action=stop/HOLD",
+                file=sys.stderr,
+            )
         print(
             f"[init] Phase 3 hard timeouts={stage_hard_timeouts} "
             f"actions={stage_timeout_actions}",
@@ -1728,7 +2007,7 @@ def main() -> None:
         initial_skill = (
             "rule_pick_pre_motion"
             if rule_based_pick_active
-            else STAGE_SKILL_SEQUENCES[first_stage][0]
+            else _stage_sequence(first_stage)[0]
         )
     else:
         initial_skill = "setup"
@@ -1903,6 +2182,7 @@ def main() -> None:
                     "actuate": args.actuate,
                     "use_real_waist": args.use_real_waist,
                     "use_real_hand": args.use_real_hand,
+                    "pick_leg_hybrid": hybrid_pick_runtime,
                     "started_at": datetime.now().isoformat(),
                 }
             )
@@ -1977,6 +2257,11 @@ def main() -> None:
                     first_phase3_stage,
                     is_start_stage=True,
                     include_hand=include_hand_in_head,
+                    skip_model_transition_pairs=(
+                        model_transition_skips
+                        if phase3_active and not rule_based_pick_active
+                        else frozenset()
+                    ),
                 )
             )
             if first_phase3_stage is not None
@@ -2003,6 +2288,7 @@ def main() -> None:
                     first_phase3_stage,
                     is_start_stage=True,
                     include_hand=include_hand_in_head,
+                    skip_model_transition_pairs=model_transition_skips,
                 )
                 if args.phase3_full
                 else phase_transitions
@@ -2238,6 +2524,16 @@ def main() -> None:
         print("[run] starting orchestrator tick loop", file=sys.stderr)
         if args.phase3_full:
             for stage in range(args.phase3_start_stage, args.phase3_end_stage + 1):
+                if stage == 5:
+                    # Stages 1..4 may have dispatched a waist target.  Stage 5
+                    # explicitly leaves waist/legs to Regular Mode, so stale
+                    # targets must not survive the stage boundary.
+                    arm_actuator.clear_waist_action()
+                    print(
+                        "[boundary] Stage 5 waist target cleared; "
+                        "waist/legs remain Regular-owned",
+                        file=sys.stderr,
+                    )
                 if stage != args.phase3_start_stage:
                     # Stop the previous Skill (which releases only its model),
                     # while arm/Dex1 publishers continue holding their latest
@@ -2265,6 +2561,7 @@ def main() -> None:
                     stage,
                     is_start_stage=(stage == args.phase3_start_stage),
                     include_hand=include_hand_in_head,
+                    skip_model_transition_pairs=model_transition_skips,
                 )
                 residency = _build_residency(stage_sequence)
                 if residency is not None:
@@ -2279,6 +2576,7 @@ def main() -> None:
                         stage,
                         is_start_stage=(stage == args.phase3_start_stage),
                         include_hand=include_hand_in_head,
+                        skip_model_transition_pairs=model_transition_skips,
                     )[0],
                     joint_state_source=joint_state_source,
                     dex1_state_source=dex1_state_source,
@@ -2289,6 +2587,7 @@ def main() -> None:
                         stage,
                         is_start_stage=(stage == args.phase3_start_stage),
                         include_hand=include_hand_in_head,
+                        skip_model_transition_pairs=model_transition_skips,
                     ),
                     enter_check=phase_enter_check,
                     actuator_send_fn=actuator_send_fn,
@@ -2338,6 +2637,35 @@ def main() -> None:
             )
     except LiveSourceSafetyError as e:
         print(f"[safety-stop] {e}", file=sys.stderr)
+        if phase3_active and args.actuate and arm_actuator_started:
+            # Do not turn a model-boundary failure into an immediate arm drop. Both
+            # actuator publisher threads still own their last safe targets at
+            # this point.  Keep them alive until the operator has secured the
+            # table leg / arms, then let the one common finally block perform
+            # the controlled arm_sdk release.
+            if recorder is not None:
+                recorder.write_event(
+                    {
+                        "event": "phase3_safety_hold",
+                        "reason": str(e),
+                        "instruction": "operator_ack_before_controlled_release",
+                        "monotonic_ns": time.monotonic_ns(),
+                    }
+                )
+            print(
+                "[Phase 3 HOLD] Last safe arm and Dex1 targets remain active. "
+                "Use E-stop immediately for dangerous motion. Otherwise secure "
+                "the object/support the arms, then press Enter for controlled "
+                "release.",
+                file=sys.stderr,
+            )
+            try:
+                input()
+            except EOFError:
+                print(
+                    "[Phase 3 HOLD] stdin closed; proceeding to controlled release",
+                    file=sys.stderr,
+                )
         raise SystemExit(2)
     except KeyboardInterrupt:
         pass
