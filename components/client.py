@@ -305,6 +305,10 @@ def main():
     )
     print("[client] waiting for the organizer's endpoints...")
     cameras.wait_until_live()
+    # live 判定が済んだら閉じる。**hot loop は raw_cameras 側しか使わない**ので、
+    # 張りっぱなしにすると bridge が同じ frame を 2 回配ることになる
+    # (実測 0.338 MB x 30 Hz = 10 MB/s の二重配信)。
+    cameras.close()
     state = states.wait_until_live()
     print(
         f"[client] endpoints live (hand state "
@@ -351,7 +355,7 @@ def main():
     finally:
         inference.close()
         sink.close()
-        cameras.close()
+        cameras.close()  # live 判定の直後に閉じてある。二重呼び出しは LINGER=0 で安全
         raw_cameras.close()
         states.close()
         grippers.close()

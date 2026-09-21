@@ -14,6 +14,7 @@ from pathlib import Path
 import msgpack
 import numpy as np
 import pytest
+import zmq
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parents[2]
@@ -171,5 +172,104 @@ def test_a_stale_measurement_falls_back_instead_of_freezing():
     assert src.measured_is_fresh is True
 
     src.update(None, t=3, obs_t=10.6)  # 0.5s 超え
+    assert src.measured_is_fresh is False
+    assert src.get() == "synthetic"
+
+
+# ---------------------------------------------------------------- 鮮度 (レビュー指摘)
+#
+# `poll()` が古い値を無期限に返すと、下流の `MeasuredDex1StateSource` は
+# 「dict が来た」だけで新鮮さを更新するので **stale_after_s に一度も入れない**。
+# `real_orin_state.py` (:5557) だけが落ちて `real_orin_cameras.py` (:5555) が
+# 生きている場合、カメラ鮮度でも検出できず、凍結した把持状態を実測として
+# 渡し続けることになる。
+class _FakeSocket:
+    """`recv(NOBLOCK)` だけを差し替えた最小の socket。"""
+
+    def __init__(self, blobs=()):
+        self.pending = list(blobs)
+
+    def recv(self, flags=0):
+        if not self.pending:
+            raise zmq.Again()
+        return self.pending.pop(0)
+
+    def close(self, linger=0):
+        pass
+
+
+def _stream(monkeypatch, blobs=(), stale_after_s=0.5):
+    s = GripperStateStream.__new__(GripperStateStream)
+    s.endpoint = "tcp://test"
+    s._socket = _FakeSocket(blobs)
+    s._stale_after_s = stale_after_s
+    s._latest = None
+    s._latest_at = None
+    return s
+
+
+def test_a_frozen_sample_stops_being_returned(monkeypatch):
+    """bridge が止まったら poll() が None を返すこと。
+
+    ここで期限切れにしないと `MeasuredDex1StateSource.update()` が毎 tick
+    成功扱いになり、`measured_is_fresh` が恒久的に True になる。
+    """
+    import components.ramen.gripper_state as gs
+
+    now = [100.0]
+    monkeypatch.setattr(gs.time, "monotonic", lambda: now[0])
+
+    s = _stream(monkeypatch, [_blob(_sides(0.0, -5.30))], stale_after_s=0.5)
+    assert s.poll() is not None, "届いた直後は返る"
+
+    now[0] += 0.4
+    assert s.poll() is not None, "0.4s はまだ新鮮"
+
+    now[0] += 0.2  # 合計 0.6s
+    assert s.poll() is None, "0.5s を超えたら返さない"
+    assert s.age_s == pytest.approx(0.6)
+
+
+def test_a_fresh_sample_revives_the_stream(monkeypatch):
+    """復旧したら また返すこと (一度切れたら終わり、にしない)。"""
+    import components.ramen.gripper_state as gs
+
+    now = [100.0]
+    monkeypatch.setattr(gs.time, "monotonic", lambda: now[0])
+
+    s = _stream(monkeypatch, [_blob(_sides(0.0, -5.30))], stale_after_s=0.5)
+    s.poll()
+    now[0] += 1.0
+    assert s.poll() is None
+
+    s._socket.pending.append(_blob(_sides(-1.0, -2.0)))
+    assert s.poll() is not None
+    assert s.age_s == pytest.approx(0.0)
+
+
+def test_the_downstream_staleness_check_now_fires(monkeypatch):
+    """poll() が None になれば measured_is_fresh も落ちること (経路の結合)。"""
+    import components.ramen.gripper_state as gs
+
+    now = [100.0]
+    monkeypatch.setattr(gs.time, "monotonic", lambda: now[0])
+
+    class _Fallback:
+        def get(self):
+            return "synthetic"
+
+    stream = _stream(monkeypatch, [_blob(_sides(0.0, -5.30))], stale_after_s=0.5)
+    src = MeasuredDex1StateSource(fallback=_Fallback(), stale_after_s=0.5)
+
+    obs_t = 10.0
+    src.update(stream.poll(), t=1, obs_t=obs_t)
+    assert src.measured_is_fresh is True
+
+    # bridge が止まる。obs (カメラ) は動き続ける
+    now[0] += 1.0
+    for i in range(20):
+        obs_t += 0.05
+        src.update(stream.poll(), t=2 + i, obs_t=obs_t)
+
     assert src.measured_is_fresh is False
     assert src.get() == "synthetic"

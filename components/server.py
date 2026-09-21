@@ -160,6 +160,17 @@ class _JpegObsPolicy:
     def reset(self):
         return self._policy.reset()
 
+    def close(self):
+        """policy の後片付けを落とさない。
+
+        `serve_policy` は今のところ呼ばないが、`components/ramen/policy.py` の
+        4 クラスはいずれも `close()` を持ち、`OrchestratorTaskspacePolicy.close()`
+        は GPU 上の expert を解放する。**interface を黙って痩せさせるラッパ**は、
+        後で shutdown 処理を足したときに静かに握りつぶす。
+        """
+        close = getattr(self._policy, "close", None)
+        return close() if callable(close) else None
+
 
 class Policy:
     """Reference policy: correct shapes, no intelligence.

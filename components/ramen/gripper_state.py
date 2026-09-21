@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import msgpack
 import zmq
@@ -44,6 +45,19 @@ import zmq
 #: `boundary/states.py` と同じ topic prefix / port。
 STATE_TOPIC = "g1_debug"
 DEFAULT_PORT = 5557
+
+#: この時間 新しい sample が来なければ「読めていない」とみなす。
+#:
+#: bridge は 50 Hz で publish する (`real_orin_state.py:82`) ので、0.5s を超えるのは
+#: **bridge 自体が止まったとき**。カメラの鮮度判定と同じ基準にしてある。
+#:
+#: ⚠️ **ここで期限切れにしないと、下流の staleness 判定が原理的に発火しない。**
+#: `MeasuredDex1StateSource` は「dict が来たかどうか」で新鮮さを更新するので、
+#: 古い値を返し続けると毎 tick 更新されてしまい、`stale_after_s` に入れない。
+#: `real_orin_state.py` (:5557) だけが落ちて `real_orin_cameras.py` (:5555) が
+#: 生きている場合、カメラ鮮度では検出できず、**凍結した把持状態を「実測」として
+#: model に渡し続ける**ことになる。
+STALE_AFTER_S = 0.5
 
 #: 運営が `gripper_q` に入れる per-side のキー。
 SIDES = ("left", "right")
@@ -60,9 +74,16 @@ class GripperStateStream:
     Args:
         host: 運営の state endpoint のホスト (client の ``--orin`` と同じ)。
         port: 既定 5557。
+        stale_after_s: この時間 新しい sample が来なければ None を返す。
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = DEFAULT_PORT,
+        *,
+        stale_after_s: float = STALE_AFTER_S,
+    ) -> None:
         self.endpoint = f"tcp://{host}:{port}"
         context = zmq.Context.instance()
         self._socket = context.socket(zmq.SUB)
@@ -70,13 +91,16 @@ class GripperStateStream:
         self._socket.setsockopt(zmq.CONFLATE, 1)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.connect(self.endpoint)
+        self._stale_after_s = float(stale_after_s)
         self._latest: dict | None = None
+        self._latest_at: float | None = None
 
     def poll(self) -> dict | None:
-        """最新の `gripper_q` を返す。まだ 1 度も来ていなければ None。
+        """最新の `gripper_q` を返す。無い / 古ければ None。
 
-        非 blocking。新しい message が無ければ直近の値をそのまま返す
-        (`boundary.StateStream.latest()` と同じ意味)。
+        非 blocking。**`stale_after_s` を超えた値は返さない** —
+        `boundary.StateStream.latest()` と違い、古い値を握り続けない。理由は
+        `STALE_AFTER_S` の comment。
 
         Returns:
             ``{"left": {"q": float, "dq": float, "tau_est": float}, "right": {...}}``
@@ -91,7 +115,17 @@ class GripperStateStream:
             decoded = self._decode(blob)
             if decoded is not None:
                 self._latest = decoded
+                self._latest_at = time.monotonic()
+        if self.age_s is None or self.age_s > self._stale_after_s:
+            return None
         return self._latest
+
+    @property
+    def age_s(self) -> float | None:
+        """最後に受けた sample の経過秒。1 度も来ていなければ None。"""
+        if self._latest_at is None:
+            return None
+        return time.monotonic() - self._latest_at
 
     @staticmethod
     def _decode(blob: bytes) -> dict | None:
