@@ -343,3 +343,44 @@ def test_the_hold_is_reported_once(capsys):
         drv.act(_obs())
 
     assert capsys.readouterr().err.count("[orch-driver] HOLD:") == 1
+
+
+# ---------------------------------------------------------------- 鮮度の測り方
+def test_a_stalled_camera_enters_hold():
+    """`obs["t"]` が許容を超えて動かなければ HOLD に入ること。"""
+    from components.ramen.orchestrator_driver import _CAMERA_STALE_TIMEOUT_S
+
+    drv = _driver()
+    drv.act(_obs(t=100.0))
+    assert drv._hold_reason is None
+
+    # 同じ frame が来続ける状態を作る (受信時刻を過去にずらす)。
+    drv._frame_received_ns -= int((_CAMERA_STALE_TIMEOUT_S + 0.2) * 1e9)
+    drv.act(_obs(t=100.0))
+
+    assert drv._hold_reason is not None
+    assert "カメラが止まっている" in drv._hold_reason
+
+
+def test_a_slow_tick_does_not_look_like_a_stalled_camera():
+    """**model のロードで tick が長引いても鮮度で落ちないこと。**
+
+    `tick()` の中では `dispatcher.start()` が model を同期ロードする
+    (起動直後の pick は 45 秒)。`_check_camera_freshness` はそのロードの **後** に
+    あるので、そこで測ると「45 秒古い frame」に見えて誤発火する
+    (2026-09-21 に pod で実測)。判定は取り込んだ瞬間に行う。
+    """
+
+    class _SlowOrch(_FakeOrch):
+        def tick(self, frame):  # noqa: ANN001
+            time.sleep(0.8)  # 許容 0.5s より長い「ロード」
+            return super().tick(frame)
+
+    drv = _driver()
+    drv._orch = _SlowOrch()
+
+    drv.act(_obs(t=1.0))
+    drv.act(_obs(t=2.0))  # 運営は新しい frame を送り続けている
+
+    assert drv._hold_reason is None, drv._hold_reason
+    assert drv._orch.ticks == 2

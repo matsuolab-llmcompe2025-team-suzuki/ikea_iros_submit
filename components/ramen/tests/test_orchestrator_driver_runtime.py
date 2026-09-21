@@ -271,7 +271,7 @@ def built_driver(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     yield drv
     drv.close()
 
@@ -603,7 +603,7 @@ def test_the_built_driver_resumes_at_the_requested_leg(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("RAMEN_START_LEG", "3")
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     try:
         assert drv._orch.state.current_skill == "rotate_table_base"
         assert drv._orch.state.n_legs_completed == 2

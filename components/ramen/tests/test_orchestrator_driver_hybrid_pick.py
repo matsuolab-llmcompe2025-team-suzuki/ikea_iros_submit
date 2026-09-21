@@ -84,7 +84,7 @@ def test_the_built_driver_uses_the_groot_pick_by_default(clean_env, monkeypatch)
     _stub_yolo(monkeypatch)
     from inference.desktop.lower_policy.skills.vla_skill import PickTableLegVlaSkill
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     try:
         pick = drv._orch.dispatcher._skills["pick_table_leg"]
         assert type(pick) is PickTableLegVlaSkill
@@ -163,7 +163,7 @@ def test_the_hybrid_owns_the_pick_timeout(clean_env, stub_probe, monkeypatch):
     _stub_yolo(monkeypatch)
     clean_env.setenv("RAMEN_PICK_HYBRID", "1")
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     try:
         assert drv._orch.hard_timeout_by_skill["pick_table_leg"] == 30.0
         assert drv._orch.timeout_action_by_skill["pick_table_leg"] == "stop"
@@ -179,7 +179,7 @@ def test_without_the_hybrid_the_pick_timeout_stays_at_the_yaml_value(
     """既定では YAML の 21s のまま = 今までどおり。"""
     _stub_yolo(monkeypatch)
 
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     try:
         assert drv._orch.hard_timeout_by_skill["pick_table_leg"] == 21.0
     finally:
@@ -248,7 +248,7 @@ def test_only_pick_is_replaced(clean_env, stub_probe, monkeypatch):
     from inference.desktop.pick_leg_hybrid.real_skill import RealPickLegHybridVlaSkill
 
     clean_env.setenv("RAMEN_PICK_HYBRID", "1")
-    drv = OrchestratorDriver()
+    drv = OrchestratorDriver(prime_first_model=False)
     try:
         skills = drv._orch.dispatcher._skills
         assert isinstance(skills["pick_table_leg"], RealPickLegHybridVlaSkill)

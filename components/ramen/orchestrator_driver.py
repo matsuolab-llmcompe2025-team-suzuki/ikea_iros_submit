@@ -102,6 +102,13 @@ _DEFAULT_RESIDENT_MODELS = 2
 # `_load_stage_timeouts` の docstring。`RAMEN_ON_TIMEOUT` で上書きできる。
 _BOUNDARY_TIMEOUT_ACTION = "advance"
 _TIMEOUT_ACTIONS = frozenset({"advance", "stop"})
+# カメラが止まったとみなすまでの時間。自前経路と同じ値 (assembly.CAMERA_STALE_TIMEOUT_S)。
+# 判定は driver の `_ingest_images` で行う (理由はそこの comment)。
+_CAMERA_STALE_TIMEOUT_S = 0.50
+# orchestrator 側の同じ判定は **保険**として緩めに回す。`tick()` の中では
+# `dispatcher.start()` の同期ロード (起動直後 45s / 切替 8〜16s) を挟むので、
+# 0.5s のままだと model を読むたびに誤発火する。
+_ORCH_CAMERA_STALE_TIMEOUT_S = 120.0
 
 
 def _variant_override(skill_name: str, default: str) -> str:
@@ -377,6 +384,7 @@ class OrchestratorDriver:
         device: str | None = None,
         dex1_open_fraction: tuple[float, float] = (1.0, 1.0),
         ee_frame_transform: np.ndarray | None = None,
+        prime_first_model: bool = True,
     ):
         if _VENDOR_DESKTOP not in sys.path:
             sys.path.insert(0, _VENDOR_DESKTOP)
@@ -541,6 +549,12 @@ class OrchestratorDriver:
         # (実測: pick 24.7s / insert 92s / rotate_leg 69s)。会場では
         # その間ずっと運営へ (T,25) を返せない。
         self._residency = self._build_residency(policies)
+        if self._residency is not None and prime_first_model:
+            # 最初の model を **serve する前に** 読む。自前経路も stage 開始前に
+            # `residency.prime()` を呼んでいる。これが無いと 1 tick 目の中で
+            # 同期ロード (pick は 45 秒) が走り、その間に運営から来た frame が
+            # 古くなって鮮度チェックに掛かる (2026-09-21 に pod で実測)。
+            self._residency.prime()
 
         # JSONL ログ。手順書が「log の taskspace_25 を確認」と案内しているのに
         # boundary 経路だけ何も残らなかった。path を渡されたときだけ書く。
@@ -574,6 +588,7 @@ class OrchestratorDriver:
             policy_filter=policy_filter,
             log_sink=log_sink,
             on_tick=self._on_tick,
+            camera_stale_timeout_s=_ORCH_CAMERA_STALE_TIMEOUT_S,
         )
         self._seed_resume_state()
         print(
@@ -690,6 +705,8 @@ class OrchestratorDriver:
             return self._held_action(body_q)
 
         self._ingest_images(obs)
+        if self._hold_reason is not None:  # 取り込みでカメラが止まったと判定した
+            return self._held_action(body_q)
         frame = self._head_frame()
 
         self._arm.reset()
@@ -776,13 +793,27 @@ class OrchestratorDriver:
         入れていた。YOLO は検出 0、policy は真っ黒 wrist で推論を続けるので、
         症状が「動いているのに掴まない」になり切り分けられない)。
         """
+        now_ns = time.monotonic_ns()
         obs_t = obs.get("t")
         if obs_t is not None and obs_t != self._last_obs_t:
             self._last_obs_t = obs_t
-            self._frame_received_ns = time.monotonic_ns()
+            self._frame_received_ns = now_ns
         # 運営が t を入れない構成でも止まらないよう、未設定なら今を使う。
-        received_ns = self._frame_received_ns or time.monotonic_ns()
+        received_ns = self._frame_received_ns or now_ns
         generation = int(float(obs_t) * 1e9) if obs_t is not None else int(received_ns)
+
+        # ⚠️ 鮮度は **ここ (取り込んだ瞬間) で測る。**
+        # orchestrator 側の `_check_camera_freshness` は `tick()` の (d) にあり、
+        # その手前の (a)/(c) で `dispatcher.start()` が model を同期ロードする。
+        # 起動直後の pick は 45 秒かかるので、そこで測ると「45 秒古い frame」に
+        # 見えて誤発火する (2026-09-21 に pod で実測)。運営は act() を呼び続けて
+        # いるので、次の呼び出しでは新しい t が来ている = ここで測れば影響を受けない。
+        age_s = (now_ns - self._frame_received_ns) / 1e9
+        if self._frame_received_ns and age_s > _CAMERA_STALE_TIMEOUT_S:
+            self._enter_hold(
+                f"カメラが止まっている: obs['t'] が {age_s:.2f}s 変わらない "
+                f"(許容 {_CAMERA_STALE_TIMEOUT_S:g}s)"
+            )
 
         images = obs.get("images") or {}
         for key, slot in (
