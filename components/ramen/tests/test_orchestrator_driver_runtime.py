@@ -212,3 +212,70 @@ def test_the_driver_stops_after_four_legs():
 
     assert drv._advance_halted is True
     assert drv._orch.advanced == 0
+
+
+# ---------------------------------------------------- __init__ の配線
+@pytest.fixture
+def built_driver(monkeypatch):
+    """YOLO だけ差し替えて driver を実際に構築する (model は deferred のまま)。
+
+    `_build_residency` を直接呼ぶ test だけだと、`__init__` から配線が外れても
+    気付けない。ここで組み立てまで通す。
+    """
+    import inference.desktop.perception.yolo_obb as yolo
+
+    class _StubYolo:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def predict(self, rgb):  # noqa: ANN001
+            return []
+
+    monkeypatch.setattr(yolo, "YoloObbPerception", _StubYolo)
+    monkeypatch.setattr(
+        OrchestratorDriver, "_resolve_yolo_weight", staticmethod(lambda ref: "stub.pt")
+    )
+    monkeypatch.delenv("RAMEN_GPU_MODELS", raising=False)
+    monkeypatch.delenv("RAMEN_ORCH_LOG", raising=False)
+
+    drv = OrchestratorDriver()
+    yield drv
+    drv.close()
+
+
+def test_the_driver_wires_the_residency_and_tick_hook(built_driver):
+    """`__init__` が先読みと hook を Orchestrator に渡していること。"""
+    assert built_driver._residency is not None, "先読みが配線から外れている"
+    assert built_driver._orch.on_tick is not None, "on_tick が渡っていない"
+    assert built_driver._orch.policy_filter is not None, "policy_filter が渡っていない"
+
+
+def test_the_driver_passes_the_hard_timeouts(built_driver):
+    """時間切れの受け皿が 4 skill 分渡っていること。"""
+    hard = built_driver._orch.hard_timeout_by_skill
+    for name, _cls, _variant in _STAGE_SKILLS:
+        assert name in hard, name
+        assert hard[name] > 0
+
+
+def test_the_driver_uses_the_looping_transition_graph(built_driver):
+    """脚が 1 本で終わらないこと。"""
+    assert built_driver._orch.transitions["rotate_leg_to_tighten"] == [
+        "rotate_table_base"
+    ]
+
+
+def test_the_log_sink_is_opt_in(monkeypatch, tmp_path):
+    """`RAMEN_ORCH_LOG` が無ければ None、あれば書ける object。"""
+    monkeypatch.delenv("RAMEN_ORCH_LOG", raising=False)
+    assert OrchestratorDriver._build_log_sink() is None
+
+    path = tmp_path / "orch.jsonl"
+    monkeypatch.setenv("RAMEN_ORCH_LOG", str(path))
+    sink = OrchestratorDriver._build_log_sink()
+    try:
+        assert sink is not None
+        sink.write('{"probe": 1}\n')
+    finally:
+        sink.close()
+    assert path.read_text(encoding="utf-8").strip() == '{"probe": 1}'
