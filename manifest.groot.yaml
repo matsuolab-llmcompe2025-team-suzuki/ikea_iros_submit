@@ -16,8 +16,8 @@ images:
     # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
     #
     # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-residency"
-    digest: "sha256:04d308b5a59b9d364afb100f74ad23c68b0ca316031fc18d982c93632a36d848"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-ramenori"
+    digest: "sha256:6846a25500f151bdc155c3dbb45b8f7c0ad44284dd9d591701ae96690ba7563f"
     #   単一 platform (linux/arm64) の OCI manifest。index ではないので digest はこれ 1 本。
     #   config の architecture=arm64 / os=linux を GHCR 上で確認済み。
     #
@@ -157,8 +157,20 @@ images:
     #      載せに行くため、機体によっては入らない。
     #      増やすときは `-e RAMEN_GPU_MODELS=<n>` で明示する。
     #
+    #  18. **RAMEN-Ori を rotate_table_base の選択肢として載せた。**
+    #      推論に lerobot fork は要らない (fork は model/ramen_ori/pixi.toml =
+    #      training env の方)。image に hydra-core / omegaconf / lingbot-vision を
+    #      足し、model/ramen_ori/ を vendor に同期した。
+    #      `-e RAMEN_VARIANT_<SKILL>=<variant>` で焼き直さずに差し替えられる:
+    #        -e RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32
+    #      実 image で load + 3 tick forward (chunk (1,19) finite、load 26.6s) と
+    #      orchestrator 経由の組み立て (type=ramen_ori / skill_id=4) を確認済み。
+    #      ⚠️ boundary は単一 head を複製するので HEAD_RIGHT は HEAD_LEFT と同じ
+    #        画像になる (4 cam で学習した model には劣化入力だが動く)。
+    #
     # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
-    #      20260921-parity              … 上記 17 が無い。**切替のたびに 8 秒止まる**
+    #      20260921-residency           … 上記 18 が無い (RAMEN-Ori を選べない)
+    #      20260921-parity              … 上記 17-18 が無い。**切替のたびに 8 秒止まる**
     #      20260921-advance-backup      … 上記 15-17 が無い。**別 prompt で推論し、
     #        skill 切替のたびに 25〜92 秒止まり、脚が 1 本しか回らない**
     #      20260921-stage-dds-fix       … 上記 14-16 が無い。**YOLO が落ちると止まったまま**
