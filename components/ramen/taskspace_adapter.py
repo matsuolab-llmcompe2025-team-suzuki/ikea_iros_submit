@@ -66,6 +66,32 @@ DEX1_OPEN_VALUE: float = 4.5
 DEFAULT_BASE_HEIGHT_M: float = 0.74
 
 
+# 骨盤高さとして通してよい範囲 [m]。**歯止めであって clamp ではない。**
+#
+# col [21] は運営側でも `boundary/actions.py` でも範囲を検証されない
+# (hand は [-1,1]、quat は unit norm を見るのに、下半身列だけ素通し)。
+# 実際 `0.0` が数週間どこにも引っかからずに WBC へ届いていた。
+# 単位違いや config の typo をここで止める。
+BASE_HEIGHT_MIN_M: float = 0.3
+BASE_HEIGHT_MAX_M: float = 1.0
+
+
+def check_base_height(base_height_cmd: float) -> float:
+    """骨盤高さ目標が妥当な範囲かを見る。範囲外なら `ValueError`。
+
+    clamp しないのは、**黙って直すと「なぜ違う値が出たか」が分からなくなる**ため。
+    呼出側 (driver / run_live) は例外を HOLD に変換するので、fail-safe に倒れる。
+    """
+    value = float(base_height_cmd)
+    if not BASE_HEIGHT_MIN_M <= value <= BASE_HEIGHT_MAX_M:
+        raise ValueError(
+            f"base_height_cmd {value} is outside the plausible pelvis height "
+            f"range [{BASE_HEIGHT_MIN_M}, {BASE_HEIGHT_MAX_M}] m. "
+            "0 means 'sink the pelvis to the floor', not 'leave it unset' — "
+            "the organizer relays col [21] literally (wbc_adapter/wbc_driver.py:455)."
+        )
+    return value
+
 def rotation_matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
     """3x3 回転行列 → 単位 quaternion (w, x, y, z)。
 
@@ -169,7 +195,7 @@ def groot_action_to_taskspace(
     out[11:14] = right_pos
     out[14:18] = rotation_matrix_to_quat_wxyz(right_R)
     out[18:21] = np.asarray(navigate_cmd, dtype=np.float32)
-    out[21] = float(base_height_cmd)
+    out[21] = check_base_height(base_height_cmd)
     out[22:25] = np.asarray(torso_rpy_cmd, dtype=np.float32)
     return out
 

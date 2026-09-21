@@ -458,6 +458,8 @@ class OrchestratorDriver:
         #: HOLD の理由 (None = 通常運転)。`reset` で解ける。
         self._hold_reason: str | None = None
         self._last_step19: np.ndarray | None = None
+        #: 直前に publish した `(T,25)`。`_taskspace` が落ちたときの最後の砦。
+        self._last_actions: np.ndarray | None = None
         # カメラ: 運営の obs["t"] が変わった瞬間を「届いた瞬間」として刻む。
         self._last_obs_t: object = None
         self._frame_received_ns = 0
@@ -809,8 +811,19 @@ class OrchestratorDriver:
             fallback_hand2=self._initial_hand2,
         )
         self._last_step19 = step19
+        # `_taskspace` も try に入れる。ここを素通りさせると `serve_policy` が
+        # traceback を client へ返して **接続を切る** (`components/transport.py`)。
+        # 会場ではそれが run の終わりになる。FK / 列の組み立てで想定外が出ても、
+        # 「返し続けるが新しい動きは作らない」に倒す方が安全。
+        try:
+            actions = self._taskspace(step19, body_q)
+        except BaseException as exc:  # noqa: BLE001
+            self._enter_hold(f"taskspace: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            return self._held_action(body_q)
+        self._last_actions = actions
         return {
-            "actions": self._taskspace(step19, body_q),
+            "actions": actions,
             "current_skill": getattr(result, "current_skill", None) if result else None,
         }
 
@@ -1044,11 +1057,24 @@ class OrchestratorDriver:
                 pass
 
     def _held_action(self, body_q: np.ndarray) -> dict:
-        """現在の実測姿勢 + 直近の手指令で `(T,25)` を組む (新しい動きは作らない)。"""
+        """現在の実測姿勢 + 直近の手指令で `(T,25)` を組む (新しい動きは作らない)。
+
+        **ここは最後の砦なので例外を出さない。** `_taskspace` が落ちたら、直前に
+        publish した行をそのまま返す。それも無ければ (起動直後) 例外を上げるしか
+        ないが、その場合は `act()` の 1 回目なので運営へ届く前に気づける。
+        """
         hand2 = self._hand.last if self._hand.last is not None else self._initial_hand2
         step19 = assemble_19d(None, body_q[15:29], hand2, measured_waist3=body_q[12:15])
+        try:
+            actions = self._taskspace(step19, body_q)
+        except BaseException:  # noqa: BLE001
+            if self._last_actions is None:
+                raise
+            traceback.print_exc()
+            actions = self._last_actions
+        self._last_actions = actions
         return {
-            "actions": self._taskspace(step19, body_q),
+            "actions": actions,
             "current_skill": self._orch.state.current_skill,
         }
 

@@ -98,6 +98,7 @@ def _driver(initial_hand2=_INSERT_HAND) -> OrchestratorDriver:
     drv._advance_halted = False
     drv._hold_reason = None
     drv._last_step19 = None
+    drv._last_actions = None
     drv._last_obs_t = None
     drv._frame_received_ns = 0
     drv._head_bgr = None
@@ -643,3 +644,39 @@ def test_reset_drops_the_measured_gripper_state():
     assert drv._dex1_was_measured is False
     # 「この run で一度は取れた」は診断用に残す。
     assert drv._dex1_src.ever_measured is True
+
+
+# ---------------------------------------------------------------- (T,25) 生成の失敗
+#
+# `_taskspace` は以前 try の外にあった。ここで例外が出ると `serve_policy` が
+# traceback を client へ返して **接続を切る** (`components/transport.py`)。
+# 会場ではそれが run の終わり。「返し続けるが新しい動きは作らない」に倒す。
+def test_a_taskspace_failure_holds_instead_of_killing_the_connection(monkeypatch):
+    drv = _driver()
+    drv.act(_obs(t=1.0))  # 1 本目で正常な行を作っておく
+    good = np.asarray(drv._last_actions).copy()
+
+    def _boom(step19, body_q):
+        raise ValueError("base_height_cmd 0.0 is outside the plausible range")
+
+    monkeypatch.setattr(drv, "_taskspace", _boom)
+    out = drv.act(_obs(t=2.0))
+
+    assert drv._hold_reason is not None and "taskspace" in drv._hold_reason
+    assert np.array_equal(np.asarray(out["actions"]), good), "直前の行を返すこと"
+    assert np.asarray(out["actions"]).shape[1] == 25
+
+
+def test_the_hold_path_survives_a_taskspace_failure(monkeypatch):
+    """HOLD は最後の砦なので、そこでも例外を外へ出さないこと。"""
+    drv = _driver()
+    drv.act(_obs(t=1.0))
+    good = np.asarray(drv._last_actions).copy()
+
+    drv._enter_hold("test")
+    monkeypatch.setattr(
+        drv, "_taskspace", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
+    )
+    out = drv.act(_obs(t=2.0))
+
+    assert np.array_equal(np.asarray(out["actions"]), good)
