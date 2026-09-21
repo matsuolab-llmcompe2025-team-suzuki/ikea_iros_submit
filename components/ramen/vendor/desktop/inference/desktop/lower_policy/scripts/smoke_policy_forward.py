@@ -385,7 +385,11 @@ def _run_dry_run(
                 joint_positions_prev=prev_joint_positions,
                 hand_state_prev=prev_hand_state,
             )
-            state = policy.__class__.build_state_from_raw(raw)
+            # ⚠️ class 経由で呼ばない。GR00T 系は staticmethod だが RAMEN-Ori は
+            # instance method なので、`policy.__class__.build_state_from_raw(raw)`
+            # だと raw が self に入り TypeError になる。
+            # VlaSkill (vla_skill.py:681) と同じく instance 経由で呼ぶ。
+            state = policy.build_state_from_raw(raw)
 
         frames = (
             {cam: frame.copy() for cam, frame in captured_frames.items()}
