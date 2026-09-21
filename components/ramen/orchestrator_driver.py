@@ -10,6 +10,12 @@ skill→variant (leg round):
 
 worker env: pick=RAMEN_WORKER_PYTHON (lerobot0.6.0) / 53D=RAMEN_WORKER_PYTHON_53D (0.6.1)。
 YOLO weight: RAMEN_YOLO_WEIGHT (dev 既定 outputs/yolo_obb/weights/m_lowaug_v4_flat.pt)。
+
+会場で焼き直さずに変えられるもの (env):
+  RAMEN_VARIANT_<SKILL>   expert の差し替え (例: rotate_table_base を RAMEN-Ori に)
+  RAMEN_GPU_MODELS        GPU に置く model 数 (既定 2 = 今 + 次)
+  RAMEN_ON_TIMEOUT        時間切れの動き (advance/stop)。既定は advance =
+                          YOLO が外しても先へ進む。詳細は _load_stage_timeouts
 """
 
 from __future__ import annotations
@@ -61,6 +67,10 @@ _YOLO_FREE_ENTRY = frozenset({"rotate_table_base"})
 # GPU に置く model の既定数 (RAMEN_GPU_MODELS で上書き)。自前経路の
 # entrypoint.DEFAULT_RESIDENT_MODELS と揃える。
 _DEFAULT_RESIDENT_MODELS = 2
+# 時間切れの既定の動き。**自前経路 (YAML) とは意図的に違う** — 理由は
+# `_load_stage_timeouts` の docstring。`RAMEN_ON_TIMEOUT` で上書きできる。
+_BOUNDARY_TIMEOUT_ACTION = "advance"
+_TIMEOUT_ACTIONS = frozenset({"advance", "stop"})
 
 
 def _variant_override(skill_name: str, default: str) -> str:
@@ -111,8 +121,31 @@ def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
     受け皿として持っているのに、boundary 経路には渡っていなかったため、YOLO が
     落とすと `rotate_table_base` から永久に出られなかった (2026-09-21 に実 image で
     実測)。同じ YAML を同じ規約で読んで渡す。
+
+    **秒数は YAML、action は大会経路の既定 (`advance`) を使う。**
+
+    脚の 4 skill には他の受け皿が無い: `is_complete` は VlaSkill では常に False
+    (`skills/base.py`)、`max_dwell_sec` は `move_to_table` にしか無い。つまり
+    時間切れが YOLO 以外の唯一の前進手段で、`stop` にするとそのバックアップが
+    消える = YOLO が外した時点でそのエピソードは何も進まないまま終わる。
+
+    YAML 側は #148 で全 skill `stop` になった。あれは **実機 SDK 経路**の判断で、
+    空の腕のまま insert へ進んで卓にぶつかるのを防ぐためのもの。妥当だが、
+    大会経路は前提が違う: IK は運営 WBC がやり、episode は `reset` できて、
+    止まっても安全なだけで点は増えない。なのでここだけ `advance` に倒す。
+
+    会場で危ないと判断したら `-e RAMEN_ON_TIMEOUT=stop` で YAML 側に戻せる。
+    どちらで走っているかは起動ログの `actions={...}` に出る。
     """
     skills = _load_skill_config(vendor_desktop).get("skills") or {}
+
+    override = os.environ.get("RAMEN_ON_TIMEOUT", "").strip().lower()
+    if override and override not in _TIMEOUT_ACTIONS:
+        raise ValueError(
+            f"RAMEN_ON_TIMEOUT must be one of {sorted(_TIMEOUT_ACTIONS)}, "
+            f"got {override!r}"
+        )
+    action = override or _BOUNDARY_TIMEOUT_ACTION
 
     hard: dict[str, float] = {}
     actions: dict[str, str] = {}
@@ -124,7 +157,17 @@ def _load_stage_timeouts(vendor_desktop: str) -> tuple[dict, dict]:
         if timeout_s <= 0:
             raise ValueError(f"skills.{skill_name}.max_seconds_hard must be > 0")
         hard[skill_name] = timeout_s
-        actions[skill_name] = str(section.get("on_timeout", "advance"))
+        actions[skill_name] = action
+    yaml_actions = {
+        name: str((skills.get(name) or {}).get("on_timeout", "advance"))
+        for name in hard
+    }
+    if yaml_actions != actions:
+        print(
+            f"[orch-driver] on_timeout: YAML {yaml_actions} -> 大会経路 {action!r}"
+            f"{'' if override else ' (既定。RAMEN_ON_TIMEOUT で変えられる)'}",
+            file=sys.stderr,
+        )
     return hard, actions
 
 
@@ -404,10 +447,7 @@ class OrchestratorDriver:
         # 4 脚まわり切ったら止める。時間切れ前進は enter_check を見ないので、
         # 放っておくと `n_legs_completed >= 4` で enter_pick_table_leg が False を
         # 返しても timeout がループを回し続けてしまう。
-        if (
-            not self._advance_halted
-            and self._orch.state.n_legs_completed >= _LEGS
-        ):
+        if not self._advance_halted and self._orch.state.n_legs_completed >= _LEGS:
             self._advance_halted = True
             print(
                 f"[orch-driver] {_LEGS} 脚完了。以後は skill を進めない",

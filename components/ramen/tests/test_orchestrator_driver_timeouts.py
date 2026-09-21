@@ -43,18 +43,22 @@ def test_every_stage_skill_has_a_hard_timeout():
         assert actions[name] in ("advance", "stop"), f"{name}: {actions[name]}"
 
 
-def test_timeouts_match_the_skill_config_yaml():
-    """driver が独自の値を持たず、自前経路と同じ YAML を読んでいること。"""
+def test_the_timeout_seconds_match_the_skill_config_yaml():
+    """秒数は driver が独自に持たず、自前経路と同じ YAML から来ていること。
+
+    ⚠️ `on_timeout` の **action だけ** は意図的に YAML と違う。大会経路は
+    `advance` に倒している (理由は `_load_stage_timeouts` の docstring と
+    下の test)。秒数まで独自に持つと、自前経路と別物の調整になってしまう。
+    """
     import yaml
 
     cfg = _VENDOR_DESKTOP / "inference/desktop/lower_policy/configs/skill_config.yaml"
     skills = (yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}).get("skills") or {}
 
-    hard, actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
+    hard, _actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
 
     for name, timeout_s in hard.items():
         assert timeout_s == float(skills[name]["max_seconds_hard"])
-        assert actions[name] == str(skills[name].get("on_timeout", "advance"))
 
 
 def test_rejects_a_non_positive_timeout(tmp_path, monkeypatch):
@@ -104,3 +108,52 @@ def test_the_orchestrator_accepts_the_maps_the_driver_builds():
 class _StubPerception:
     def predict(self, rgb):  # noqa: ANN001
         return []
+
+
+# ---------------------------------------------------------------- 大会経路の on_timeout
+#
+# #148 が YAML の `on_timeout` を全 skill `advance` -> `stop` に変えた。あれは
+# **実機 SDK 経路** の判断 (空の腕のまま insert へ進んで卓にぶつからない)。
+# 大会経路は前提が違うので、driver 側で `advance` に倒している。
+def test_the_boundary_path_advances_on_timeout_regardless_of_the_yaml(monkeypatch):
+    """YAML が stop でも、大会経路の既定は advance であること。
+
+    脚の 4 skill には他の受け皿が無い (`is_complete` は常に False、
+    `max_dwell_sec` は move_to_table だけ)。ここが stop だと **YOLO が外した
+    時点でそのエピソードは何も進まないまま終わる**。
+    """
+    monkeypatch.delenv("RAMEN_ON_TIMEOUT", raising=False)
+
+    hard, actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
+
+    assert set(actions) == set(hard)
+    assert set(actions.values()) == {"advance"}
+
+
+def test_the_venue_can_switch_back_to_stop(monkeypatch):
+    """会場で危ないと判断したら env で戻せること。"""
+    monkeypatch.setenv("RAMEN_ON_TIMEOUT", "stop")
+
+    _hard, actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
+
+    assert set(actions.values()) == {"stop"}
+
+
+def test_an_unknown_timeout_action_is_rejected(monkeypatch):
+    """typo で黙って既定に落ちないこと。"""
+    monkeypatch.setenv("RAMEN_ON_TIMEOUT", "halt")
+
+    with pytest.raises(ValueError, match="RAMEN_ON_TIMEOUT"):
+        _load_stage_timeouts(str(_VENDOR_DESKTOP))
+
+
+def test_the_seconds_still_come_from_the_yaml(monkeypatch):
+    """秒数は YAML のまま (action だけを大会経路用に倒している)。"""
+    monkeypatch.delenv("RAMEN_ON_TIMEOUT", raising=False)
+
+    hard, _actions = _load_stage_timeouts(str(_VENDOR_DESKTOP))
+
+    assert hard["rotate_table_base"] == 30.0
+    assert hard["pick_table_leg"] == 21.0
+    assert hard["insert_table_leg"] == 21.0
+    assert hard["rotate_leg_to_tighten"] == 58.0
