@@ -110,28 +110,31 @@ insert初期指令へ整える順に実行する。insert目標は値を複製�
 state-command interlockを維持しつつ、物体へ全閉指令を連続してDex1を過熱させない。
 実機評価中にstage安全判定が失敗した場合はarm_sdkを即時解放せず、最後の安全targetを
 保持して操作者が物体を支えたことをEnterで確認してからcontrolled releaseする。
-単体`run_skill`でexecutorを省略した場合の`vla`は従来挙動を保持する。本番
-`run_phase3`は有限完了契約を必須にするため`rule_based`を明示する。
+単体`run_skill`でexecutorを省略した場合の`vla`は従来挙動を保持する。本番の
+stage実行は有限完了契約を必須にするため`rule_based`を明示する (既定値がこれ)。
 
 ## 本番 Stage 1〜4 への差し替え
 
-`evaluate.model_evaluation.runners.run_phase3` は、Stage 1〜4 の
-`pick_table_leg` に上記の有限 `rule_based` Phase 3版を既定で使う。pick完了時には
-`skill_config.yaml:skills.insert_table_leg.initial_pose` の腕14DとDex1 2Dへ実測到達し、
-その後だけ `insert_table_leg` へ遷移する。hybrid全体が30秒を超える、または任意の
-実測安全条件に失敗した場合は次skillへ進まず、最後の安全targetを保持する。操作者が
-物体と腕を支えてEnterを押した後にだけarm_sdkをcontrolled releaseする。
+本番のstage実行は`inference.desktop.entrypoint`が入口で、`--pick-leg-hybrid`を
+付けるとStage 1〜4の`pick_table_leg`が上記の有限`rule_based` Phase 3版になる。
+pick完了時には`skill_config.yaml:skills.insert_table_leg.initial_pose`の腕14Dと
+Dex1 2Dへ実測到達し、その後だけ`insert_table_leg`へ遷移する。hybrid全体が30秒を
+超える、または任意の実測安全条件に失敗した場合は次skillへ進まず、最後の安全target
+を保持する。操作者が物体と腕を支えてEnterを押した後にだけarm_sdkを
+controlled releaseする。
 
 ```bash
-pixi run -e runtime python -m evaluate.model_evaluation.runners.run_phase3 \
+# Stage 1〜4 を 1 process で通す (途中から始めるときは --phase3-start-stage を変える)
+pixi run -e runtime python -m inference.desktop.entrypoint \
   --interface enx58278cbf8be0 \
-  --start-stage 1 --end-stage 4 \
-  --actuate
+  --phase3-full --phase3-start-stage 1 --phase3-end-stage 4 \
+  --actuate --use-real-waist --use-real-hand \
+  --pick-leg-hybrid
 ```
 
-旧learned-only pickを再現するときだけ`--no-pick-leg-hybrid`を付ける。Stage 0または
-Stage 5だけを実行するときもpickは存在しないため同flagを付ける。直接
-`inference.desktop.entrypoint`を呼ぶ場合は、明示的に`--pick-leg-hybrid`を指定する。
+policy variantは`policy_config.yaml:default_variant_by_skill`から自動で入るので
+書かなくてよい。別のckptで試すときだけ`--policy-variant-*`で上書きする
+(CLIが勝つ)。旧learned-only pickを再現するときは`--pick-leg-hybrid`を外す。
 
 ### 単一RTX 5090でVLMとGR00Tを共存させる場合
 

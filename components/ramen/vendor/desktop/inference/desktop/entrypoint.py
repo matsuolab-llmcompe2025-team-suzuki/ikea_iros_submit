@@ -245,6 +245,92 @@ def _require_real_waist_and_hand(
     )
 
 
+#: policy slot → `--policy-variant-*` の属性名。
+_POLICY_SLOT_ATTRS: dict[str, str] = {
+    "move": "policy_variant",
+    "rotate_table": "policy_variant_rotate_table_base",
+    "pick": "policy_variant_pick",
+    "insert": "policy_variant_insert",
+    "rotate_leg": "policy_variant_rotate_leg",
+    "flip": "policy_variant_flip",
+}
+#: policy slot → skill 名 (`policy_config.yaml:default_variant_by_skill` の key)。
+#: move_table_base は Phase 3 の stage 列に無いので既定を持たない。
+_POLICY_SLOT_SKILLS: dict[str, str] = {
+    "rotate_table": "rotate_table_base",
+    "pick": "pick_table_leg",
+    "insert": "insert_table_leg",
+    "rotate_leg": "rotate_leg_to_tighten",
+    "flip": "flip_table",
+}
+
+
+def required_policy_slots(args: argparse.Namespace) -> tuple[str, ...]:
+    """この run が読む policy slot (Issue #148)。
+
+    検証 (足りない / 使わない) と既定の充填が同じ規則を使う。stage を選んでいない
+    run は空を返すので、rule-based pick のように variant を持たない経路では
+    何も埋まらない。
+    """
+
+    if getattr(args, "phase3_full", False):
+        stages = set(range(args.phase3_start_stage, args.phase3_end_stage + 1))
+    elif args.stage is not None:
+        stages = {args.stage}
+    else:
+        return ()
+    return (
+        (("pick", "insert", "rotate_leg") if stages & {1, 2, 3, 4} else ())
+        + (("rotate_table",) if stages & {2, 3, 4} else ())
+        + (("flip",) if 5 in stages else ())
+    )
+
+
+def apply_default_policy_variants(
+    args: argparse.Namespace, *, config_path: Path
+) -> dict[str, str]:
+    """CLI が渡さなかった slot を `policy_config.yaml` の既定で埋める (Issue #148)。
+
+    埋めるのはこの run が要る slot だけ。stage 0 に variant が載ったり、stage 1 に
+    rotate_table_base が載ったりすると `_validate_phase3_config` が弾くので、
+    「全部埋めてから捨てる」ではなく最初から要るものだけを埋める。
+
+    Returns:
+        slot 名 → "config" / "cli" (起動ログと記録の metadata 用)。
+    """
+
+    from inference.desktop.lower_policy.policies.config_loader import (
+        load_default_variant_by_skill,
+    )
+
+    required = required_policy_slots(args)
+    if not required:
+        return {}
+    defaults = load_default_variant_by_skill(config_path)
+    unknown = sorted(set(defaults) - set(_POLICY_SLOT_SKILLS.values()))
+    if unknown:
+        raise ValueError(
+            f"{config_path}: default_variant_by_skill has unknown skills {unknown} "
+            f"(valid: {sorted(_POLICY_SLOT_SKILLS.values())})"
+        )
+    source: dict[str, str] = {}
+    for slot in required:
+        attr = _POLICY_SLOT_ATTRS[slot]
+        if getattr(args, attr) is not None:
+            source[slot] = "cli"
+            continue
+        variant = defaults.get(_POLICY_SLOT_SKILLS[slot])
+        if variant is None:
+            raise ValueError(
+                f"{config_path}: default_variant_by_skill is missing "
+                f"{_POLICY_SLOT_SKILLS[slot]!r}; pass --{attr.replace('_', '-')} "
+                "explicitly or add the default"
+            )
+        setattr(args, attr, variant)
+        source[slot] = "config"
+    return source
+
+
 def _validate_phase3_config(args: argparse.Namespace) -> None:
     """Reject unsafe or resource-wasting Phase 3 CLI combinations."""
 
@@ -318,13 +404,9 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         raise ValueError("Phase 3 requires both wrist-camera observations")
 
     variants = {
-        "move": args.policy_variant,
-        "rotate_table": args.policy_variant_rotate_table_base,
-        "pick": args.policy_variant_pick,
-        "insert": args.policy_variant_insert,
-        "rotate_leg": args.policy_variant_rotate_leg,
-        "flip": args.policy_variant_flip,
+        slot: getattr(args, attr) for slot, attr in _POLICY_SLOT_ATTRS.items()
     }
+    required = required_policy_slots(args)
     hybrid_pick = bool(getattr(args, "pick_leg_hybrid", False))
     if hybrid_pick:
         selected_stages = (
@@ -354,13 +436,7 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
             raise ValueError("--phase3-start-stage must be <= --phase3-end-stage")
         selected_stages = set(range(args.phase3_start_stage, args.phase3_end_stage + 1))
         uses_leg_models = bool(selected_stages.intersection({1, 2, 3, 4}))
-        uses_rotate_table = bool(selected_stages.intersection({2, 3, 4}))
         uses_flip = 5 in selected_stages
-        required = (
-            (("pick", "insert", "rotate_leg") if uses_leg_models else ())
-            + (("rotate_table",) if uses_rotate_table else ())
-            + (("flip",) if uses_flip else ())
-        )
         missing = [name for name in required if variants[name] is None]
         if missing:
             raise ValueError(
@@ -396,9 +472,6 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         return
 
     if stage in {1, 2, 3, 4}:
-        required = ("pick", "insert", "rotate_leg") + (
-            ("rotate_table",) if stage in {2, 3, 4} else ()
-        )
         missing = [name for name in required if variants[name] is None]
         if missing:
             raise ValueError(
@@ -1279,9 +1352,23 @@ def main() -> None:
     ):
         sys.exit("Phase 3 is mutually exclusive with Phase 1 profiles")
     try:
+        # 先に既定で埋めてから検査する。検査は「その stage が要る slot が揃って
+        # いるか」を見るので、埋める側も同じ `required_policy_slots` を使う。
+        variant_source = apply_default_policy_variants(
+            args, config_path=args.policy_config
+        )
         _validate_phase3_config(args)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         sys.exit(f"Phase 3 configuration rejected: {exc}")
+    if variant_source:
+        print(
+            "[init] policy variants: "
+            + " ".join(
+                f"{slot}={getattr(args, _POLICY_SLOT_ATTRS[slot])} ({origin})"
+                for slot, origin in variant_source.items()
+            ),
+            file=sys.stderr,
+        )
     phase1_profile: str | None = None
     if args.phase1_11_arm_only:
         phase1_profile = "1.11"
@@ -2183,6 +2270,14 @@ def main() -> None:
                     "use_real_waist": args.use_real_waist,
                     "use_real_hand": args.use_real_hand,
                     "pick_leg_hybrid": hybrid_pick_runtime,
+                    # どの ckpt で走ったか + その値が CLI か config の既定か
+                    # (Issue #148)。後から run を取り違えないため。
+                    "policy_variants": {
+                        slot: getattr(args, attr)
+                        for slot, attr in _POLICY_SLOT_ATTRS.items()
+                        if getattr(args, attr) is not None
+                    },
+                    "policy_variant_source": variant_source,
                     "started_at": datetime.now().isoformat(),
                 }
             )
