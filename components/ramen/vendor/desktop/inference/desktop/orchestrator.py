@@ -805,8 +805,11 @@ class Orchestrator:
     def reset_episode(self) -> None:
         """次の episode を最初からやり直せる状態に戻す。
 
-        **model は解放しない。** 読み直すと skill 切替と同じ待ちが発生するので、
-        `ModelResidency` が持っている常駐はそのままにする。
+        ⚠️ `dispatcher.stop()` は `VlaSkill._on_stop()` を通るので、**その時点で
+        active だった skill の model は解放される** (skill の buffer を畳むのに
+        必要な経路で、避けられない)。常駐から外れていない model は
+        `ModelResidency` が background で読み直すので、次の episode の頭で
+        止まるのは「reset 時に active だった skill が次も先頭に来る」場合だけ。
 
         boundary の server は 1 本の process が動き続け、運営が episode 間に
         `reset` を呼ぶ (`components/transport.py` の route)。ここを戻さないと

@@ -452,7 +452,10 @@ class OrchestratorDriver:
         **`_advance_halted` と orchestrator 側の state を必ず戻す。** 戻さないと
         1 本走り切った後の 2 本目が skill を一切進めないまま終わる
         (4 脚完了で halt したまま、`n_legs_completed` も 4 のままになる)。
-        model は解放しない (読み直すと切替と同じ待ちが出る)。
+
+        ⚠️ reset 時に active だった skill の model は解放される
+        (`dispatcher.stop()` が `VlaSkill._on_stop()` を通るため)。常駐から
+        外れていないものは先読みが背後で読み直す。
         """
         self._t = 0
         self._advance_halted = False
