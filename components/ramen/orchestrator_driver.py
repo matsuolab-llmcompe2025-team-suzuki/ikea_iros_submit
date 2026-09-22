@@ -704,7 +704,11 @@ class OrchestratorDriver:
         # orchestrator は `log_sink.write(json.dumps(...) + "\n")` を呼ぶだけなので
         # 素の file object でよい (自前経路も `log_path.open("w")` を渡している)。
         print(f"[orch-driver] orchestrator log -> {path}", file=sys.stderr)
-        return open(path, "w", encoding="utf-8")
+        # **行バッファで開く。** 既定のブロックバッファ (8KB) だと、会場の撤収が
+        # `docker rm -f` = SIGKILL なので**末尾が丸ごと失われる**。落ちた run ほど
+        # 最後の数十 tick が要るのに、そこだけ残らない形になる。20Hz の 1 行なので
+        # flush の負荷は無視できる。
+        return open(path, "w", encoding="utf-8", buffering=1)
 
     def _on_tick(self, result, obs, skill) -> None:
         """tick ごとの hook。先読みの範囲を今の skill に合わせる。"""
