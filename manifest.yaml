@@ -66,7 +66,14 @@ images:
     # --- eeorigin (main、#128) に入っているもの -------------------------------
     #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
     #   GrootConfig / FurnitureGrootRuntimeConfig type strip (base registry) +
-    #   GPU overhead env 化 + 53D FK を CWD 非依存 path (assets/) に修正 +
+    #   53D FK を CWD 非依存 path (assets/) に修正 +
+    #   ※ 以前ここに「GPU overhead env 化」と書いていたが **事実と違う**
+    #     (2026-09-22 に確認)。`_GROOT_GPU_LOAD_OVERHEAD_BYTES = 12 GiB` は
+    #     groot.py のモジュール定数で、env 読み取りは vendor tree のどこにも無い。
+    #     出荷の streaming load も `_require_groot_load_headroom` を必ず通るので、
+    #     53D の load には **checkpoint 11.7 GiB + 12 GiB = 23.7 GiB の空き**が要る。
+    #     Thor は 128 GB unified なので通る想定だが、それは
+    #     `torch.cuda.mem_get_info()` が unified pool を正しく返す前提 (未検証) +
     #   **publish EE を wrist_yaw_link 原点 (zero tool offset) に修正**
     #   (運営 IK は zero offset 固定 = WBC_RUNBOOK §3。pick の IK 残差 60x の原因だった)
     #
