@@ -4,7 +4,7 @@ RAMEN-Ori (`README.md` / `manifest.yaml`) とは別トラックで、**GR00T 系
 lane の `(T,25)` task-space に載せて** 運営評価に出すための実装と手順。
 
 - 実装: `components/ramen/`
-- 提出 manifest: `manifest.groot.yaml`
+- 提出 manifest: `manifest.yaml`（2026-09-22 に `manifest.groot.yaml` から統合）
 - image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-groot-orch-eeorigin`
 - 技術詳細 / 判断ログ: `VENDOR_NOTES.md` §「GR00T-pick 提出トラック」「53D skills」ほか
 
@@ -95,7 +95,7 @@ navigate・base = 0。**scipy 不要** (matrix→quat は Shepperd 法)。
 | `taskspace_adapter.py` | 19D/38D → `(T,25)` (FK+quat+hand+下半身)、pure-numpy |
 | `g1_urdf_fk.py` | G1 wrist FK (vendored、pure-numpy) |
 | `groot_worker.py` | pick worker client (self-contained、直接 worker protocol、raw 38D) |
-| `groot53_worker.py` | 53D worker client (WIP、原's inference server 版。現行は使わず) |
+
 | `orchestrator_io.py` | boundary↔orchestrator の I/O adapter (state/wrist 注入、interceptor、19D 再構成) |
 | `orchestrator_driver.py` | full orchestrator driver (perception+skills+遷移 build、act→tick→(T,25)) |
 | `smoke_*.py` | GPU smoke (pick / 53d / orchestrator) |
@@ -106,7 +106,9 @@ navigate・base = 0。**scipy 不要** (matrix→quat は Shepperd 法)。
 - `vendor/desktop/` … **desktop inference runtime 全体** (orchestrator / dispatcher / 5 VlaSkill /
   actuators / perception[cleaner/stream/yolo_obb] / skill_planner / policies + configs)。
   53D と orchestrator が使う。`groot.py` に spawn patch (pixi→`RAMEN_WORKER_PYTHON_53D`)。
-- `vendor/groot53/`, `vendor/dex1/` … 53D self-contained 版の WIP (現行未使用)。
+- ~~`vendor/groot53/`, `vendor/dex1/`~~ … 53D self-contained 版の WIP。**2026-09-22 に削除**
+  (誰からも起動されず、生きている `Groot53Backend` は vendored の `build_state_from_raw`
+   を使っている。残すと「直せば動く」と誤解される / Issue #7)。
 
 > vendored code は iros_2026_ramen からの複製。上流更新時は同期が要る (各 file 冒頭に出典)。
 
@@ -122,7 +124,7 @@ docker login nvcr.io -u '$oauthtoken'          # NGC API key
 docker login ghcr.io -u <github-user>          # GitHub PAT (write:packages)
 
 docker buildx build --builder armbuilder --platform linux/arm64 \
-  -f docker/Dockerfile.thor.groot \
+  -f docker/Dockerfile.thor \
   -t ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:<tag> \
   --push .
 ```
@@ -130,7 +132,7 @@ docker buildx build --builder armbuilder --platform linux/arm64 \
 - base = `nvcr.io/nvidia/pytorch:25.12-py3` (numpy 2.x ABI torch sm_110 / CUDA13。25.08 は numpy 1.x ABI で from_numpy が壊れるため不可)。
 - image 内訳: image main = lerobot 0.6.0 + ultralytics + pyyaml、`/opt/venv-groot53` = lerobot 0.6.1。
 - 新規 package を作らず **既存 `ikea-thor` の tag** に push (運営に伝達済の名前を維持、
-  `:onboarding` tag は温存)。push 後 digest を `manifest.groot.yaml` に反映。
+  `:onboarding` tag は温存)。push 後 digest を `manifest.yaml` に反映（本体 repo の venue_runbook / offline_bundle も同時に）。
 
 ---
 
@@ -159,7 +161,7 @@ docker buildx build --builder armbuilder --platform linux/arm64 \
 3. **HF_TOKEN**: GR00T / YOLO weights は private Team-RAMEN repo → `-e HF_TOKEN=<read token>` 必須。
 4. **GHCR read 権限**: `ikea-thor` package を運営が pull できる状態か (onboarding Finding 2)。
 5. **NVIDIA_DISABLE_REQUIRE=1**: Thor docker run に必須 (Finding 1)。
-6. `manifest.yaml` (RAMEN-Ori, hold-still stub) と `manifest.groot.yaml` (本トラック) は別。
+6. manifest は `manifest.yaml` 1 本（トラック分岐は 2026-09-22 に解消）。
    運営にどちらを評価してもらうか要調整。
 
 ---

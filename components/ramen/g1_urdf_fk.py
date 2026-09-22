@@ -2,7 +2,10 @@
 
 VENDORED from iros_2026_ramen `inference/desktop/perception/g1_urdf_fk.py`
 (self-contained Thor image のため submission repo に複製)。pure numpy。
-上流を更新したら本 copy も同期すること。
+
+⚠️ **`tools/sync_vendor_desktop.sh` の対象外＝手動コピー。** 上流を更新したら
+ここも同期すること。同期漏れは `tests/test_fk_copies_agree.py` が検出する
+(2026-09-22 に tool offset が 10cm ずれたまま放置されていたのを検出、Issue #7)。
 
 # 目的
 
@@ -47,51 +50,60 @@ from typing import Sequence
 import numpy as np
 
 
-# Vendored URDF は module 相対 assets に置く (container 内 CWD 非依存)。
+# VENDOR 適応: URDF は module 相対 `assets/` に置く (container の CWD 非依存)。
+# 上流は repo root からの相対 (parents[3]) だが、container では /app が CWD で
+# 解決できず FileNotFoundError になり **全 53D skill が起動失敗する** (IAC eval 指摘)。
+# ここが、この手動コピーが存在する唯一の理由。
 DEFAULT_URDF_PATH: str = str(
     Path(__file__).resolve().parent / "assets" / "g1_29dof_mode_15_with_dex1_1.urdf"
 )
 
 # 参照: g1_hw_bridge/joint_mapping.py:G1_JOINT_NAMES と一致 (SDK motor index 順)
 G1_JOINT_NAMES: tuple[str, ...] = (
-    "left_hip_pitch_joint",       # 0
-    "left_hip_roll_joint",        # 1
-    "left_hip_yaw_joint",         # 2
-    "left_knee_joint",            # 3
-    "left_ankle_pitch_joint",     # 4
-    "left_ankle_roll_joint",      # 5
-    "right_hip_pitch_joint",      # 6
-    "right_hip_roll_joint",       # 7
-    "right_hip_yaw_joint",        # 8
-    "right_knee_joint",           # 9
-    "right_ankle_pitch_joint",    # 10
-    "right_ankle_roll_joint",     # 11
-    "waist_yaw_joint",            # 12
-    "waist_roll_joint",           # 13
-    "waist_pitch_joint",          # 14
+    "left_hip_pitch_joint",  # 0
+    "left_hip_roll_joint",  # 1
+    "left_hip_yaw_joint",  # 2
+    "left_knee_joint",  # 3
+    "left_ankle_pitch_joint",  # 4
+    "left_ankle_roll_joint",  # 5
+    "right_hip_pitch_joint",  # 6
+    "right_hip_roll_joint",  # 7
+    "right_hip_yaw_joint",  # 8
+    "right_knee_joint",  # 9
+    "right_ankle_pitch_joint",  # 10
+    "right_ankle_roll_joint",  # 11
+    "waist_yaw_joint",  # 12
+    "waist_roll_joint",  # 13
+    "waist_pitch_joint",  # 14
     "left_shoulder_pitch_joint",  # 15
-    "left_shoulder_roll_joint",   # 16
-    "left_shoulder_yaw_joint",    # 17
-    "left_elbow_joint",           # 18
-    "left_wrist_roll_joint",      # 19
-    "left_wrist_pitch_joint",     # 20
-    "left_wrist_yaw_joint",       # 21
-    "right_shoulder_pitch_joint", # 22
+    "left_shoulder_roll_joint",  # 16
+    "left_shoulder_yaw_joint",  # 17
+    "left_elbow_joint",  # 18
+    "left_wrist_roll_joint",  # 19
+    "left_wrist_pitch_joint",  # 20
+    "left_wrist_yaw_joint",  # 21
+    "right_shoulder_pitch_joint",  # 22
     "right_shoulder_roll_joint",  # 23
-    "right_shoulder_yaw_joint",   # 24
-    "right_elbow_joint",          # 25
-    "right_wrist_roll_joint",     # 26
-    "right_wrist_pitch_joint",    # 27
-    "right_wrist_yaw_joint",      # 28
+    "right_shoulder_yaw_joint",  # 24
+    "right_elbow_joint",  # 25
+    "right_wrist_roll_joint",  # 26
+    "right_wrist_pitch_joint",  # 27
+    "right_wrist_yaw_joint",  # 28
 )
 
 LEFT_WRIST_LINK: str = "left_wrist_yaw_link"
 RIGHT_WRIST_LINK: str = "right_wrist_yaw_link"
 ROOT_LINK: str = "pelvis"
-# BitRobot/GR00T labels use a tool point 5 cm along wrist-yaw link +X rather
-# than the URDF link origin.  Keeping this explicit avoids a systematic 5 cm
-# state error on both arms.
-WRIST_TOOL_OFFSET_M = np.array([0.05, 0.0, 0.0], dtype=np.float64)
+# BitRobot/GR00T の GT `ee_state` は Dex1 hand grasp point 相当を record している
+# (SDK teleop 経由、URDF wrist_yaw_link origin ではない)。3 dataset (rotate_table_base_
+# merged_v1 + task_7_optimal_v1 + task_0 chunk0) の LeRobot GT との fit で決定した
+# 左右別 offset を hardcode (Issue #132 Phase A)。fit std ~3-9cm = joint-angle
+# 依存の変動残存、mm 精度は Orin SDK 側から /g1/ee_state topic 直接 subscribe
+# (Issue #63 A-2 hardware 後) が必要。fit の検証は
+# `perception/tests/test_g1_urdf_fk.py::TestFkCrossVerifyTrainingData`
+# (@pytest.mark.integration、3 dataset の LeRobot ee_state と mean L2 を照合)。
+LEFT_WRIST_TOOL_OFFSET_M = np.array([0.087, -0.034, 0.092], dtype=np.float64)
+RIGHT_WRIST_TOOL_OFFSET_M = np.array([0.116, -0.057, -0.015], dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -109,7 +121,7 @@ class ChainJoint:
     name: str
     joint_index: int
     fixed_T: np.ndarray  # (4, 4)
-    axis: np.ndarray     # (3,)
+    axis: np.ndarray  # (3,)
 
 
 def _euler_xyz_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -269,31 +281,75 @@ class G1WristFK:
     Attributes:
         _left_chain: (list[ChainJoint]) pelvis → left_wrist_yaw_link chain。
         _right_chain: pelvis → right_wrist_yaw_link chain。
+        _left_offset / _right_offset: (3,) float64、wrist_yaw_link frame での tool
+            point offset (Issue #132 Phase A で skill 別 override 対応)。default は
+            module 定数 LEFT/RIGHT_WRIST_TOOL_OFFSET_M (3-dataset fit avg)、instance
+            per に override 可能 (skill 別に fit した offset を渡す運用)。
     """
 
-    def __init__(self, left_chain: Sequence[ChainJoint], right_chain: Sequence[ChainJoint]):
+    def __init__(
+        self,
+        left_chain: Sequence[ChainJoint],
+        right_chain: Sequence[ChainJoint],
+        left_tool_offset: np.ndarray | None = None,
+        right_tool_offset: np.ndarray | None = None,
+    ):
         self._left_chain = tuple(left_chain)
         self._right_chain = tuple(right_chain)
+        # Issue #132 Phase A: skill 別 tool offset override。None なら module default。
+        # copy() で外部からの mutation 隔離、shape (3,) 強制 (誤 shape で silent
+        # broadcast する trap 回避)。
+        self._left_offset = self._validate_offset(
+            left_tool_offset, LEFT_WRIST_TOOL_OFFSET_M, "left_tool_offset"
+        )
+        self._right_offset = self._validate_offset(
+            right_tool_offset, RIGHT_WRIST_TOOL_OFFSET_M, "right_tool_offset"
+        )
+
+    @staticmethod
+    def _validate_offset(
+        value: np.ndarray | None, default: np.ndarray, name: str
+    ) -> np.ndarray:
+        if value is None:
+            return default.copy()
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.shape != (3,):
+            raise ValueError(f"{name} must be (3,) float64, got shape {arr.shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} must be finite, got {arr}")
+        return arr.copy()
 
     @classmethod
     def from_urdf(
         cls,
         urdf_path: str | Path = DEFAULT_URDF_PATH,
         joint_names: Sequence[str] = G1_JOINT_NAMES,
+        left_tool_offset: np.ndarray | None = None,
+        right_tool_offset: np.ndarray | None = None,
     ) -> "G1WristFK":
         """URDF file を parse して G1WristFK instance を返す。
 
         Args:
             urdf_path: URDF file path (repo 内 default = g1_description/urdf/...).
             joint_names: SDK joint layout (index 0..28 に対応する URDF joint name 順)。
+            left_tool_offset / right_tool_offset: Issue #132 Phase A、skill 別 tool
+                offset override (wrist_yaw_link frame の (3,) float、None なら
+                module default LEFT/RIGHT_WRIST_TOOL_OFFSET_M)。
 
         Returns:
             G1WristFK。
         """
         joint_name_to_index = {name: i for i, name in enumerate(joint_names)}
         left_chain = _parse_urdf_chain(urdf_path, LEFT_WRIST_LINK, joint_name_to_index)
-        right_chain = _parse_urdf_chain(urdf_path, RIGHT_WRIST_LINK, joint_name_to_index)
-        return cls(left_chain=left_chain, right_chain=right_chain)
+        right_chain = _parse_urdf_chain(
+            urdf_path, RIGHT_WRIST_LINK, joint_name_to_index
+        )
+        return cls(
+            left_chain=left_chain,
+            right_chain=right_chain,
+            left_tool_offset=left_tool_offset,
+            right_tool_offset=right_tool_offset,
+        )
 
     def _fk_chain(
         self, chain: Sequence[ChainJoint], joint_positions: np.ndarray
@@ -325,9 +381,9 @@ class G1WristFK:
         T_left = self._fk_chain(self._left_chain, jp)
         T_right = self._fk_chain(self._right_chain, jp)
 
-        left_xyz = T_left[:3, 3] + T_left[:3, :3] @ WRIST_TOOL_OFFSET_M
+        left_xyz = T_left[:3, 3] + T_left[:3, :3] @ self._left_offset
         left_euler = _matrix_to_euler_xyz(T_left[:3, :3])
-        right_xyz = T_right[:3, 3] + T_right[:3, :3] @ WRIST_TOOL_OFFSET_M
+        right_xyz = T_right[:3, 3] + T_right[:3, :3] @ self._right_offset
         right_euler = _matrix_to_euler_xyz(T_right[:3, :3])
 
         out = np.concatenate(
@@ -340,27 +396,54 @@ class G1WristFK:
         ).astype(np.float32, copy=False)
         return out
 
+    def left_tool_position(self, joint_positions: np.ndarray) -> np.ndarray:
+        """(29,) joint_positions → 左手 tool point の (3,) 位置 [m] (pelvis frame)。
+
+        `compute_ee_state` の左手 xyz と同一だが、**左 chain だけ**を回すので
+        右 chain 分の計算が要らない。数値 Jacobian のように 1 tick で 8 回叩く
+        用途 (Issue #137 の z 天井クランプ) 向けの軽量経路。
+
+        Args:
+            joint_positions: (29,) float、G1_JOINT_NAMES 順。leg [0:12] は
+                左 wrist chain (waist 12-14 + left arm 15-21) に含まれないため
+                値は結果に影響しないが、shape 検証のため 29 要素を要求する。
+
+        Returns:
+            (3,) float64。
+        """
+        jp = np.asarray(joint_positions, dtype=np.float64)
+        if jp.shape != (29,):
+            raise ValueError(f"joint_positions must be (29,), got {jp.shape}")
+        T = self._fk_chain(self._left_chain, jp)
+        return T[:3, 3] + T[:3, :3] @ self._left_offset
+
     def compute_ee_transforms(
         self, joint_positions: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """(29,) joint_positions → 左右 **wrist_yaw_link 原点**の (pos(3), R(3x3))。
 
-        ⚠️ ここは publish する (T,25) action 用の下位 API。運営 WBC の decoupled IK は
-        **zero tool offset(生の wrist_yaw_link 原点)固定**で我々の (T,25) を解く
-        (WBC_RUNBOOK §3)。したがって action として publish する EE 位置は
-        **tool offset を足さない wrist_yaw_link 原点**でなければならない。以前は
-        `+ R @ WRIST_TOOL_OFFSET_M`(5cm)を足して tool point を publish していたが、
-        これが運営 IK 期待点との系統偏り(pick で IK 残差 60x ≈ 6cm)の原因だった。
-        model の **state 入力**側 (`compute_ee_state`) は学習時と同じ 5cm offset を
-        維持する(runbook: state input は real offset のままでよい)。回転行列は
-        wrist-yaw link 姿勢そのまま(matrix→quat は adapter 側で実施)。
+        ⚠️ これは **publish する `(T,25)` action 用**の下位 API。運営 WBC の decoupled
+        IK は **zero tool offset (生の wrist_yaw_link 原点) 固定**で我々の `(T,25)` を
+        解く (`WBC_RUNBOOK` §3)。したがって action として publish する EE 位置は
+        **tool offset を足さない wrist_yaw_link 原点**でなければならない。
+        以前は `+ R @ tool_offset` (5cm) を足した tool point を publish しており、
+        これが運営 IK 期待点との系統偏り = **pick の IK 残差 60x (≈6cm)** の原因だった
+        (2026-09-14 dry-run の "steady bias, not scattered noise" がこれ)。
+
+        model への **state 入力**側 (`compute_ee_state`) は学習時と同じ tool offset を
+        **維持する** (runbook: state input は real offset のままでよい)。両者で意味が
+        違うので、offset を共通化しないこと。
+
+        呼び出し元は publish 経路のみ (`taskspace_adapter` / `boundary_sink` /
+        `solve_boundary_ee_frame`)。回転は wrist-yaw link 姿勢そのまま
+        (matrix→quat は adapter 側で実施、gimbal lock 縮退回避)。
 
         Args:
             joint_positions: (29,) float、G1_JOINT_NAMES 順。
 
         Returns:
             (left_pos(3), left_R(3x3), right_pos(3), right_R(3x3)) 全て float64。
-            pos は wrist_yaw_link 原点 (pelvis frame, zero tool offset)、R は姿勢。
+            pos は **wrist_yaw_link 原点** (pelvis frame、zero tool offset)、R は姿勢。
         """
         jp = np.asarray(joint_positions, dtype=np.float64)
         if jp.shape != (29,):

@@ -2,7 +2,7 @@
 
 # なぜ要るか
 
-提出 image は `docker/Dockerfile.thor.groot` の `COPY . ./` でこの repo を丸ごと焼く。
+提出 image は `docker/Dockerfile.thor` の `COPY . ./` でこの repo を丸ごと焼く。
 推論コードの本体は `iros_2026_ramen` 側にあり、ここはそのコピー
 (`tools/sync_vendor_desktop.sh`)。
 

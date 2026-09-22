@@ -3,16 +3,22 @@
 > ## Team RAMEN submission
 >
 > - **Lane:** `decoupled` ((T,25) task-space)
-> - **Images** (linux/arm64, GHCR、digest 指定):
->   - Thor (server): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:a32494cd2c8fd23b49cc1f4209f7c49e1d4645acd90092ce8b8028a352e3170a`
->   - Orin (client): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin@sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4`
-> - **Base images:** Thor `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`、Orin `nvcr.io/nvidia/l4t-jetpack:r35.3.1`
-> - **Status (onboarding):** `boundary/` unmodified、`conformance.py --lane decoupled` PASS、別コンテナ e2e (server+client+mock) で action 疎通確認済。現状 Policy は hold-still (RAMEN-Ori は後続で差し替え)。
-> - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml` を参照。
-> - **GR00T トラック (別提出):** 上記 RAMEN-Ori とは別に、GR00T 系 policy を decoupled
->   `(T,25)` に載せた実装がある (pick / 53D 4本 / full orchestrator[YOLO+自動遷移])。
->   image `ikea-thor:20260831-groot-orch`、manifest `manifest.groot.yaml`、手順は
->   **[`GROOT_DEPLOY.md`](./GROOT_DEPLOY.md)** を参照。
+> - **Images** (linux/arm64, GHCR、digest 指定。正本は `manifest.yaml`):
+>   - Thor (server): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:249e504251dd7537410199f724e06348b72a746b09b0cf94e486c6b25a6e6ebb`
+>   - Orin (client): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin@sha256:b5e61a0dc502cf0b1fe225392bff42bf60812fc91034f7643d8da183b9b257da`
+> - **Base images:** Thor `nvcr.io/nvidia/pytorch:25.12-py3`（`@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8`）、Orin `nvcr.io/nvidia/l4t-jetpack:r35.3.1`
+> - **Status:** `boundary/` unmodified（`components/ramen/tests/test_boundary_is_organizer_code.py`
+>   が運営配布物との sha256 一致を固定）、`conformance.py --lane decoupled --full-rig` PASS。
+> - **Policy:** 1 つの image に全部入っている。`rotate_table_base` は RAMEN-Ori、
+>   `pick_table_leg` / `insert_table_leg` / `rotate_leg_to_tighten` / `flip_table` は
+>   GR00T、それらを YOLO perception の orchestrator が自動遷移させる
+>   (`RAMEN_POLICY=groot_orchestrator`)。**hold-still stub ではない。**
+> - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml`。運用手順は
+>   **[`GROOT_DEPLOY.md`](./GROOT_DEPLOY.md)**。
+>
+> ⚠️ かつて RAMEN-Ori トラックと GR00T トラックを別 manifest で並存させていたが、
+> **その分岐はもう無い**。`manifest.groot.yaml` は 2026-09-22 に `manifest.yaml`
+> へ統合した（運営は `manifest.yaml` をファイル名で要求している / `CONTRACT.md:24`）。
 
 RAMEN submits **two containers**: a policy server for the Jetson AGX Thor and a
 policy client for the Jetson Orin NX onboard the G1. What runs inside them is
@@ -69,7 +75,8 @@ ikea_iros_submit/
 │   └── mock_wbc.py        fake controller; validates what we publish
 ├── conformance.py       run this before we ship
 ├── requirements.txt
-├── docker/              RAMEN — Dockerfile.thor / Dockerfile.orin (+ Dockerfile.smoke-arm64)
+├── docker/              RAMEN — **Dockerfile.thor** (提出 image) / Dockerfile.orin
+│                          (Dockerfile.smoke-arm64 は検証用)
 ├── manifest.yaml        RAMEN — lane / image digests / base / entrypoints / port
 ├── INSTRUCTIONS.md      RAMEN — build & run commands for the organizer
 └── VENDOR_NOTES.md      RAMEN — provenance & our divergences from upstream

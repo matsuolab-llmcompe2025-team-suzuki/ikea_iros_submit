@@ -61,8 +61,7 @@ DEX1_OPEN_VALUE: float = 4.5
 #
 # つまり 0.0 を入れると「骨盤を高さ 0 m へ」= 床まで沈む指令になる。go-live の
 # 1 通目から効くので、呼出側が何も渡さないときは中立姿勢を出す。
-# (運営 package 2026.09.21 / iros_2026_ramen の
-#  docs/handoff/organizer_package_20260921_findings.md C1)
+# (運営 package 2026.09.21、reference/wbc_adapter/wbc_driver.py:455 がリテラル転送)
 DEFAULT_BASE_HEIGHT_M: float = 0.74
 
 
@@ -91,6 +90,7 @@ def check_base_height(base_height_cmd: float) -> float:
             "the organizer relays col [21] literally (wbc_adapter/wbc_driver.py:455)."
         )
     return value
+
 
 def rotation_matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
     """3x3 回転行列 → 単位 quaternion (w, x, y, z)。

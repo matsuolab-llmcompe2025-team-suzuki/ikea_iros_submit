@@ -5,7 +5,7 @@
 #
 # # なぜ要るか
 #
-# 提出 image は docker/Dockerfile.thor.groot の `COPY . ./` でこの repo を丸ごと焼く。
+# 提出 image は docker/Dockerfile.thor の `COPY . ./` でこの repo を丸ごと焼く。
 # 推論コードの本体は iros_2026_ramen 側にあるので、vendor が古いとその古いコードが
 # そのまま image に入る。2026-09-20 時点で約 3 週間ぶんドリフトしていた
 # (20 files が古い / 38 files が欠落、ramen_ori.py は 914 行 → 1904 行)。

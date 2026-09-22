@@ -29,9 +29,7 @@ from .taskspace_adapter import (
 # groot_pick_leg_contract.REAL_ROOT_PROXY_XYZ_WXYZ (静止 root proxy、xyz+wxyz)。
 # RealDdsBackend は global translation / base height を観測できないため、訓練時の
 # 立位高さの session-local 静止 root を使う。root 予測は robot に送られない。
-_ROOT_PROXY_XYZ_WXYZ = np.array(
-    [0.0, 0.0, 0.70, 1.0, 0.0, 0.0, 0.0], dtype=np.float64
-)
+_ROOT_PROXY_XYZ_WXYZ = np.array([0.0, 0.0, 0.70, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 _BODY_DIM = 29
 _HAND_DIM = 2
 
@@ -57,7 +55,9 @@ class HoldPoseBackend(InferenceBackend):
 
     def __init__(self, hand_open_fraction: float = 1.0):
         # 1.0 = 全開 (boundary -1 = open)。DEX1 model 空間の絶対値に変換して保持。
-        self._hand_value = float(np.clip(hand_open_fraction, 0.0, 1.0)) * DEX1_OPEN_VALUE
+        self._hand_value = (
+            float(np.clip(hand_open_fraction, 0.0, 1.0)) * DEX1_OPEN_VALUE
+        )
 
     def infer(self, obs: dict, horizon: int) -> np.ndarray:
         body_q = np.asarray(obs["body_q"], dtype=np.float64)
@@ -65,8 +65,8 @@ class HoldPoseBackend(InferenceBackend):
             raise ValueError(f"obs.body_q must be (29,), got {body_q.shape}")
         row = np.concatenate(
             [
-                _ROOT_PROXY_XYZ_WXYZ,                       # root(7)
-                body_q,                                     # body(29)
+                _ROOT_PROXY_XYZ_WXYZ,  # root(7)
+                body_q,  # body(29)
                 np.full(_HAND_DIM, self._hand_value, np.float64),  # hand(2)
             ]
         )
@@ -111,14 +111,14 @@ class GrootWorkerBackend(InferenceBackend):
         state38 = self._worker.build_state(body_q, self._dex1_open)
 
         images = obs.get("images", {})
-        ego = self._bgr(images, "ego_view")   # head 単一 ego_view を cam_0/cam_1 両方へ
+        ego = self._bgr(images, "ego_view")  # head 単一 ego_view を cam_0/cam_1 両方へ
         frames_bgr = {
             "head_left": ego,
             "head_right": ego,
             "left_wrist": self._bgr(images, "left_wrist"),
             "right_wrist": self._bgr(images, "right_wrist"),
         }
-        chunk38 = self._worker.predict(state38, frames_bgr)   # (T_model, 38) raw
+        chunk38 = self._worker.predict(state38, frames_bgr)  # (T_model, 38) raw
 
         if chunk38.shape[0] >= horizon:
             return chunk38[:horizon]
@@ -203,7 +203,6 @@ class Groot53Backend(InferenceBackend):
         task: str | None = None,
     ):
         import os
-        import sys
         from pathlib import Path
 
         # 既定は vendored desktop subtree (self-contained)。RAMEN_DESKTOP_REPO で override 可。
@@ -229,7 +228,14 @@ class Groot53Backend(InferenceBackend):
         # "inference/orin/.../*.urdf" のハードコード相対 path で、container の CWD
         # (/app) から解決できず FileNotFoundError で全 53D skill が起動失敗する
         # (IAC eval 指摘)。top-level 版は assets/ を __file__ 相対で持ち CWD 非依存。
-        # 両者の compute_ee_state は数値一致 (20 random q で max diff 0.0) を確認済。
+        #
+        # ⚠️ **両者が数値一致することは前提であって、自動では保証されない。**
+        # components/ramen/g1_urdf_fk.py は sync_vendor_desktop.sh の対象外
+        # (手動コピー) なので、本体だけが動くとここが静かにズレる。実際 2026-09-22
+        # まで tool offset が古いままで、compute_ee_state が左 0.1048m / 右 0.0885m
+        # ずれていた (Issue #7)。**この経路だけ**が学習分布から外れた ee_state を
+        # policy に渡していた (orchestrator 経路は vendored vla_skill 経由なので無事)。
+        # 以後は tests/test_fk_copies_agree.py が一致を固定する。
 
         self._CameraKey = CameraKey
         self._Observation = Observation
@@ -275,9 +281,13 @@ class Groot53Backend(InferenceBackend):
             raise ValueError(f"obs.body_q must be (29,), got {body_q.shape}")
         ee_state = self._fk.compute_ee_state(body_q)
         hand_state = (self._dex1_open * self._DEX1_OPEN_VALUE).astype(np.float32)
-        state49 = self._build_state(self._RawRobotState(
-            joint_positions=body_q, hand_state=hand_state, ee_state=ee_state,
-        ))
+        state49 = self._build_state(
+            self._RawRobotState(
+                joint_positions=body_q,
+                hand_state=hand_state,
+                ee_state=ee_state,
+            )
+        )
         images = obs.get("images", {})
         frames = {
             self._CameraKey.HEAD_LEFT: self._bgr(images, "ego_view"),
@@ -285,9 +295,13 @@ class Groot53Backend(InferenceBackend):
             self._CameraKey.WRIST_RIGHT: self._bgr(images, "right_wrist"),
         }
         observation = self._Observation(
-            frames_bgr=frames, frames_bgr_prev=None, state=state49,
-            skill_id=None, language=self._task or obs.get("prompt"),
-            obb_detections=None, timestamp_ns=0,
+            frames_bgr=frames,
+            frames_bgr_prev=None,
+            state=state49,
+            skill_id=None,
+            language=self._task or obs.get("prompt"),
+            obb_detections=None,
+            timestamp_ns=0,
         )
         action19 = np.asarray(
             self._policy.predict(observation).action_chunk, dtype=np.float64
@@ -330,7 +344,7 @@ class GrootPickTaskspacePolicy:
     段階1 では pick 単体 (案C) を想定。model 選択・skill 遷移は将来 (案A/B)。
     """
 
-    ACTION_CHUNK = 16     # metadata.action_chunk_size (= 返す T)
+    ACTION_CHUNK = 16  # metadata.action_chunk_size (= 返す T)
     OBS_CHUNK = 1
 
     def __init__(
@@ -341,7 +355,9 @@ class GrootPickTaskspacePolicy:
         urdf_path: str | None = None,
     ):
         if lane != "decoupled":
-            raise ValueError(f"GrootPickTaskspacePolicy is decoupled-only, got {lane!r}")
+            raise ValueError(
+                f"GrootPickTaskspacePolicy is decoupled-only, got {lane!r}"
+            )
         self.lane = lane
         self._backend = backend if backend is not None else HoldPoseBackend()
         self._ee_frame_transform = ee_frame_transform
