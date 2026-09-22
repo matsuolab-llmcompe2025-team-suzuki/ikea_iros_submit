@@ -141,13 +141,13 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile.thor.groot
+          file: docker/Dockerfile.thor
           platforms: ${{ needs.params.outputs.platform }}
           push: ${{ needs.params.outputs.push == 'true' }}
           tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ needs.params.outputs.tag }}
           provenance: false # 提出物の manifest を素の index に保つ
 
-      - name: digest を記録 (manifest.groot.yaml に書く値)
+      - name: digest を記録 (manifest.yaml に書く値)
         if: ${{ needs.params.outputs.push == 'true' }}
         env:
           PLATFORM: ${{ needs.params.outputs.platform }}
@@ -162,8 +162,8 @@ jobs:
             echo "digest:   $DIGEST"
             echo '```'
             if [ "$PLATFORM" = "linux/arm64" ]; then
-              echo "⚠️ manifest.groot.yaml の digest を手で更新すること。"
+              echo "⚠️ manifest.yaml の digest を手で更新すること。"
             else
-              echo "⚠️ **amd64 は検証専用。manifest.groot.yaml に書かないこと** (Thor は aarch64)。"
+              echo "⚠️ **amd64 は検証専用。manifest.yaml に書かないこと** (Thor は aarch64)。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
