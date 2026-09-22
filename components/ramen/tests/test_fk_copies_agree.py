@@ -146,6 +146,81 @@ def test_compute_ee_transforms_agrees(instances):
     assert worst == 0.0, f"compute_ee_transforms が最大 {worst:.4e} ずれている"
 
 
+#: submit 内にある **手動コピーの台帳**。
+#: `(components/ramen 側, vendor 側, 許容する AST ハンク数, 何のための差か)`
+#:
+#: ⚠️ **名前一致で自動検出してはいけない。** `groot_worker.py` は両側にあるが
+#: **別物**で、components 側は worker を起動する client (`GrootPickWorker`)、
+#: vendor 側は起動される server (`serve` / `main`)。名前で拾うと誤検出する。
+MANUAL_COPIES = [
+    (
+        "g1_urdf_fk.py",
+        "inference/desktop/perception/g1_urdf_fk.py",
+        2,
+        "URDF path を module 相対 assets/ にする (container の CWD が /app のため)",
+    ),
+    (
+        "taskspace_adapter.py",
+        "inference/desktop/lower_policy/policies/taskspace_adapter.py",
+        0,
+        "局所適応なし。完全に一致していること",
+    ),
+]
+
+
+def _code_only(path: Path) -> list[str]:
+    """docstring / コメント / 空行を落とし、実行される構文だけを返す。"""
+    import ast
+
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+        ):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body.pop(0)
+                if not body:
+                    body.append(ast.Pass())
+    return ast.dump(ast.fix_missing_locations(tree), indent=1).splitlines()
+
+
+@pytest.mark.parametrize(
+    "manual,vendored,max_hunks,why",
+    MANUAL_COPIES,
+    ids=[c[0] for c in MANUAL_COPIES],
+)
+def test_manual_copies_only_differ_where_they_must(manual, vendored, max_hunks, why):
+    """手動コピーの局所適応が、宣言した数を超えて増えていないこと。
+
+    増えた分は「意図した適応」か「同期漏れ」か区別が付かない。区別が付かない
+    差分こそが 2026-09-22 の 10cm ズレを 1 か月隠していたもの。
+    """
+    import difflib
+
+    hunks = [
+        line
+        for line in difflib.unified_diff(
+            _code_only(_RAMEN / manual),
+            _code_only(_VENDOR / vendored),
+            lineterm="",
+            n=0,
+        )
+        if line.startswith("@@")
+    ]
+    assert len(hunks) <= max_hunks, (
+        f"{manual}: 局所適応が {len(hunks)} 箇所 (許容 {max_hunks})。"
+        f" 認めている差は「{why}」だけ。"
+        f" 本体 inference/desktop から手で同期すること"
+        f" ({manual} は sync_vendor_desktop.sh の対象外)。差分: {hunks}"
+    )
+
+
 def test_the_manual_copy_only_differs_in_the_urdf_path(copies):
     """**局所適応は URDF path 1 箇所だけ**であること。
 
