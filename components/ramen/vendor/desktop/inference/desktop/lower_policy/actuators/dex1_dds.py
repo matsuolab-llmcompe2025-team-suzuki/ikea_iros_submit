@@ -115,10 +115,29 @@ class Dex1Limits:
 @dataclass(frozen=True)
 class Dex1Gains:
     """位置制御のゲイン。把持は「全閉指令で脚に機械的に止めさせる」ので、
-    握り込みすぎない程度の弱めの kp にしておく。実機で要調整。"""
+    握り込みすぎない程度の弱めの kp にしておく。
+
+    **値は運営の reference calibration に合わせてある** (2026-09-22、Issue #154):
+
+        tools/diagnose_dex1.py
+          "(Reference calibration for one unit, if H1: indices 31/33,
+            q=0.0 closed, q=-5.30 open, kp=5.0, kd=0.05 -- sign-flipped
+            from Unitree's reference, so **trust these, not the docs**.)"
+        tools/run_wbc_with_dex1.py
+          GRIPPER_KP = 5.0 / GRIPPER_KD = 0.05   ← 会場で実際に書き込まれる値
+
+    会場のグリッパは運営 injector が `rt/lowcmd` の slot 31/33 に自分の kp/kd を
+    書くので、ここは **自前機だけ**に効く。合わせる理由は「自前機の評価が会場の
+    挙動を予測できるようにする」こと。
+
+    ⚠️ kd はかつて 0.1 だった (2026-09-11 の暫定値、docstring も「実機で要調整」と
+    書いたまま一度も調整されていなかった)。速度 (`TRAIN_MAX_SPEED_UNITS_PER_S`) と
+    違って **ゲインは学習が持っている量ではない** — 学習データ側の値は分からず
+    設定もできないので、会場の値が唯一の実行可能なアンカー。
+    """
 
     kp: float = 5.0
-    kd: float = 0.1
+    kd: float = 0.05
 
 
 class Dex1DdsGripper:
