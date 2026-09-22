@@ -12,13 +12,16 @@
 
   - 本物の凍結 (1 秒以上 byte 同一) では警告が出る
   - 正常なレート差 (短い重複) では **出ない**
+  - **bridge が黙った場合も出ない** (それは別の故障で、既存の staleness が扱う)
 
 テストは `time.monotonic` を差し替えて時間を進める。tick 数ではなく経過秒で
-判定しているので、呼び出し回数は結果に影響しない。
+判定しているので、呼び出し回数は結果に影響しない。`received_at` は `feed`
+fixture が tick ごとに進める = 「bridge から新しい message が届いている」状態。
 """
 
 from __future__ import annotations
 
+import itertools
 import sys
 import time
 from pathlib import Path
@@ -66,35 +69,52 @@ def inference():
     return Inference(None, None, None, "", ["ego_view", "left_wrist"])
 
 
+@pytest.fixture
+def feed(inference):
+    """`_check_frozen` を「bridge から新しい message が届いた tick」として呼ぶ。
+
+    `received_at` を毎回進める。据え置きたい (= bridge が黙った) ときだけ
+    明示的に渡す。
+    """
+    seq = itertools.count(1)
+
+    def _feed(images: dict, received_at: float | None = None) -> None:
+        inference._check_frozen(
+            images, next(seq) if received_at is None else received_at
+        )
+
+    return _feed
+
+
 def _err(capsys) -> str:
     return capsys.readouterr().err
 
 
-def test_frozen_camera_warns(inference, clock, capsys):
+def test_frozen_camera_warns(feed, clock, capsys):
     """1 秒以上 byte 同一なら警告が出る。"""
-    inference._check_frozen({"ego_view": b"frame-A"})
+    feed({"ego_view": b"frame-A"})
     _err(capsys)
 
     clock.advance(CAMERA_FREEZE_WARN_S / 2)
-    inference._check_frozen({"ego_view": b"frame-A"})
+    feed({"ego_view": b"frame-A"})
     assert _err(capsys) == "", "閾値未満で鳴ってはいけない"
 
     clock.advance(CAMERA_FREEZE_WARN_S)
-    inference._check_frozen({"ego_view": b"frame-A"})
+    feed({"ego_view": b"frame-A"})
     err = _err(capsys)
     assert "ego_view" in err
     assert "変わっていない" in err
 
 
-def test_live_camera_never_warns(inference, clock, capsys):
+def test_live_camera_never_warns(feed, clock, capsys):
     """毎 tick 中身が変わっていれば、何秒回しても鳴らない。"""
     for i in range(200):
         clock.advance(0.05)  # 20Hz x 200 = 10 秒
-        inference._check_frozen({"ego_view": f"frame-{i}".encode()})
+        feed({"ego_view": f"frame-{i}".encode()})
     assert _err(capsys) == ""
 
 
-def test_rate_mismatch_duplicates_do_not_warn(inference, clock, capsys):
+def test_rate_mismatch_duplicates_do_not_warn(feed, clock, capsys):
     """publish 30Hz を 20Hz で読む = 同じ JPEG を 2 回続けて見るのが正常。
 
     ここで鳴ると**健全なカメラで run を落とす**ので、最も守るべき性質。
@@ -104,11 +124,11 @@ def test_rate_mismatch_duplicates_do_not_warn(inference, clock, capsys):
         clock.advance(0.05)  # 20Hz で observe
         if tick % 3:  # 3 回に 1 回は新しい frame が来ていない
             frame_no += 1
-        inference._check_frozen({"ego_view": f"frame-{frame_no}".encode()})
+        feed({"ego_view": f"frame-{frame_no}".encode()})
     assert _err(capsys) == ""
 
 
-def test_worst_benign_hiccup_does_not_warn(inference, clock, capsys):
+def test_worst_benign_hiccup_does_not_warn(feed, clock, capsys):
     """`cap.read()` の連続失敗による最悪の良性ギャップでも鳴らないこと。
 
     head thread は読み取りに失敗すると `time.sleep(0.05)` して再試行するだけ
@@ -116,73 +136,94 @@ def test_worst_benign_hiccup_does_not_warn(inference, clock, capsys):
     **連続一致を N 回で数える設計だとここで誤発火する** (元案は N=3 = 0.15s)。
     閾値直前まで詰めて、鳴らないことを固定する。
     """
-    inference._check_frozen({"ego_view": b"hiccup"})
+    feed({"ego_view": b"hiccup"})
     clock.advance(CAMERA_FREEZE_WARN_S - 0.1)  # 0.9 秒ぶん撮れていない
     for _ in range(18):
-        inference._check_frozen({"ego_view": b"hiccup"})
+        feed({"ego_view": b"hiccup"})
     assert _err(capsys) == ""
 
-    inference._check_frozen({"ego_view": b"recovered"})
+    feed({"ego_view": b"recovered"})
     assert _err(capsys) == "", "良性のギャップから復帰しても黙っていること"
 
 
-def test_warning_repeats_but_is_rate_limited(inference, clock, capsys):
+def test_warning_repeats_but_is_rate_limited(feed, clock, capsys):
     """凍結が続く間は痕跡を残し続ける。ただし毎 tick は出さない。"""
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     clock.advance(CAMERA_FREEZE_WARN_S + 0.1)
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     assert "変わっていない" in _err(capsys)
 
     clock.advance(CAMERA_FREEZE_REPEAT_S / 2)
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     assert _err(capsys) == "", "再通知の間隔を守っていない"
 
     clock.advance(CAMERA_FREEZE_REPEAT_S)
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     assert "変わっていない" in _err(capsys)
 
 
-def test_recovery_reports_how_long_it_was_frozen(inference, clock, capsys):
+def test_recovery_reports_how_long_it_was_frozen(feed, clock, capsys):
     """復帰時に継続時間を出す。申告では「いつから いつまで」が要る。"""
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     clock.advance(3.0)
-    inference._check_frozen({"ego_view": b"stuck"})
+    feed({"ego_view": b"stuck"})
     _err(capsys)
 
-    inference._check_frozen({"ego_view": b"moving-again"})
+    feed({"ego_view": b"moving-again"})
     err = _err(capsys)
     assert "再開" in err
     assert "3.0s" in err
 
 
-def test_recovery_is_silent_if_it_never_warned(inference, clock, capsys):
+def test_recovery_is_silent_if_it_never_warned(feed, clock, capsys):
     """短い重複から復帰しただけのときは何も出さない。"""
-    inference._check_frozen({"ego_view": b"a"})
+    feed({"ego_view": b"a"})
     clock.advance(CAMERA_FREEZE_WARN_S / 2)
-    inference._check_frozen({"ego_view": b"a"})
-    inference._check_frozen({"ego_view": b"b"})
+    feed({"ego_view": b"a"})
+    feed({"ego_view": b"b"})
     assert _err(capsys) == ""
 
 
-def test_each_camera_is_tracked_separately(inference, clock, capsys):
+def test_each_camera_is_tracked_separately(feed, clock, capsys):
     """head だけ凍って wrist は生きている、が実際の故障の形。"""
     for i in range(3):
         clock.advance(CAMERA_FREEZE_WARN_S)
-        inference._check_frozen(
-            {"ego_view": b"stuck", "left_wrist": f"wrist-{i}".encode()}
-        )
+        feed({"ego_view": b"stuck", "left_wrist": f"wrist-{i}".encode()})
     err = _err(capsys)
     assert "ego_view" in err
     assert "left_wrist" not in err
 
 
+def test_a_silent_bridge_does_not_warn(feed, clock, capsys):
+    """bridge が黙った場合は鳴らないこと。**これは別の故障。**
+
+    `observe()` は `read(timeout_ms=0) or latest()` なので、bridge が停止すると
+    同じ frame オブジェクトが返り続けて bytes は一致する。しかしそれは
+    「カメラの凍結」ではなく「bridge の停止」で、`obs["t"]` が止まるぶん
+    **受信時刻ベースの staleness が 0.5 秒で HOLD する**別経路が扱う。
+
+    ここで鳴らすと別の故障を凍結として運営に申告してしまい、申告そのものの
+    信用を落とす。
+    """
+    feed({"ego_view": b"last-frame"})
+    for _ in range(50):
+        clock.advance(0.1)  # 合計 5 秒、閾値 1.0s を大きく超える
+        feed({"ego_view": b"last-frame"}, received_at=7.0)  # 受信時刻が進まない
+    assert _err(capsys) == ""
+
+
 class _FrozenCameras:
-    """同じ frame を返し続ける `RawCameraStream` 代用。"""
+    """**受信は継続しているのに中身が同じ** frame を返す `RawCameraStream` 代用。
+
+    これが本物の凍結の形 (bridge の publish loop は capture と非同期なので、
+    capture が止まっても message は 30Hz で届き続ける)。
+    """
 
     def __init__(self, jpegs: dict) -> None:
         self._frame = SimpleNamespace(jpegs=jpegs, timestamps={}, received_at=0.0)
 
     def read(self, timeout_ms: int = 0):
+        self._frame.received_at += 1 / 30.0  # 新しい message が届いている
         return self._frame
 
     def latest(self):
@@ -214,10 +255,10 @@ def test_observe_runs_the_check(clock, capsys):
     assert "ego_view" in _err(capsys)
 
 
-def test_missing_key_restarts_the_run(inference, clock, capsys):
+def test_missing_key_restarts_the_run(feed, clock, capsys):
     """key ごと消えた期間は凍結に数えない (別経路の話なので)。"""
-    inference._check_frozen({"ego_view": b"a"})
+    feed({"ego_view": b"a"})
     clock.advance(5.0)
-    inference._check_frozen({})  # ego_view が obs から落ちた
-    inference._check_frozen({"ego_view": b"a"})  # 同じ bytes で再登場
+    feed({})  # ego_view が obs から落ちた
+    feed({"ego_view": b"a"})  # 同じ bytes で再登場
     assert _err(capsys) == "", "消えていた時間を凍結に数えてはいけない"

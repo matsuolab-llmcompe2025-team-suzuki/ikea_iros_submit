@@ -125,6 +125,8 @@ class Inference:
         self._last_jpeg: dict[str, bytes] = {}
         self._jpeg_changed_at: dict[str, float] = {}
         self._freeze_warned_at: dict[str, float] = {}
+        #: 直前 tick の `frame.received_at`。**bridge から新しい message が来たか**の判定。
+        self._last_received_at: float | None = None
 
     @property
     def busy(self) -> bool:
@@ -147,7 +149,7 @@ class Inference:
         # 再エンコードはしないので server が展開したピクセルは以前と同一。
         # 展開は components/server.py が policy に渡す直前で 1 回だけ行う。
         images_jpeg = {k: frame.jpegs[k] for k in self._camera_keys if k in frame.jpegs}
-        self._check_frozen(images_jpeg)
+        self._check_frozen(images_jpeg, frame.received_at)
         return {
             "images_jpeg": images_jpeg,
             "body_q": state.body_q,
@@ -161,7 +163,7 @@ class Inference:
             "t": frame.received_at,
         }
 
-    def _check_frozen(self, images_jpeg: dict) -> None:
+    def _check_frozen(self, images_jpeg: dict, received_at: float) -> None:
         """同じ JPEG が届き続けていないか見る。**止めない。log だけ出す。**
 
         判定は decode 前の JPEG bytes 同士の比較。bridge は同じ ndarray を
@@ -169,8 +171,18 @@ class Inference:
         になる。実写では センサノイズで必ず違う bytes になるため、一致が
         `CAMERA_FREEZE_WARN_S` 続くのは「撮れていない」を意味する。
 
+        ⚠️ **新しい message が来た tick でしか判定しない。** `observe()` は
+        `read(timeout_ms=0) or latest()` なので、bridge が黙った場合も同じ frame
+        オブジェクトが返り続けて bytes は一致する。それは「カメラの凍結」ではなく
+        「bridge の停止」で、`obs["t"]` が止まるぶん **受信時刻ベースの staleness が
+        0.5 秒で HOLD する** 別経路の話。ここで鳴らすと **別の故障を凍結として
+        申告してしまい**、申告そのものの信用を落とす。
+
         止めない理由と閾値の根拠は module 冒頭の `CAMERA_FREEZE_WARN_S` を参照。
         """
+        if received_at == self._last_received_at:
+            return  # 新しい message が来ていない = bridge 側の停止。別経路が扱う
+        self._last_received_at = received_at
         now = time.monotonic()
         for key, jpeg in images_jpeg.items():
             if self._last_jpeg.get(key) != jpeg:
@@ -196,9 +208,9 @@ class Inference:
             self._freeze_warned_at[key] = now
             print(
                 f"[client] WARNING: camera {key} が {held:.1f}s 変わっていない "
-                f"(JPEG が byte 単位で同一)。bridge は送り続けていて obs['t'] は "
-                f"進むので鮮度チェックは発火しない。capture 側が止まっている可能性が "
-                f"高い — 走行後の申告根拠になるのでこの行を残すこと",
+                f"(JPEG が byte 単位で同一)。**bridge からの受信は継続中**なので "
+                f"obs['t'] は進み、鮮度チェックは発火しない = capture 側が"
+                f"止まっている。走行後の申告根拠になるのでこの行を残すこと",
                 file=sys.stderr,
             )
 
