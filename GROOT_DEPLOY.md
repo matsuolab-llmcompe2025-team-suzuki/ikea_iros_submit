@@ -4,7 +4,7 @@ RAMEN-Ori (`README.md` / `manifest.yaml`) とは別トラックで、**GR00T 系
 lane の `(T,25)` task-space に載せて** 運営評価に出すための実装と手順。
 
 - 実装: `components/ramen/`
-- 提出 manifest: `manifest.groot.yaml`
+- 提出 manifest: `manifest.yaml`（2026-09-22 に `manifest.groot.yaml` から統合）
 - image: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260920-groot-orch-eeorigin`
 - 技術詳細 / 判断ログ: `VENDOR_NOTES.md` §「GR00T-pick 提出トラック」「53D skills」ほか
 
@@ -130,7 +130,7 @@ docker buildx build --builder armbuilder --platform linux/arm64 \
 - base = `nvcr.io/nvidia/pytorch:25.12-py3` (numpy 2.x ABI torch sm_110 / CUDA13。25.08 は numpy 1.x ABI で from_numpy が壊れるため不可)。
 - image 内訳: image main = lerobot 0.6.0 + ultralytics + pyyaml、`/opt/venv-groot53` = lerobot 0.6.1。
 - 新規 package を作らず **既存 `ikea-thor` の tag** に push (運営に伝達済の名前を維持、
-  `:onboarding` tag は温存)。push 後 digest を `manifest.groot.yaml` に反映。
+  `:onboarding` tag は温存)。push 後 digest を `manifest.yaml` に反映（本体 repo の venue_runbook / offline_bundle も同時に）。
 
 ---
 
@@ -159,7 +159,7 @@ docker buildx build --builder armbuilder --platform linux/arm64 \
 3. **HF_TOKEN**: GR00T / YOLO weights は private Team-RAMEN repo → `-e HF_TOKEN=<read token>` 必須。
 4. **GHCR read 権限**: `ikea-thor` package を運営が pull できる状態か (onboarding Finding 2)。
 5. **NVIDIA_DISABLE_REQUIRE=1**: Thor docker run に必須 (Finding 1)。
-6. `manifest.yaml` (RAMEN-Ori, hold-still stub) と `manifest.groot.yaml` (本トラック) は別。
+6. manifest は `manifest.yaml` 1 本（トラック分岐は 2026-09-22 に解消）。
    運営にどちらを評価してもらうか要調整。
 
 ---

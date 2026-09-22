@@ -1,34 +1,359 @@
-# IKEA IROS submission manifest (Issue #116)
+# IKEA IROS submission manifest
 #
-# 運営 2026-08 の container build 訂正を反映。base image は確定。
-# 提出時は下記 + INSTRUCTIONS.md の docker run + conformance ログ + contact を添える。
+# **これが提出する manifest。** 運営はこのファイル名を明示的に要求している:
+#   CONTRACT.md:24  "Declare one in `manifest.yaml`. It must match what your
+#                    code actually [does]"
+#   RUNBOOK.md:386  --lane "must match the team's manifest.yaml"
+#
+# 2026-09-22 まで `manifest.groot.yaml` という別名で置かれ、`manifest.yaml` には
+# 旧 RAMEN-Ori トラックの内容 (image が :onboarding、weights_uri が TBD、
+# base_image が Dockerfile.thor の cuda:13.0.0) が残っていた。**運営が開くのは
+# manifest.yaml なので、申告と実物が食い違う状態だった** (Issue #7 で発見)。
+#
+# トラックの分岐はもう存在しない。下の thor image 1 つに RAMEN-Ori (rotate) と
+# GR00T (pick/insert/rotate_leg/flip) と orchestrator (YOLO) が全部入っている。
+#
+# ⚠️ **digest の正本はここ。** 本体 repo の docs/handoff/venue_runbook.md と
+#    docs/handoff/offline_bundle.md はここの写し。焼き直したら 3 つとも直すこと。
+#
+# ⚠️ thor image は private (新規 GHCR package)。運営アカウントに read 権限付与が必要
+#    (既存 ikea-thor/ikea-orin と同じ手続き = onboarding Finding 2)。
+# ⚠️ 実 Thor (sm_110) での実行は未検証。arm64 build と、**同一 Dockerfile の amd64 image を
+#    A100 80GB の pod に載せた実行検証**まで済んでいる (下の「実 image 検証」を参照)。
 
-# モデルで決まる lane。RAMEN-Ori は非 GR00T-SONIC = decoupled ((T,25) task-space)。
 lane: decoupled
-
-# 両 image とも linux/arm64 (aarch64) でビルドすること。
 platform: linux/arm64
 
 images:
-  thor:                       # policy server / sm_110 Blackwell / JetPack 7.2 / CUDA 13
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:onboarding"
-    digest: "sha256:a32494cd2c8fd23b49cc1f4209f7c49e1d4645acd90092ce8b8028a352e3170a"
-    base_image: "nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04"   # 標準 NGC CUDA (l4t ではない)
+  thor:                       # policy server / RAMEN-Ori(rotate) + GR00T(pick/insert/rotate_leg/flip) + full orchestrator (YOLO)
+    # 既存 ikea-thor package の新 tag (運営に伝達済の名前を維持、旧 tag は温存)。
+    #
+    # ✅ **2 系統 (#128 eeorigin / #1 vendorsync) の合流 + orchestrator 修正 + pick 修正入り。**
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260921-venuefix2"
+    digest: "sha256:249e504251dd7537410199f724e06348b72a746b09b0cf94e486c6b25a6e6ebb"
+    #   単一 platform (linux/arm64) の manifest。index ではないので digest はこれ 1 本。
+    #   GHCR 上で mediaType=manifest.v2+json / manifests キー無し / layers 102 を確認済み。
+    #   (buildx は既定で attestation を付けて index 化するので --provenance=false --sbom=false)
+    #   旧 tag 20260921-reset / 20260921-venuefix は温存。
+    #
+    # --- venuefix2 (レビュー指摘の修正) ---------------------------------------
+    #   a. Dex1 の staleness 判定が原理的に発火していなかった。`poll()` が古い値を
+    #      無期限に返すので `measured_is_fresh` が恒久的に True。bridge (:5557) が
+    #      落ちても凍結値を「実測」として渡し続けていた (ログも「実測を使う」のまま)
+    #   b. base_height のガードが大会経路に届いていなかった。driver は submit 自身の
+    #      taskspace_adapter を import するので、本体 repo 側だけ直しても効かない
+    #   c. `_taskspace` が `act()` の try の外だった。例外が出ると serve_policy が
+    #      接続を切る = run の終わり。HOLD + 直前の行を返す形にした
+    #   d. :5555 の SUB 二重張り解消 / _JpegObsPolicy に close() を追加
+    #
+    # --- 2026-09-21 venuefix で入ったもの (運営 interface package 2026.09.21 対応) ---
+    #   1. base_height_cmd の既定を 0.0 -> 0.74。運営 adapter は col[21] を WBC へ
+    #      リテラル転送する (wbc_adapter/wbc_driver.py:455)。0 は「指定なし」ではなく
+    #      骨盤高さ 0m = 床まで沈む指令だった。呼出側は誰も渡していないので、
+    #      既定値がそのまま go-live の 1 通目から出ていた
+    #   2. head の実ステレオ (ego_view_left/right) を使う。運営 bridge が publish して
+    #      いるのに mono を複製して「偽の右眼」で pick の expert に渡していた
+    #   3. Dex1 の実測開度を :5557 の gripper_q から読む (2 本目の SUB)。
+    #      boundary/states.py が 4 キーしか decode しないので捨てられていた。
+    #      合成 (自分の指令のエコー) から実測に置換
+    #   4. カメラを **JPEG のまま**運ぶ。運営 bridge は JPEG を配っているのに
+    #      client が Orin で展開して生 RGB を流していた。実シーンで 4.61MB -> 0.338MB、
+    #      1 GbE 実効 101MB/s に対し 45.6ms -> 3.35ms。ピクセルは byte-identical
+    #   5. stage variant の正本を policy_config.yaml の default_variant_by_skill に統一。
+    #      pick が submit 側 v2 / 本体 config v1 で食い違っていた -> v1 に統一
+    #   6. vendor 同期の穴を 2 つ修正 (pick worker script / joint_layout)
+    #
+    # --- eeorigin (main、#128) に入っているもの -------------------------------
+    #   numpy2.x ABI fix (base25.12) + YOLO recursive glob + serve前 warmup +
+    #   GrootConfig / FurnitureGrootRuntimeConfig type strip (base registry) +
+    #   GPU overhead env 化 + 53D FK を CWD 非依存 path (assets/) に修正 +
+    #   **publish EE を wrist_yaw_link 原点 (zero tool offset) に修正**
+    #   (運営 IK は zero offset 固定 = WBC_RUNBOOK §3。pick の IK 残差 60x の原因だった)
+    #
+    # --- boundary-stagefix (この branch、#1) に入っているもの -------------------
+    #   1. components/ramen/vendor/desktop/ を iros_2026_ramen へ全面同期 (77 files、
+    #      約 3 週間のドリフト解消)。YOLO warmup 欠落の修正 = 初回推論 1.8s が
+    #      CAMERA_STALE_TIMEOUT_S=0.5 を超えて毎回 safety-stop していたバグを含む
+    #   2. 自前経路 (inference/desktop/entrypoint.py) を image に同梱
+    #   3. CycloneDDS 0.10.2 + unitree_sdk2py@65691c8 を同梱 (rt/arm_sdk / LocoClient 用)
+    #   4. base を index digest で pin (可変 tag の入れ替わり防止)
+    #   5. --action-sink boundary で stage 1-4 が起動できなかったバグの修正
+    #      (グリッパを使う stage が丸ごと取れない状態だった)
+    #   6. RAMEN_POLICY=groot_orchestrator が DeferredPolicy の signature 変更で
+    #      起動不能だったのを修正 (manifest が「推奨」と書いている経路)
+    #   7. **同じ経路が 53D expert を 1 つも読めなかったのを修正。**
+    #      orchestrator は 53D を server 自身の process に読むが、それは
+    #      lerobot 0.6.1 でないと config.json を draccus が弾く。image の CMD は
+    #      0.6.0 で、0.6.1 の /opt/venv-groot53 は worker にしか渡っていなかった。
+    #      → RAMEN_POLICY=groot_orchestrator のとき 0.6.1 へ os.execv で入り直す。
+    #      併せて warmup の例外握りつぶしをやめた (この不具合は起動ログ上
+    #      正常に見えていた)。RunPod の A100 80GB で実測:
+    #        修正前 DecodingError / GPU 425MiB → 修正後 policy ready / GPU 7273MiB
+    #
+    #   8. **pick_table_leg (Stage 1 の先頭) が container で必ず落ちていたのを修正。**
+    #      vendor tree は components/ramen/vendor/{desktop,model} で desktop/ が 1 段
+    #      挟まるため、上流 groot_pick_legs.py の repo_root = parents[4] が
+    #      vendor/desktop を指し worker script を見失う。さらに worker interpreter が
+    #      dev 専用の model/subtask_policy_training/.venv/bin/python 決め打ちで、
+    #      .dockerignore が .venv/ を除外しているため image には存在し得ない。
+    #      どちらも fallback 無しの FileNotFoundError。DeferredPolicy は skill 開始時に
+    #      初めて load するので、rotate_table_base が通った後に落ちる = 起動ログ上は
+    #      正常に見える。→ worker script の実在で repo root を選び、interpreter は
+    #      RAMEN_WORKER_PYTHON を見る (tools/vendor_patches.py の 2 本目)
+    #   9. **os.execv が -u を落として `listening` 行が出なかったのを修正。**
+    #      stdout が block buffer になり
+    #        [serve] policy server listening on ws://0.0.0.0:8765
+    #      が出ない。会場手順は「この行が出るまで client を繋ぐな」なので、
+    #      先に繋ぐと accept が near-zero になり、しかも症状が「Thor を PC2 より
+    #      先に起動した」場合と同じで切り分けできない。re-exec するのは
+    #      RAMEN_POLICY=groot_orchestrator = 大会当日の構成だけなので会場でだけ踏む
+    #
+    # build 時に worker の起動可能性を assert するようにした (image が緑なのに会場で
+    # worker だけ落ちる形を build で止める):
+    #   [build] pick worker OK (lerobot 0.6.0 + accelerate + safetensors)
+    #   [build] 53D worker OK (lerobot 0.6.1 env から -m で起動できる)
+    #   [build] orchestrator pick worker OK
+    #
+    #  10. 🔴 **orchestrator が rotate_table_base から永久に出られなかったのを修正。**
+    #      `enter_pick_table_leg` は `state.base_rotation_start_table_top_verts` が
+    #      None なら必ず False を返す。この基準は `state.transition()` の ctx 経由
+    #      でしか入らないが、`rotate_table_base` が **initial_skill** のときの
+    #      auto start は `dispatcher.start()` を直接呼ぶので transition を通らない。
+    #      boundary の OrchestratorDriver は initial_skill="rotate_table_base" なので
+    #      **大会経路そのものが該当**し、Stage 1 の 1 skill 目から先へ進めなかった。
+    #      → ring が満ちた最初の tick で基準を 1 度だけ seed する
+    #  11. 🔴 **RAMEN_POLICY=groot_53d_real が 53D を読めなかったのを修正。**
+    #      #7 と同じ原因 (親が lerobot 0.6.0) だが re-exec の条件が
+    #      groot_orchestrator だけで 53D 単体経路が漏れていた。
+    #      **flip_table (Stage 5 の唯一の skill) はこの経路でしか動かせない**。
+    #      pick(38D) は worker を別 process に出すので踏まない = pick だけ試しても
+    #      気付けなかった
+    #
+    #  12. **`--stage 5 --action-sink boundary` が成立しなかったのを修正。**
+    #      boundary は --use-real-hand を禁止する一方、stage 5 の検証はそれを要求して
+    #      いて boundary 例外が無かった (#5 で stage 1-4 を直したときの漏れ)。
+    #      --phase3-full は別の検証関数を通るので動いており、**単独 stage だけ**が
+    #      落ちていた = 会場で flip だけやり直す手段が塞がっていた
+    #  13. 🔴 **自前経路 (entrypoint.py) が container で一切起動できなかったのを修正。**
+    #      cyclonedds 0.10.2 は `<Tracing><Verbosity>config</Verbosity></Tracing>` を
+    #      含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって
+    #      `*** buffer overflow detected ***` で **core dump** する。unitree の
+    #      ChannelConfigHasInterface は必ずこの block を持つので
+    #      `ChannelFactoryInitialize(0, <interface>)` が全滅し、--interface を必ず
+    #      渡す entrypoint は Stage 0 の歩行 (+2点) を含めて起動できなかった。
+    #      interface 指定なしの ChannelConfigAutoDetermine は Tracing を持たず
+    #      落ちないので、import / DomainParticipant(0) / CRC() だけを見ていた
+    #      従来の build assert は通り抜けていた。
+    #      → Tracing block を剥がし、build assert に
+    #        `ChannelFactoryInitialize(0, "lo")` を追加した
+    #
+    #  14. **大会経路に skill 前進の受け皿が無かったのを修正。**
+    #      `tick()` は YOLO の enter_check しか見ず、is_complete /
+    #      max_seconds_hard / max_dwell_sec は `run_live()` (自前経路) の局所変数に
+    #      閉じていた。boundary の driver は `tick()` を直接回すので、YOLO が
+    #      落とすと skill が進まないまま stage が終わる。会場は学習データと違う
+    #      シーンなので現実的なリスク。
+    #      → `advance_finished_skill()` に切り出して両経路から呼ぶ。driver は
+    #        skill_config.yaml の値を自前経路と同じ規約で読む
+    #        (rotate_table_base 30s / pick 21s / insert 21s / rotate_leg 58s、
+    #         いずれも on_timeout: advance)
+    #      ⚠️ 時間切れ前進は「うまくいった証拠ではない」。掴めていない脚を持った
+    #        まま insert へ進む可能性は残る。YOLO が主で、これは止まり続けるより
+    #        マシという位置づけ
+    #
+    #  15. 🔴 **大会経路が自前経路と違う組み立てになっていたのを揃えた (10 箇所)。**
+    #      driver が `assembly.build_vla_skill` を通さず `VlaCls(...)` を直接
+    #      呼んでいたため、assembly が入れる 6 項目が丸ごと抜けていた:
+    #        language_override  rotate_table_base は variant が specialist 用の
+    #                           'rotate table base' なのに class の
+    #                           "rotate and move table base (combined 5+7)" で推論
+    #        dispatch_waist     rotate_table_base は config が False なのに腰を出す
+    #        motion_limiter     速度・加速度の包絡 + 位置の限界が無い
+    #        teacher_range      4 skill 全てに設定があるのに効かない
+    #        wrist FK (skill別) rotate_table_base の独自 offset が効かず 4.4cm ずれる
+    #        progress_monitor   rotate_table_base で on になる設定が効かない
+    #      加えて 4 つ:
+    #        policy_filter      policy が見る検出が planner 用の遅れた出力だった
+    #        on_tick            ModelResidency 未接続 = skill 切替で act() が
+    #                           25〜92 秒ブロック (実測 pick 24.7 / insert 92 /
+    #                           rotate_leg 69 秒)
+    #        log_sink           JSONL が出ず、手順書の「taskspace_25 を見る」が不能
+    #        4 脚ループ          rotate_leg_to_tighten が終端で 1 脚しか回らなかった
+    #  16. **`groot_53d_real` の prompt と腰も揃えた。**
+    #      VlaSkill を通さない薄い経路なので、prompt が運営の obs 任せ、腰は
+    #      常時出す、になっていた。flip は Stage 5 の唯一の skill で
+    #      **大会経路ではこの backend でしか動かせない**
+    #
+    #  17. **skill 切替のたびに 8 秒 act() が止まっていたのを直した。**
+    #      ModelResidency は自分が読んだものを集合で覚えているが、
+    #      `VlaSkill._on_stop()` が skill 停止時に `release_after_skill()` を呼び
+    #      **residency を通さず解放する**。集合だけを信じると「載っているつもりで
+    #      実は無い」になり、先読みが積まれず次に要る tick でその場で読む。
+    #      実 image で 4 脚まわして実測 (2026-09-21):
+    #        insert -> rotate_leg   8121 / 7779 / 7880 ms
+    #        他の切替                 23〜28 ms
+    #      → DeferredPolicy.is_loaded を見て、解放されていたら先読みし直す。
+    #      併せて **GPU に置く model の既定を「全部」から 2 に下げた**
+    #      (今 + 次で切替は隠れる。読み込み 約 8 秒 < 各 skill の 21〜58 秒)。
+    #      ズレを直した今、全部のままだと 53D×4 + pick で約 26 GiB を本当に
+    #      載せに行くため、機体によっては入らない。
+    #      増やすときは `-e RAMEN_GPU_MODELS=<n>` で明示する。
+    #
+    #  18. **RAMEN-Ori を rotate_table_base の選択肢として載せた。**
+    #      推論に lerobot fork は要らない (fork は model/ramen_ori/pixi.toml =
+    #      training env の方)。image に hydra-core / omegaconf / lingbot-vision を
+    #      足し、model/ramen_ori/ を vendor に同期した。
+    #      `-e RAMEN_VARIANT_<SKILL>=<variant>` で焼き直さずに差し替えられる:
+    #        -e RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32
+    #      実 image で load + 3 tick forward (chunk (1,19) finite、load 26.6s) と
+    #      orchestrator 経由の組み立て (type=ramen_ori / skill_id=4) を確認済み。
+    #      ⚠️ boundary は単一 head を複製するので HEAD_RIGHT は HEAD_LEFT と同じ
+    #        画像になる (4 cam で学習した model には劣化入力だが動く)。
+    #
+    #  19. 🔴 **episode 間の `reset` で停止状態が戻らなかったのを修正。**
+    #      `reset` は boundary 契約の一部で運営が episode 間に呼ぶが、
+    #      `_advance_halted` と `n_legs_completed` が残るため **1 本走り切った後の
+    #      2 本目が skill を一切進めないまま終わる**状態だった
+    #      (18 の「4 脚で止める」処理が作り込んだ)。
+    #      `Orchestrator.reset_episode()` を足して driver から呼ぶ。model は
+    #      解放しない (読み直すと切替と同じ待ちが出る)。
+    #
+    # 🔴 **旧 tag を誤って pull しないこと。どれも何かを欠いている:**
+    #      20260921-ramenori            … 上記 19 が無い。**2 本目が動かない**
+    #      20260921-residency           … 上記 18-19 が無い (RAMEN-Ori を選べない)
+    #      20260921-parity              … 上記 17-18 が無い。**切替のたびに 8 秒止まる**
+    #      20260921-advance-backup      … 上記 15-17 が無い。**別 prompt で推論し、
+    #        skill 切替のたびに 25〜92 秒止まり、脚が 1 本しか回らない**
+    #      20260921-stage-dds-fix       … 上記 14-16 が無い。**YOLO が落ちると止まったまま**
+    #      20260921-orch-seedfix        … 上記 12-14 が無い。**自前経路が起動しない**
+    #      20260920-pickfix-unbuffered  … 上記 10-13 が無い。**orchestrator が
+    #        rotate_table_base から進めず、flip も起動しない**
+    #      20260920-orch-lerobot61      … 上記 8-11 が無い。**pick_table_leg が必ず落ちる**
+    #      20260920-groot-orch-eeorigin … 上記 1-6 が無い。とくに
+    #        RAMEN_POLICY=groot_orchestrator が DeferredPolicy の TypeError で
+    #        **起動しない** (manifest が「推奨」と書いている経路)。
+    #        --action-sink boundary の stage 1-4 も起動しない
+    #      20260920-boundary-stagefix   … EE 原点修正が無い (pick の IK 残差 60x が残る)
+    #      20260920-eeorigin-vendorsync … 上記 7 が無い
+    #        (groot_orchestrator が 53D を読めず、しかも起動したように見える)
+    #
+    # 実 image 検証 (2026-09-20、同一 Dockerfile の amd64 image を RunPod A100 80GB の
+    # pod の image にして実行。venv 再現ではなく image そのもの):
+    #   - orchestrator の 4 expert が全て load + forward
+    #       pick_table_leg        groot_pick_legs_v2     load 24.7s / 3 tick / (16,19) finite
+    #       insert_table_leg      groot_insert_leg_200k  92s / 3 tick finite
+    #       rotate_leg_to_tighten groot_rotate_leg_200k  69s / 3 tick finite
+    #       rotate_table_base     groot_overlay          load 64.6s + first forward
+    #         ※ tick は「overlay はダミー画像を拒否」で止まる = 仕様
+    #   - OrchestratorDriver が valid (T,25) を出す (skill=rotate_table_base)
+    #   - RAMEN_POLICY=groot_orchestrator が listening まで到達 (約 2 分)
+    #   - 53D 推論時 GPU 5.9GiB (tensor-streamed load)
+    #
+    # 実シーン 1 枚 (outputs/yolo_smoke_20260920/frame_raw.jpg) を回しながら
+    # OrchestratorDriver を 40 tick 駆動 (2026-09-21):
+    #   - seeded base rotation reference → tick 10 (25°) で
+    #     `fire transition: rotate_table_base -> pick_table_leg`
+    #   - 遷移先の expert が DeferredPolicy として skill 開始時に load される所まで確認
+    #   - 38/40 tick で valid (T,25)
+    #   ※ insert 以降は手の接触 signal が要る (enter_insert_table_leg) ので、
+    #     手が写っていない静止シーンでは発火しない。配線の確認であって
+    #     推論品質の検証ではない。
+    #
+    # 運営 harness 相当 (mock_orin + server + client + mock_wbc、2026-09-21):
+    #   - groot_pick_real                      40 accepted / 0 rejected
+    #   - groot_53d_real + flip                40 accepted / 0 rejected (T=14〜16、age 0.012s)
+    #   - groot_orchestrator                   mock カメラに卓が無く overlay が拒否
+    #     → **conformance.py で推奨経路は検証できない**。実カメラが要る
+    # 4 脚まわしての実測 (実シーン 1 枚を回しながら 5700 tick、2026-09-21):
+    #   - n_legs_completed が 0->1->2->3->4 と進み、4 脚で停止する
+    #   - 遷移 16 回。切替 tick は 23〜28ms (通常 tick の median 31ms と同程度)
+    #   - act() latency median 31ms / p95 35ms
+    #   - 起動直後の 1〜2 回目の切替だけは先読みが間に合わず 10〜16 秒かかることがある
+    #     (HF cache が温まっていれば短い)。3 回目以降は隠れる
+    #
+    # 自前経路の起動確認 (--interface lo、実機なしなので state 待ちで止まる、2026-09-21):
+    #   - --stage 0 / 1 / 5 いずれも --action-sink boundary --synthetic-hand-state で
+    #     起動して待機に入る (DDS 初期化を通過)
+    #   - --policy-variant-* の欠落は起動時に正しく reject される
+    #
+    # ⚠️ conformance.py は server 起動後 **2.0 秒**しか待たない (conformance.py:93)。
+    #    実 policy は listening まで 45〜60 秒かかるので、素で走らせると必ず
+    #    "0 accepted / FAIL" になる。上の結果は server を先に温めてから同じ 4 process を
+    #    組んだもの。運営 harness は無改変のまま。
+    #
+    # image 内検証 (2026-09-20、arm64 コンテナ内で実行):
+    #   - 大会経路 components/ramen/g1_urdf_fk.compute_ee_transforms が
+    #     wrist_yaw_link 原点を返す (zero tool offset)
+    #   - 自前経路 vendor/.../perception/g1_urdf_fk も同様。かつ
+    #     compute_ee_state は tool offset を維持 (差 = [0.087, -0.034, 0.092] m)
+    #   - --action-sink boundary --stage 1 が起動、--synthetic-hand-state の
+    #     ガードも生存
+    #   - cyclonedds 0.10.2 + unitree_sdk2py(LOCO_SERVICE_NAME="sport") + CRC()
+    #   - orchestrator_driver が assembly.load_policy 経由
+    #   - conformance.py --lane decoupled が stub / groot_pick とも PASS (40/0)
+    base_image: "nvcr.io/nvidia/pytorch@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8"
+    base_image_tag: "nvcr.io/nvidia/pytorch:25.12-py3"   # numpy 2.x ABI torch
+    # image ENV 既定は pick 単体 (RAMEN_POLICY=groot_pick_real)。run 時 env で切替:
+    #   - full orchestrator (推奨、perception[YOLO]+dwell で skill 自動遷移=「一通り全部」):
+    #       -e RAMEN_POLICY=groot_orchestrator -e HF_TOKEN=<token>
+    #   - 53D 単体: -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>
+    #       (groot_rotate_leg_200k / groot_insert_leg_200k / groot_overlay /
+    #        groot_flip_table_n17_2_baseline)
+    # 2 lerobot env 内蔵 (pick=0.6.0 image main / 53D=0.6.1 /opt/venv-groot53)、YOLO=ultralytics。
+    #
+    # pick の hybrid (任意、Issue #3 / 本体 #148)。**既定は使わない**ので、
+    # 下の image を必要とするのは `-e RAMEN_PICK_HYBRID=1` を付けたときだけ:
+    #   vllm/vllm-openai@sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a
+    #   (= v0.29.0 の linux/arm64。公開 image、CUDA 13.0.2 / NVARCH=sbsa、
+    #    TORCH_CUDA_ARCH_LIST に 11.0 = sm_110 を含む)
+    # Thor 上で Qwen/Qwen3-VL-8B-Instruct を 127.0.0.1:8000 に立て、
+    # --gpu-memory-utilization 0.20 で GR00T と同居させる。手順は INSTRUCTIONS.md。
+    # ⚠️ 実 Thor での実行は未検証 (09-27 接続テスト待ち)。
     entrypoint:
       ["python3", "-u", "components/server.py",
        "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
-  orin:                       # policy client / sm_87 Ampere / JetPack 5.1.1 / CUDA 11.4
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:onboarding"
-    digest: "sha256:a7a6448893e7dbd80f554cd1bd7a0f648ea1ef25f849012e8565f737c10b04d4"
-    base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"  # device の L4T R35.3.1 に完全一致必須
+  orin:                       # policy client (model 非依存の relay、RAMEN-Ori track と共通)
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin:20260921-venuefix2"
+    digest: "sha256:b5e61a0dc502cf0b1fe225392bff42bf60812fc91034f7643d8da183b9b257da"
+    base_image: "nvcr.io/nvidia/l4t-jetpack:r35.3.1"
+    #   単一 platform (linux/arm64) の manifest、layers 26。GHCR 上で確認済み。
+    #   venuefix2: gripper_q の staleness を実際に発火させる (poll() 自身に期限)。
+    #   live 判定後に CameraStream を閉じる (同じ frame の二重配信をやめる)。
+    #   base tag は device の L4T (JetPack 5.1.1 / R35.3.1) に完全一致させること。
+    #   旧 tag onboarding (sha256:a7a64488...) は温存。
+    #
+    # --- 2026-09-21 venuefix で入ったもの --------------------------------------
+    #   **client 側の変更はこの image にしか入らない。** Thor だけ焼き直しても効かない。
+    #   1. :5557 に 2 本目の SUB を張り、Dex1 の実測開度 gripper_q を obs に載せる
+    #      (boundary/states.py は REQUIRED/OPTIONAL の 4 キーしか decode しない)
+    #   2. カメラを **JPEG のまま**運ぶ。以前は Orin で decode して生 RGB を送っていた。
+    #      実シーンで 4.61MB -> 0.338MB / 45.6ms -> 3.35ms (1 GbE 実効 101MB/s 実測)
+    #      再エンコードしないので server が展開したピクセルは以前と byte-identical
+    #   Python 3.8 (JetPack 5.1.1 の既定) での実行まで確認済み。
     entrypoint:
       ["python3", "-u", "components/client.py",
        "--lane", "decoupled", "--thor", "192.168.100.1", "--orin", "192.168.100.2"]
 
-thor_orin_port: 8765          # components/transport.py の WebSocket port
+thor_orin_port: 8765
 
-# weights は image に焼き込まない。RAMEN-Ori (#115) の HF repo を指す。
-weights_uri: "hf://Team-RAMEN/TBD"                    # RAMEN-Ori weights 確定後
+# weights は image に焼かず runtime に HF 取得 (private Team-RAMEN)。
+#   docker run 時に -e HF_TOKEN=<token> を渡すこと (private repo pull に必須)。
+#
+# ⚠️ **準備スロットは 20 分しかない。** 下の 4 つは host の
+# ~/.cache/huggingface へ事前に pull しておくこと (mount する前提)。
+# orchestrator は 1 脚で 4 つとも通る:
+#   rotate_table_base     hf://Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b
+#                         (RAMEN-Ori。2026-09-21 に GR00T overlay から差し替え)
+#   pick_table_leg        下の weights_uri と同じ
+#   insert_table_leg      hf://Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k@0f0927bcc1aed6927fb26b82c017009961ee3d35
+#   rotate_leg_to_tighten hf://Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26
+# Stage 5 の flip は RAMEN_POLICY=groot_53d_real 側:
+#   hf://Team-RAMEN/... (policy_config.yaml の groot_flip_table_n17_2_baseline)
+# pick を hybrid にするなら Qwen/Qwen3-VL-8B-Instruct も (INSTRUCTIONS.md)。
+# ⚠️ この値は `policy_config.yaml` の `default_variant_by_skill.pick_table_leg` と
+#    一致させること。2026-09-21 まで submit が v2、本体 config が v1 を指していた。
+#    v1 は subdir 配置なので `checkpoint_subdir: checkpoint-40000` で読む。
+weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a"
 
-# Thor 上の想定ピーク GPU mem (128 GB unified)。RAMEN-Ori load 後に実測して確定。
-peak_gpu_memory_thor_gb: "TBD"
+# Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。
+peak_gpu_memory_thor_gb: "TBD"   # 実機測定待ち (128 GB unified)

@@ -167,7 +167,7 @@ python3 -m pytest components/ramen/tests -q
     `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260831-groot-pick`
     index digest `sha256:207c8db9027325a50dca7ff47298aaed2ca0e3a2e9732456b5aadfa7f650c3a5`
     （arm64 platform manifest = `sha256:2c00de8edef8da824e92dd5aa24954daf3a12fafa09a5af96e21e1f6001ebe9c`）。
-    → `manifest.groot.yaml`（RAMEN-Ori 用 manifest.yaml と別 track）に反映済。
+    → `manifest.yaml` に反映済（2026-09-22 に `manifest.groot.yaml` から統合）。
     ※ 運営に伝達済の package 名 `ikea-thor` を維持（`:onboarding` tag は温存、read 権限は既存のまま）。
     ※ 初回誤って push した `ikea-thor-groot` package は堀江が別途削除予定。
 - ⚠️ EE frame（pelvis/torso）は運営未確認（adapter に `ee_frame_transform` 穴あり）。
@@ -202,6 +202,6 @@ groot_inference_server.py` の use_relative_actions=true + relative_exclude_join
   追加。pick=0.6.0 (image main) / 53D=0.6.1 の **2-env**。build check で両 venv の lerobot 版確認。
 - run 時 skill 切替: `-e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>`。
 - arm64 build+push 済: **ikea-thor:20260831-groot-all** index digest
-  `sha256:65ffd2621c58722e18f8747a328adb67ee695b448c5847afedb639f7eaf09041` → manifest.groot.yaml。
+  `sha256:65ffd2621c58722e18f8747a328adb67ee695b448c5847afedb639f7eaf09041` → manifest.yaml。
 - ⚠️ 実行(GR00T 推論)は sm_110 GPU 必要 = 実 Thor でのみ検証可(x86/QEMU は build のみ)。
   1 run = 1 skill (model 選択=案A/B は未、「一通り全部」の複数 skill は follow-up)。
