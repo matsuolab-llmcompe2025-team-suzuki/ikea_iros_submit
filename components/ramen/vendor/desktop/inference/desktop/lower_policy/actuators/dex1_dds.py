@@ -55,19 +55,55 @@ DEFAULT_STATE_TOPIC: dict[Side, str] = {
 }
 
 
+#: 学習データの最速グリッパ速度 (unit/s、0=全閉 / 4.5=全開 の空間)。
+#:
+#: 出所: `BitRobot/G1_WBT_Dex1_Building-Children-Table` の
+#: `observation.state.hand_state` を episode 0 の 153 秒 / 4600 frame で実測し、
+#: 0.30 秒窓の平均速度の最大を取った値 (2026-09-22、Issue #154)。
+#:
+#: ```
+#: 左手  max 4.20  p99 3.46  p95 3.08 unit/s
+#: 右手  max 3.34  p99 3.29  p95 3.00 unit/s
+#: ```
+#:
+#: **なぜ制限するか。** 自前機は制限が無く、実測 5.43 unit/s (= 6.4 motor rad/s、
+#: WandB `pick_table_leg_*_20260920` の `hand_position_rad`) で動いており、
+#: **学習データより 1.3 倍速い**。policy は学習時の速度で腕とグリッパの
+#: タイミングを学んでいるので、速すぎる側もずれている。
+#:
+#: 会場側は運営の `run_wbc_with_dex1.py --dex1-max-speed` が既定 2.0 motor rad/s
+#: (= 1.70 unit/s) で slew しており、**学習の 2.5 分の 1**。そちらは我々が渡す
+#: 引数なので 09-27 で擦り合わせる (`docs/handoff/venue_runbook.md`)。
+#:
+#: ⚠️ 実測は episode 0 の 153 秒のみ。窓幅 0.30 秒は運営の slew が効く時間尺度に
+#: 合わせたもので、窓を変えれば値も動く。広げる場合はこの定数も見直すこと。
+TRAIN_MAX_SPEED_UNITS_PER_S: float = 4.2
+
+
 @dataclass(frozen=True)
 class Dex1Limits:
     """指令値の安全枠。0 = 全閉 / 4.5 = 全開。
 
     設定ミスで機械限界を超える指令が飛ぶのを防ぐため、`command` で必ずクランプする。
+
+    Attributes:
+        max_speed: 位置指令の最大変化率 (unit/s)。`None` で無制限。
+            既定は学習データの実測最速 (`TRAIN_MAX_SPEED_UNITS_PER_S`)。
+            運営の `Dex1Injector.apply` と同じく **最初の 1 指令だけは即座に採る**
+            (目標が無い状態からの slew には意味が無いため)。
     """
 
     min_position: float = 0.0
     max_position: float = 4.5
+    max_speed: Optional[float] = TRAIN_MAX_SPEED_UNITS_PER_S
 
     def __post_init__(self) -> None:
         if not self.min_position < self.max_position:
             raise ValueError("Dex1Limits: min_position < max_position を満たすこと")
+        if self.max_speed is not None and (
+            not math.isfinite(self.max_speed) or self.max_speed <= 0.0
+        ):
+            raise ValueError("Dex1Limits: max_speed must be positive finite or None")
 
     def clamp(self, position: float) -> float:
         value = float(position)
@@ -105,7 +141,9 @@ class Dex1DdsGripper:
         cmd_topic: Optional[dict[Side, str]] = None,
         state_topic: Optional[dict[Side, str]] = None,
         publisher_factory: Optional[Callable[[str], Any]] = None,
-        subscriber_factory: Optional[Callable[[str, Callable[[Any], None]], Any]] = None,
+        subscriber_factory: Optional[
+            Callable[[str, Callable[[Any], None]], Any]
+        ] = None,
         cmd_factory: Optional[Callable[[], Any]] = None,
         continuous_publish_hz: Optional[float] = 200.0,
     ) -> None:
@@ -115,11 +153,27 @@ class Dex1DdsGripper:
         self._state_topic = dict(state_topic or DEFAULT_STATE_TOPIC)
         for side in (Side.LEFT, Side.RIGHT):
             if side not in self._cmd_topic or side not in self._state_topic:
-                raise ValueError(f"topic mapping must cover both sides (missing {side})")
+                raise ValueError(
+                    f"topic mapping must cover both sides (missing {side})"
+                )
 
         self._lock = threading.Lock()
         self._state: dict[Side, Optional[float]] = {Side.LEFT: None, Side.RIGHT: None}
-        self._last_cmd: dict[Side, Optional[float]] = {Side.LEFT: None, Side.RIGHT: None}
+        #: 呼び出し側が指令した **目標値**。`last_command` はこれを返す。
+        self._last_cmd: dict[Side, Optional[float]] = {
+            Side.LEFT: None,
+            Side.RIGHT: None,
+        }
+        #: 実際に publish する **追従中の値**。`limits.max_speed` で目標へ寄せる。
+        self._current: dict[Side, Optional[float]] = {
+            Side.LEFT: None,
+            Side.RIGHT: None,
+        }
+        #: 側ごとの直近 slew 時刻 (monotonic)。dt はここから測る。
+        self._slew_t: dict[Side, Optional[float]] = {
+            Side.LEFT: None,
+            Side.RIGHT: None,
+        }
         self._closed = False
         if continuous_publish_hz is not None and (
             not math.isfinite(continuous_publish_hz) or continuous_publish_hz <= 0.0
@@ -130,7 +184,11 @@ class Dex1DdsGripper:
         self._publisher_thread: Optional[threading.Thread] = None
         self._publisher_error: Optional[BaseException] = None
 
-        if publisher_factory is None or subscriber_factory is None or cmd_factory is None:
+        if (
+            publisher_factory is None
+            or subscriber_factory is None
+            or cmd_factory is None
+        ):
             # SDK は instantiate 時に初めて import する (default env での import 保護)。
             try:
                 from unitree_sdk2py.core.channel import (  # type: ignore
@@ -150,18 +208,23 @@ class Dex1DdsGripper:
                 ) from exc
 
             if publisher_factory is None:
+
                 def publisher_factory(topic: str) -> Any:  # noqa: F811
                     pub = ChannelPublisher(topic, MotorCmds_)
                     pub.Init()
                     return pub
 
             if subscriber_factory is None:
-                def subscriber_factory(topic: str, handler: Callable[[Any], None]) -> Any:  # noqa: F811
+
+                def subscriber_factory(
+                    topic: str, handler: Callable[[Any], None]
+                ) -> Any:  # noqa: F811
                     sub = ChannelSubscriber(topic, MotorStates_)
                     sub.Init(handler, 10)
                     return sub
 
             if cmd_factory is None:
+
                 def cmd_factory() -> Any:  # noqa: F811
                     # The SDK default MotorCmds_ helper has an empty sequence;
                     # Dex1 is one motor per side and therefore needs one
@@ -227,8 +290,24 @@ class Dex1DdsGripper:
             return self._state[side]
 
     def last_command(self, side: Side) -> Optional[float]:
+        """呼び出し側が指令した **目標値**。未送信なら `None`。
+
+        ⚠️ `max_speed` が有効なとき、実際に publish している値はこれとは違う
+        (目標へ向かって追従中)。**把持判定 (`classify_grasp`) にこれを使うと、
+        閉じ始めの過渡で「指令より開いた位置で止まっている」ように見えて
+        誤って HOLDING になる。** その用途には `current_command` を使うこと。
+        """
         with self._lock:
             return self._last_cmd[side]
+
+    def current_command(self, side: Side) -> Optional[float]:
+        """いま実際に publish している値 (slew 後)。未送信なら `None`。
+
+        `classify_grasp` の `command` 引数にはこちらを渡す。実測 (`read`) が
+        追従しようとしている相手はこの値であって、最終目標ではない。
+        """
+        with self._lock:
+            return self._current[side]
 
     # ------------------------------------------------------------ 指令
 
@@ -246,15 +325,41 @@ class Dex1DdsGripper:
         motor.kd = self._gains.kd
         return msg
 
+    def _slew(self, side: Side, target: float) -> float:
+        """`target` へ `max_speed` で寄せた、いま publish すべき値を返す。
+
+        運営の `tools/run_wbc_with_dex1.py:118-140` (`Dex1Injector.apply`) と同じ形:
+        経過時間から `step = max_speed * dt` を作り、目標との差をその幅で clip する。
+        **最初の 1 指令だけは目標をそのまま採る** — 追従元が無い状態で slew しても
+        意味が無いうえ、起動時に必ず全開から始まる想定を壊すため。
+
+        呼び出し側は `self._lock` を保持していること。
+        """
+        max_speed = self._limits.max_speed
+        now = time.monotonic()
+        current = self._current[side]
+        if max_speed is None or current is None:
+            self._current[side] = target
+            self._slew_t[side] = now
+            return target
+        last = self._slew_t[side]
+        # dt の上限は 0.1s。スレッド停止後などに 1 回で飛ばさないため (運営も同じ)。
+        dt = 0.02 if last is None else min(max(now - last, 1e-3), 0.1)
+        step = max_speed * dt
+        moved = current + min(max(target - current, -step), step)
+        self._current[side] = moved
+        self._slew_t[side] = now
+        return moved
+
     def command(self, side: Side, position: float) -> None:
         if self._closed:
             raise RuntimeError("Dex1DdsGripper is closed")
         self._raise_publisher_error()
         clamped = self._limits.clamp(position)
-        msg = self.build_command(clamped)
-        self._publishers[side].Write(msg)
         with self._lock:
             self._last_cmd[side] = clamped
+            to_send = self._slew(side, clamped)
+        self._publishers[side].Write(self.build_command(to_send))
         self._ensure_publisher_thread()
 
     def _ensure_publisher_thread(self) -> None:
@@ -282,12 +387,17 @@ class Dex1DdsGripper:
         period = 1.0 / self._continuous_publish_hz
         deadline = time.monotonic() + period
         while not self._stop_event.wait(max(0.0, deadline - time.monotonic())):
+            # 保持 publish も slew を通す。ここを通さないと 200Hz の hold が
+            # 目標値をそのまま出し続け、`command` 側の rate limit が無意味になる。
             with self._lock:
-                targets = dict(self._last_cmd)
+                to_send = {
+                    side: (None if target is None else self._slew(side, target))
+                    for side, target in self._last_cmd.items()
+                }
             try:
-                for side, target in targets.items():
-                    if target is not None:
-                        self._publishers[side].Write(self.build_command(target))
+                for side, value in to_send.items():
+                    if value is not None:
+                        self._publishers[side].Write(self.build_command(value))
             except BaseException as exc:  # surfaced synchronously on the next tick
                 with self._lock:
                     self._publisher_error = exc
