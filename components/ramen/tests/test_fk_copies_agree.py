@@ -88,6 +88,31 @@ def instances(copies):
     )
 
 
+def test_the_manual_copy_keeps_its_own_urdf_path(copies):
+    """**局所適応が消えていないこと。** hunk 数の検査では捕まらない方向。
+
+    `MANUAL_COPIES` の判定は `len(hunks) <= max_hunks` なので、誰かが「同期」の
+    つもりで上流を verbatim コピーすると **hunks が 0 になって PASS する**。
+    そのとき `DEFAULT_URDF_PATH` は上流の `parents[3]` 相対に戻り、container は
+    CWD が `/app` なので解決できず **全 53D skill が起動失敗する**
+    (= この手動コピーが存在する唯一の理由が消える / IAC eval 指摘)。
+
+    `instances` fixture が `from_urdf()` を引数なしで呼ぶので結果的には落ちるが、
+    メッセージは `FileNotFoundError` で「局所適応が消えている」とは言わない。
+    ここで理由ごと固定する。
+    """
+    manual, _ = copies
+    path = Path(manual.DEFAULT_URDF_PATH)
+    assert path.is_file(), (
+        f"DEFAULT_URDF_PATH が解決しない: {path}。上流を verbatim コピーして"
+        " **URDF path の局所適応を消していないか**。container は CWD が /app なので、"
+        " 上流の repo root 相対 (parents[3]) では解決できない"
+    )
+    assert path.is_absolute() and "assets" in path.parts, (
+        f"module 相対の assets/ を指していない: {path}。CWD 依存になっていないか"
+    )
+
+
 @pytest.mark.parametrize(
     "const",
     ["LEFT_WRIST_TOOL_OFFSET_M", "RIGHT_WRIST_TOOL_OFFSET_M", "G1_JOINT_NAMES"],
