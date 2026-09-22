@@ -109,6 +109,18 @@ jobs:
     # platform に合わせてネイティブ runner を選ぶ (QEMU だと数時間かかる)。
     runs-on: ${{ needs.params.outputs.runner }}
     timeout-minutes: 180
+    # **Thor だけ焼くと壊れずに静かに劣化する。** client 側の変更 (カメラ凍結の
+    # 検出 / JPEG 転送 / gripper_q の 2 本目 SUB) は Orin image にしか入らないので、
+    # Thor だけ新しいと「動いてはいるが機能が無い」状態になり、起動ログからは
+    # 見分けが付かない。既定で両方焼く。
+    strategy:
+      fail-fast: false      # 片方が落ちてももう片方の digest は取りたい
+      matrix:
+        include:
+          - image: ikea-thor
+            file: docker/Dockerfile.thor
+          - image: ikea-orin
+            file: docker/Dockerfile.orin
     steps:
       - uses: actions/checkout@v4
 
@@ -141,10 +153,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile.thor
+          file: ${{ matrix.file }}
           platforms: ${{ needs.params.outputs.platform }}
           push: ${{ needs.params.outputs.push == 'true' }}
-          tags: ghcr.io/${{ github.repository_owner }}/ikea-thor:${{ needs.params.outputs.tag }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.params.outputs.tag }}
           provenance: false # 提出物の manifest を素の index に保つ
 
       - name: digest を記録 (manifest.yaml に書く値)
@@ -158,11 +170,12 @@ jobs:
             echo "## 焼けた image"
             echo '```'
             echo "platform: $PLATFORM"
-            echo "repo_tag: ghcr.io/${{ github.repository_owner }}/ikea-thor:$TAG"
+            echo "repo_tag: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:$TAG"
             echo "digest:   $DIGEST"
             echo '```'
             if [ "$PLATFORM" = "linux/arm64" ]; then
-              echo "⚠️ manifest.yaml の digest を手で更新すること。"
+              echo "⚠️ manifest.yaml の images.* と、本体 repo の venue_runbook §1-2 /"
+              echo "   offline_bundle.md の digest を更新すること (**3 箇所**)。"
             else
               echo "⚠️ **amd64 は検証専用。manifest.yaml に書かないこと** (Thor は aarch64)。"
             fi
