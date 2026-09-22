@@ -75,8 +75,8 @@ ikea_iros_submit/
 │   └── mock_wbc.py        fake controller; validates what we publish
 ├── conformance.py       run this before we ship
 ├── requirements.txt
-├── docker/              RAMEN — **Dockerfile.thor.groot** (提出 image) / Dockerfile.orin
-│                          (Dockerfile.thor は旧トラック用 / Dockerfile.smoke-arm64 は検証用)
+├── docker/              RAMEN — **Dockerfile.thor** (提出 image) / Dockerfile.orin
+│                          (Dockerfile.smoke-arm64 は検証用)
 ├── manifest.yaml        RAMEN — lane / image digests / base / entrypoints / port
 ├── INSTRUCTIONS.md      RAMEN — build & run commands for the organizer
 └── VENDOR_NOTES.md      RAMEN — provenance & our divergences from upstream

@@ -43,7 +43,7 @@ _GROOT_WORKER_PYTHON = Patch(
     why=(
         "GR00T 53D worker の起動を pixi 依存から外すパッチ。"
         "上流 groot.py の _GrootWorkerClient.__init__ が変わった可能性がある。"
-        "Dockerfile.thor.groot の RAMEN_WORKER_PYTHON_53D と対。"
+        "Dockerfile.thor の RAMEN_WORKER_PYTHON_53D と対。"
     ),
     before="""        self._mode = cfg.mode
         self._overlay_jpeg_subsampling = cfg.overlay_jpeg_subsampling
@@ -107,7 +107,7 @@ _GROOT_PICK_LEGS_WORKER = Patch(
     why=(
         "pick-leg GR00T worker の repo root 解決と interpreter を container 向けに直すパッチ。"
         "上流 groot_pick_legs.py の _PickLegsWorkerClient.__init__ が変わった可能性がある。"
-        "Dockerfile.thor.groot の RAMEN_WORKER_PYTHON と対 "
+        "Dockerfile.thor の RAMEN_WORKER_PYTHON と対 "
         "(components/ramen/groot_worker.py と同じ規約)。"
     ),
     before="""        repo_root = Path(__file__).resolve().parents[4]

@@ -22,10 +22,11 @@ docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>
 cd <repo-root>
 
 # Thor (policy server)
-# 🔴 **Dockerfile.thor.groot** を使うこと。docker/Dockerfile.thor は古い
-#    RAMEN-Ori トラック用で、lerobot[groot] / ultralytics / lingbot-vision が
-#    入らず RAMEN_WORKER_PYTHON も設定されない = 全 policy が load に失敗する。
-docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor.groot \
+# これが提出 image の Dockerfile。旧 RAMEN-Ori トラック用の別 Dockerfile が
+# 並存していたが、2026-09-22 に削除して 1 本化した (紛らわしいうえ、そちらで
+# 焼くと lerobot[groot] / ultralytics / lingbot-vision が入らず全 policy が
+# load に失敗する)。
+docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor \
   --provenance=false --sbom=false \
   -t <registry>/ramen-thor:<tag> --push .
 

@@ -43,7 +43,7 @@ python3 -m pytest components/ramen/tests -q
 現在 2 件:
 - `lower_policy/policies/groot.py` — GR00T 53D worker を `RAMEN_WORKER_PYTHON_53D`
   （lerobot 0.6.1 の python）で直接起動する。container に pixi は無いので本家の
-  `pixi run` 経路は fallback に回す。`Dockerfile.thor.groot` の同名 ENV と対。
+  `pixi run` 経路は fallback に回す。`Dockerfile.thor` の同名 ENV と対。
 - `lower_policy/policies/groot_pick_legs.py` — pick worker の repo root 解決と
   `RAMEN_WORKER_PYTHON`（lerobot 0.6.0 の python）起動。vendor tree では
   `parents[4]` が vendor/desktop を指すので、worker script を持つ方を root にする。
@@ -68,7 +68,7 @@ python3 -m pytest components/ramen/tests -q
 
 ## Unitree SDK / CycloneDDS を image に同梱（Issue #1、2026-09-20）
 
-`docker/Dockerfile.thor.groot` は大会経路（`components/server.py`、ZMQ のみ）に加えて
+`docker/Dockerfile.thor` は大会経路（`components/server.py`、ZMQ のみ）に加えて
 **自前経路（`inference/desktop/entrypoint.py`、`rt/arm_sdk` 直 + LocoClient）**も同じ image で
 動かせるようにしてある。会場で持つ image を 1 個にするため。
 
@@ -123,7 +123,9 @@ python3 -m pytest components/ramen/tests -q
   design doc `docs/model/ramen_ori_vla_design.md` §8.6 に未反映。
   - ⚠️ **`scipy` を Thor image の deps に焼き込む**（FK step が要求。運営 onboarding **Finding 5**:
     OOJU/CuriosAI が dev host patch のみで clean run の import time に container fail した事例あり）。
-    RAMEN-Ori 搭載時に `docker/Dockerfile.thor` の model deps へ `scipy` を追加すること。
+    ~~RAMEN-Ori 搭載時に `docker/Dockerfile.thor` の model deps へ `scipy` を追加すること。~~
+    → **不要**。RAMEN-Ori は lingbot-vision 経由で既に入っており、scipy 非依存であることを
+      2026-09-22 に確認済み (Issue #7)。旧トラックの Dockerfile も同日に削除した。
 - **運営 onboarding = PASS**（2026-08、`ikea_iros_submit@6a46c3d`、contract+plumbing 認証、two-box 0 reject）。
   残 gate: (1) `-e NVIDIA_DISABLE_REQUIRE=1`（Finding 1、対応済 INSTRUCTIONS/下記）、(2) GHCR access（Finding 2、public 化で解消）、
   (3) RAMEN-Ori 実搭載（real checkpoint、weighted stage 未検証）。Orin base r35.3.1 は初回正解で credit（Finding 4）。
@@ -140,7 +142,7 @@ python3 -m pytest components/ramen/tests -q
 - `components/ramen/vendor/`: worker inference の最小 closure（`groot_pick_leg_contract` /
   `worker_protocol` / `real_groot_n17_worker.py`）を package path 保存で vendor。desktop policy
   stack 非依存。
-- **container build**: `docker/Dockerfile.thor.groot`（RAMEN-Ori 用と別 image）。
+- **container build**: `docker/Dockerfile.thor`（2026-09-22 に 1 本化。旧 RAMEN-Ori 用は削除）。
   - base = `nvcr.io/nvidia/pytorch:25.12-py3`（numpy 2.x ABI torch。25.08 は torch が numpy 1.x ABI で、
     lerobot 必須の numpy 2.x を入れると from_numpy が全推論クラッシュ = IAC eval 指摘。25.12 で解消、QEMU 検証済）。
     torch **sm_110** の現実解（repo に Thor install script 無し、標準 NGC pytorch を採る）。
@@ -151,7 +153,7 @@ python3 -m pytest components/ramen/tests -q
     大会経路の pick は **ver1**（`policy_config.yaml` の `default_variant_by_skill` が正本）、
     `RAMEN_POLICY=groot_pick_real` の単体経路は contract 固定の ver2-lora。
   - build: `docker buildx build --builder armbuilder --platform linux/arm64 \
-    -f docker/Dockerfile.thor.groot -t <registry>/ramen-thor-groot:<tag> --push .`
+    -f docker/Dockerfile.thor -t <registry>/ramen-thor-groot:<tag> --push .`
   - ⚠️ **旧 25.08 build 検証ログ（無効化、2026-08-31）**: 当初 `nvcr.io/nvidia/pytorch:25.08-py3`
     で `[build] torch 2.8.0a0+nv25.08 cuda 13.0 | numpy 2.2.6 | lerobot 0.6.0` まで build は
     緑で通っていたが、**この torch は numpy 1.x ABI で、numpy 2.x を入れると実推論の
@@ -183,7 +185,7 @@ groot_inference_server.py` の use_relative_actions=true + relative_exclude_join
 **self-contained 化は 2 blocker で保留**（`components/ramen/vendor/groot53` + `groot53_worker.py`
 + `vendor/dex1` は WIP・未使用）:
 1. **lerobot 版分裂**: 53D checkpoint は **0.6.1** 形式（pick は 0.6.0）。container で lerobot
-   env が分裂（pick 0.6.0 / 53D 0.6.1 の 2 venv が要る）。Dockerfile.thor.groot は 0.6.0 のみ。
+   env が分裂（pick 0.6.0 / 53D 0.6.1 の 2 venv が要る）。Dockerfile.thor は 0.6.0 のみ。
 2. **checkpoint load 経路**: takada 53D checkpoint は `embed_tokens` の tied-weight を持ち、
    原さん server の vanilla `GrootPolicy.from_pretrained` が strict load で
    "Unexpected key ... embed_tokens.weight" 失敗。desktop groot.py の custom load
@@ -198,7 +200,7 @@ groot_inference_server.py` の use_relative_actions=true + relative_exclude_join
 - `components/ramen/vendor/desktop/` に desktop 53D closure を package path 保存で vendor
   (groot.py の custom load = raw_config+streaming shards+tied-embedding 復元、が blocker2 を解決)。
   vendored groot.py の worker spawn を pixi→`RAMEN_WORKER_PYTHON_53D` に patch。
-- `Dockerfile.thor.groot`: 53D 用 `/opt/venv-groot53` (lerobot **0.6.1**、base torch sm_110 継承) を
+- `Dockerfile.thor`: 53D 用 `/opt/venv-groot53` (lerobot **0.6.1**、base torch sm_110 継承) を
   追加。pick=0.6.0 (image main) / 53D=0.6.1 の **2-env**。build check で両 venv の lerobot 版確認。
 - run 時 skill 切替: `-e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>`。
 - arm64 build+push 済: **ikea-thor:20260831-groot-all** index digest

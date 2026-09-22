@@ -124,7 +124,7 @@ docker login nvcr.io -u '$oauthtoken'          # NGC API key
 docker login ghcr.io -u <github-user>          # GitHub PAT (write:packages)
 
 docker buildx build --builder armbuilder --platform linux/arm64 \
-  -f docker/Dockerfile.thor.groot \
+  -f docker/Dockerfile.thor \
   -t ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:<tag> \
   --push .
 ```
