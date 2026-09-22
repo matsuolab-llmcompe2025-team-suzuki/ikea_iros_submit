@@ -355,5 +355,17 @@ thor_orin_port: 8765
 #    v1 は subdir 配置なので `checkpoint_subdir: checkpoint-40000` で読む。
 weights_uri: "hf://Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a"
 
-# Thor 上の想定ピーク GPU mem。実 Thor で GR00T load 後に実測して確定。
-peak_gpu_memory_thor_gb: "TBD"   # 実機測定待ち (128 GB unified)
+# Thor 上の想定ピーク GPU mem (既定構成 = RAMEN_POLICY=groot_orchestrator /
+# RAMEN_GPU_MODELS=2 / pick hybrid の VLM 無効)。
+#
+# 実測基準: **同一 Dockerfile の amd64 image** を RunPod A100 80GB で実行 (2026-09-20)。
+#   53D 推論時        5.9 GiB   (tensor-streamed load)
+#   policy ready      7.1 GiB   (7273 MiB)
+#   GR00T 常駐 2 つ    約 12 GiB  ← 既定。切替は「今 + 次」で隠れる
+#   + YOLO + 実行時オーバーヘッド
+#
+# ⚠️ **実 Thor (sm_110, 128 GB unified) での実測ではない。** 09-27 に確認する。
+# ⚠️ 設定を変えると大きく動く:
+#     -e RAMEN_GPU_MODELS=<全部>  53D×4 + pick で約 26 GiB
+#     pick hybrid の VLM を使う    --gpu-memory-utilization 0.20 = 約 26 GB 追加
+peak_gpu_memory_thor_gb: 15
