@@ -1101,6 +1101,19 @@ class OrchestratorDriver:
         ⚠️ reset 時に active だった skill の model は解放される
         (`dispatcher.stop()` が `VlaSkill._on_stop()` を通るため)。常駐から
         外れていないものは先読みが背後で読み直す。
+
+        🔴 **例外を外に出さない。** `serve_policy` は route の例外を掴むと
+        traceback を client へ返して **接続を切る** = run の終わり
+        (`components/transport.py` の `except Exception`)。`act()` は全例外を HOLD に
+        倒しているのに、ここだけ素通しだと次の連鎖で落ちる:
+
+            worker が死ぬ -> act() は HOLD で持ちこたえる (設計どおり)
+            -> episode 間の reset() -> dispatcher.stop() -> _on_stop() が
+               死んだ worker に触る -> 例外 -> 接続断
+
+        **安全機構が支えた run を、直後の reset が落とす**形になる。reset は
+        「綺麗に始める」ための掃除なので、失敗しても最悪「state が汚いまま次の
+        episode に入る」で済む。接続を切るより軽い。
         """
         self._t = 0
         self._advance_halted = False
@@ -1111,10 +1124,23 @@ class OrchestratorDriver:
         # ⚠️ 属性の張り替えでは駄目 (orchestrator が構築時の instance を持つ)。
         self._dex1_src.reset()
         self._dex1_was_measured = False
-        self._orch.reset_episode()
-        # `reset_episode()` は n_legs_completed を 0 に戻す。3 本目から再開する
-        # 構成でそのままにすると、reset のたびに 1 本目の規則 (Kabsch) に落ちる。
-        self._seed_resume_state()
+        # 1 つ失敗しても残りは進める (部分的な掃除の方が、何もしないより良い)。
+        for label, step in (
+            ("orchestrator", self._orch.reset_episode),
+            # `reset_episode()` は n_legs_completed を 0 に戻す。3 本目から再開する
+            # 構成でそのままにすると、reset のたびに 1 本目の規則 (Kabsch) に落ちる。
+            ("resume state", self._seed_resume_state),
+        ):
+            try:
+                step()
+            except BaseException as exc:  # noqa: BLE001
+                print(
+                    f"[orch-driver] 🔴 reset の {label} が失敗した: "
+                    f"{type(exc).__name__}: {exc}。接続は維持するが、"
+                    f"**この episode は state が汚れたまま始まる**",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
 
     def _seed_resume_state(self) -> None:
         """`RAMEN_START_LEG` に対応する `n_legs_completed` を入れる。
