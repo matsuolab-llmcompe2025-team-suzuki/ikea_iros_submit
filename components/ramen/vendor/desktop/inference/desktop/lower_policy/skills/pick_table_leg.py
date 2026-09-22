@@ -82,9 +82,9 @@ class SkillStatus(str, Enum):
 class GoalKind(str, Enum):
     """stage の目標ポーズをどう決めるか。"""
 
-    CV = "cv"                    # GraspPoseProvider から取得 (毎回変わる)
-    FIXED = "fixed"              # root_link 基準の固定値 (YAML)
-    RELATIVE = "relative"        # 他方の腕の**実測** EE pose からのオフセット
+    CV = "cv"  # GraspPoseProvider から取得 (毎回変わる)
+    FIXED = "fixed"  # root_link 基準の固定値 (YAML)
+    RELATIVE = "relative"  # 他方の腕の**実測** EE pose からのオフセット
 
 
 @dataclass(frozen=True)
@@ -246,7 +246,7 @@ class PickTableLegSkill(Skill):
         self._stage_started_at: Optional[float] = None
         self._start_pose: dict[Side, EEPose] = {}
         self._goal_pose: dict[Side, EEPose] = {}
-        self._target: Optional[np.ndarray] = None   # 直前 tick の 14-D 指令
+        self._target: Optional[np.ndarray] = None  # 直前 tick の 14-D 指令
         self._retries: int = 0
         self._failure_reason: Optional[str] = None
         self._issued_grip: dict[Side, float] = {}
@@ -424,7 +424,9 @@ class PickTableLegSkill(Skill):
                 return pose
             # pre-grasp: 把持点の真上へ、手首を起こした姿勢で退避する。
             # 位置は root_link 基準、姿勢は把持姿勢からの差分。
-            position = pose.position if spec.offset is None else pose.position + spec.offset
+            position = (
+                pose.position if spec.offset is None else pose.position + spec.offset
+            )
             rpy = pose.rpy if spec.rpy_offset is None else pose.rpy + spec.rpy_offset
             return EEPose(position=position, rpy=rpy)
         # RELATIVE: 基準腕の **実測** pose から解決する。公称値ではなく実測を使う
@@ -480,15 +482,30 @@ class PickTableLegSkill(Skill):
                     and actual.rotation_error(goal) > ex.rot_tol_rad
                 ):
                     return False
-        if ex.grasp is not None and self._grasp_state(ex.grasp) is not GraspState.HOLDING:
+        if (
+            ex.grasp is not None
+            and self._grasp_state(ex.grasp) is not GraspState.HOLDING
+        ):
             return False
-        if ex.release is not None and self._grasp_state(ex.release) is not GraspState.OPEN:
+        if (
+            ex.release is not None
+            and self._grasp_state(ex.release) is not GraspState.OPEN
+        ):
             return False
         return True
 
     def _grasp_state(self, side: Side) -> Optional[GraspState]:
+        # **目標値ではなく、いま publish している値**と突き合わせる。
+        # `Dex1DdsGripper` は `limits.max_speed` で目標へ追従するので、閉じ始めの
+        # 過渡では実測が目標より開いた位置にある。目標と比べると
+        # `state - command` が大きくなり、`classify_grasp` が誤って HOLDING を
+        # 返す (何も噛んでいないのに掴んだ判定になる)。
+        # `current_command` を持たない実装 (rate limit 無し) では従来どおり。
         state = self._gripper.read(side)
-        command = self._gripper.last_command(side)
+        current = getattr(self._gripper, "current_command", None)
+        command = (
+            current(side) if callable(current) else self._gripper.last_command(side)
+        )
         if state is None or command is None:
             return None
         return classify_grasp(command, state, self._th)
@@ -607,9 +624,7 @@ def _stage_from_config(index: int, entry: object) -> StageSpec:
         if key not in entry:
             raise ValueError(f"{ctx}: {key!r} is required")
 
-    moving = tuple(
-        _side_from_config(v, ctx) for v in entry.get("moving", ())
-    )
+    moving = tuple(_side_from_config(v, ctx) for v in entry.get("moving", ()))
     goal = _goal_from_config(entry.get("goal"), ctx)
     grip = {
         _side_from_config(k, ctx): float(v)
@@ -622,9 +637,7 @@ def _stage_from_config(index: int, entry: object) -> StageSpec:
     if unknown:
         raise ValueError(f"{ctx}: unknown exit key(s) {sorted(unknown)}")
     exit_spec = ExitSpec(
-        pos_tol_m=(
-            float(exit_cfg["pos_tol_m"]) if "pos_tol_m" in exit_cfg else None
-        ),
+        pos_tol_m=(float(exit_cfg["pos_tol_m"]) if "pos_tol_m" in exit_cfg else None),
         rot_tol_rad=(
             float(exit_cfg["rot_tol_rad"]) if "rot_tol_rad" in exit_cfg else None
         ),

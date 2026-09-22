@@ -70,6 +70,34 @@ LANES = ("sonic", "decoupled")
 SONIC_STEP_HZ = 50.0  # gear_sonic_deploy's control cadence
 DECOUPLED_CHUNK_HZ = 20.0  # task-space re-query rate
 
+# ---------------------------------------------------------------- カメラ凍結
+# 運営 bridge の publish loop は **capture と非同期**で、新しい frame が撮れたか
+# どうかを一切見ずに 30Hz 固定で `_latest_frames` を再エンコードして送る
+# (`reference/orin_bridge/real_orin_cameras.py: camera_publish_loop`)。しかも
+# `timestamps[key] = now` は **publish 時刻**で、capture 時刻ではない。
+#
+# つまり capture 側が止まっても
+#   - JPEG は **byte 単位で同一**のまま 30Hz で流れ続け
+#   - `obs["t"]` (= 受信時刻) は正常に進む
+# ので、受信時刻ベースの鮮度チェックは **原理的に発火しない**。
+# head の capture thread には再起動が無く、USB が外れれば `cap.read()` は永久に
+# 失敗し続ける (`if not ok: time.sleep(0.05); continue`) = 凍結は回復しない。
+#
+# ⚠️ **止めない。log だけ出す。**
+# publish 30Hz と capture のレート差で **短い重複は正常に起きる**ので、これを
+# 停止条件にすると健全なカメラで run を落とす。閾値は tick 数ではなく「秒」で
+# 持つ (`observe()` の呼ばれる間隔は lane と負荷で変わる)。
+#
+# 目的は CONTRACT.md「Fairness standard」の立証:
+#   "If a run fails, the cause must be demonstrably yours."
+#   your failure の例: "a policy that runs correctly but produces unreachable
+#   or task-incorrect targets"
+# 凍結画像で動く policy の外見は、この「我々の失敗」と区別が付かない。運営
+# bridge は凍結時に無言、運営 preflight は起動時しか見ない、こちらも画像を
+# 記録していない — **この log が no-contest を申告できる唯一の材料**になる。
+CAMERA_FREEZE_WARN_S = 1.0  # 30Hz なら 30 frame ぶん撮れていない
+CAMERA_FREEZE_REPEAT_S = 5.0  # 凍結が続いている間の再通知間隔
+
 
 class Inference:
     """Runs one inference at a time on a worker thread, so the control loop
@@ -92,6 +120,13 @@ class Inference:
         self._camera_keys = camera_keys
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
         self._pending: Future | None = None
+        # カメラ凍結の検出用 (log only)。key -> 直前の JPEG / 最後に中身が変わった
+        # 時刻 / 最後に警告を出した時刻。
+        self._last_jpeg: dict[str, bytes] = {}
+        self._jpeg_changed_at: dict[str, float] = {}
+        self._freeze_warned_at: dict[str, float] = {}
+        #: 直前 tick の `frame.received_at`。**bridge から新しい message が来たか**の判定。
+        self._last_received_at: float | None = None
 
     @property
     def busy(self) -> bool:
@@ -113,10 +148,10 @@ class Inference:
         # 運営 adapter の 1 周期 50 ms をほぼ使い切っていた。
         # 再エンコードはしないので server が展開したピクセルは以前と同一。
         # 展開は components/server.py が policy に渡す直前で 1 回だけ行う。
+        images_jpeg = {k: frame.jpegs[k] for k in self._camera_keys if k in frame.jpegs}
+        self._check_frozen(images_jpeg, frame.received_at)
         return {
-            "images_jpeg": {
-                k: frame.jpegs[k] for k in self._camera_keys if k in frame.jpegs
-            },
+            "images_jpeg": images_jpeg,
             "body_q": state.body_q,
             "base_quat": state.base_quat,
             # Dex1-1 の実測開度。boundary/states.py は REQUIRED/OPTIONAL の 4 キーしか
@@ -127,6 +162,64 @@ class Inference:
             "prompt": self._prompt,
             "t": frame.received_at,
         }
+
+    def _check_frozen(self, images_jpeg: dict, received_at: float) -> None:
+        """同じ JPEG が届き続けていないか見る。**止めない。log だけ出す。**
+
+        判定は decode 前の JPEG bytes 同士の比較。bridge は同じ ndarray を
+        `cv2.imencode` し直すだけなので、capture が止まっていれば byte 完全一致
+        になる。実写では センサノイズで必ず違う bytes になるため、一致が
+        `CAMERA_FREEZE_WARN_S` 続くのは「撮れていない」を意味する。
+
+        ⚠️ **新しい message が来た tick でしか判定しない。** `observe()` は
+        `read(timeout_ms=0) or latest()` なので、bridge が黙った場合も同じ frame
+        オブジェクトが返り続けて bytes は一致する。それは「カメラの凍結」ではなく
+        「bridge の停止」で、`obs["t"]` が止まるぶん **受信時刻ベースの staleness が
+        0.5 秒で HOLD する** 別経路の話。ここで鳴らすと **別の故障を凍結として
+        申告してしまい**、申告そのものの信用を落とす。
+
+        止めない理由と閾値の根拠は module 冒頭の `CAMERA_FREEZE_WARN_S` を参照。
+        """
+        if received_at == self._last_received_at:
+            return  # 新しい message が来ていない = bridge 側の停止。別経路が扱う
+        self._last_received_at = received_at
+        now = time.monotonic()
+        for key, jpeg in images_jpeg.items():
+            if self._last_jpeg.get(key) != jpeg:
+                # 中身が変わった = 新しい capture が来ている。凍結していたなら
+                # **継続時間を残す** (申告では「いつから いつまで」が要る)。
+                if self._freeze_warned_at.pop(key, None) is not None:
+                    held = now - self._jpeg_changed_at.get(key, now)
+                    print(
+                        f"[client] camera {key}: 画像の更新が再開した "
+                        f"(凍結していた時間 {held:.1f}s)",
+                        file=sys.stderr,
+                    )
+                self._last_jpeg[key] = jpeg
+                self._jpeg_changed_at[key] = now
+                continue
+
+            held = now - self._jpeg_changed_at.get(key, now)
+            if held < CAMERA_FREEZE_WARN_S:
+                continue  # レート差による短い重複は正常
+            last_warn = self._freeze_warned_at.get(key)
+            if last_warn is not None and now - last_warn < CAMERA_FREEZE_REPEAT_S:
+                continue
+            self._freeze_warned_at[key] = now
+            print(
+                f"[client] WARNING: camera {key} が {held:.1f}s 変わっていない "
+                f"(JPEG が byte 単位で同一)。**bridge からの受信は継続中**なので "
+                f"obs['t'] は進み、鮮度チェックは発火しない = capture 側が"
+                f"止まっている。走行後の申告根拠になるのでこの行を残すこと",
+                file=sys.stderr,
+            )
+
+        # key ごと消えた場合は別経路 (server が直前画像を保持する) の話なので、
+        # 凍結判定の連続性だけ切っておく。再登場は新しい run として数える。
+        for key in [k for k in self._last_jpeg if k not in images_jpeg]:
+            del self._last_jpeg[key]
+            self._jpeg_changed_at.pop(key, None)
+            self._freeze_warned_at.pop(key, None)
 
     def submit(self) -> bool:
         """Kick off the next inference. False if one is already in flight or
