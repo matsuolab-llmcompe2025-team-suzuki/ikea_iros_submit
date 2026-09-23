@@ -1,0 +1,7 @@
+# tools/update_organizer.sh が生成。手で編集しない。
+source_repo   : https://github.com/iacevaltest/ikea_iros_submit.git
+source_ref    : main
+source_commit : 2ae4eeb5fcbb5794a10357d427a59504849280e5
+committed_at  : 2026-08-13T17:14:59+08:00
+subject       : updated README for the jetpack ver for orin
+paths         : boundary/ mocks/ conformance.py requirements.txt
