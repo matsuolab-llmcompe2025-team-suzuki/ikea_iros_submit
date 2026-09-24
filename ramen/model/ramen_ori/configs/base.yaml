@@ -1,0 +1,381 @@
+# RAMEN-Ori Phase 1 default training config (Issue #115、Phase 1 M10、Phase 2 A-0 で Hydra DI 化)。
+# 各 sub-module は `_target_` swap で G-2/G-3 fusion 等の alternative に差替可能。
+# data は Hydra group (configs/data/*.yaml) から選択 (deep-merge 事故回避)。
+#
+# Hydra CLI override 例:
+#   pixi run train training.max_steps=1000
+#   pixi run train wandb.enabled=true
+#   pixi run train data=real_task5_7                                          # group swap
+#   pixi run train model.fusion._target_=model.ramen_ori.fusion.FusionCrossAttn  # G-3 swap (実装後)
+
+defaults:
+  - data: dummy         # data group: dummy (default) / real_task5_7 (Phase 2)
+  - _self_
+
+device: cuda
+
+vision_backbone:
+  # A-1 default: "lingbot-base" (LingBot ViT-B/16 ~86M frozen)
+  # A-2 alt:     "radio-b" (NVIDIA RADIOv2.5-B ~86M frozen)、"radio-l" (~305M)
+  variant: lingbot-base
+  dtype: fp32     # Phase 1 は fp32 全一貫、Phase 2 で bf16 化検討
+
+model:
+  # global (sub-module 内部 hyperparam は各 _target_ block で保持)
+  d_model: 512
+  # Issue #129 Phase A (2026-08-31): 3 cam (head_left + L/R wrist) 前提に縮小、
+  # vocab は +1 buffer で 4 (head_right 除外、GR00T と apples-to-apples 比較性)。
+  num_cams: 4
+  chunk_len: 16
+  # Issue #129 Phase A: action は arms 14 + hand 2 = 16D (waist 3 除外)。
+  # inference で waist を使わない前提、loss 圏外に外して arms/hand へ gradient 集中。
+  action_dim: 16
+  sample_n_steps: 6
+
+  vision:
+    _target_: model.ramen_ori.vision.VisionEncoder
+    # backbone / embed_dim は train.py で partial 化 (LingBot loader 経由で inject)
+    d_model: ${model.d_model}
+    pool_size: 8
+    # true: backbone を凍結 (no_grad、土台)。false: 勾配を流し、学習する範囲は optim.partial_train で決まる
+    # (一部解放の変種: freeze=false + partial_train.enabled=true)。backbone はどちらでも常に eval mode。
+    # 注意 (Issue #141 で判明): LingBot の loader は backbone を凍結して返すので、false だけでは学習されない
+    # (Phase K は false + partial_train off で、backbone の重みは配布時のまま)。また Phase K は凍結した backbone を
+    # train mode で動かしていて、LingBot の RoPE の乱れ (rescale_coords、train mode だけ) で学習と推論の特徴が
+    # ずれていた (今は常に eval)。train.py は freeze と partial_train が合わない組み合わせをエラーにする
+    freeze: true
+
+  temporal:
+    _target_: model.ramen_ori.temporal.TemporalEncoder
+    num_cams: ${model.num_cams}
+    embed_dim: 384
+    depth: 8
+    num_heads: 6
+    pool_size: 8
+    cam_embed_dim: 16
+    d_model: ${model.d_model}
+
+  obb:
+    _target_: model.ramen_ori.obb.ObbTokenizer
+    num_classes: 7
+    num_cams: ${model.num_cams}
+    class_embed_dim: 32
+    cam_embed_dim: 16
+    d_model: ${model.d_model}
+    drop_rate: 0.05
+
+  state:
+    _target_: model.ramen_ori.state.StateEncoder
+    state_dim: 71
+    d_model: ${model.d_model}
+    # hidden_dim: null  # null → d_model と同じ
+    # 入口の LayerNorm。Issue #141 以降は model.normalization で次元ごとに正規化し false にする。
+    # 推論は base.yaml から model を組み立てるので、既定は Phase K と同じ true のまま
+    input_norm: true
+    # 学習時に state を group ごとに隠す確率 ({joint, hand, tracking_err, velocity, ee_pose}: p)。null = 隠さない。
+    # 隠した印を group ごとに 1 個足すので最初の層の入力が増える (Issue #141 Phase 6、configs/retrain/c32_state_dropout.yaml)
+    dropout: null
+
+  skill:
+    _target_: model.ramen_ori.skill.SkillEmbedding
+    num_skills: 6
+    d_model: ${model.d_model}
+
+  fusion:
+    _target_: model.ramen_ori.fusion.FusionTransformer   # G-1 Standard default (Alt-1 で G-2/G-3 追加)
+    d_model: ${model.d_model}
+    num_layers: 6
+    num_heads: 8
+    mlp_dim: 2048
+    # qk_norm: false  # attention の q/k を head ごとに RMSNorm (Issue #141、retrain/common.yaml で true)。
+    #                   G-2 / G-3 には無い引数なので base には書かない (action_expert も同じ、MeanFlow には無い)
+
+  action_expert:
+    _target_: model.ramen_ori.action_expert.FlowMatchingDiT  # B-7 default (Alt-7 で B-8 MeanFlow 追加)
+    chunk_len: ${model.chunk_len}
+    action_dim: ${model.action_dim}
+    embed_dim: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    context_dim: ${model.d_model}
+    # qk_norm: false  # self-attn と cross-attn の q/k を head ごとに RMSNorm (Issue #141、retrain/common.yaml で true)
+
+  # memory の token (Issue #141 Phase 7、memory.MemoryEncoder)。null = 使わない (Phase K と同じ構造)。
+  # 使うときは data.memory: true と組にする (configs/retrain/c32_memory.yaml)
+  memory: null
+
+  # Alt-3 I-6 Depth aux head。null = I-1 baseline (default)。有効化例:
+  #   model.aux_head._target_=model.ramen_ori.aux_depth.DepthHead
+  #   +model.aux_head.vision_embed_dim=512 +model.aux_head.num_cams=3 +model.aux_head.pool_size=8
+  aux_head: null
+  aux_weight: 0.1
+
+  # FK の loss (L4、Issue #129 Phase B → Issue #141 RO-16 で 3 項に作り直し)。
+  # pred action の 1-step Euler 復元を元の単位に戻して URDF FK に通し、教師と比べる:
+  #   左側 / 右側 = 肘の位置・手先の位置・手の向き (rot6d)、両側 = 両手先の位置の差。教師の std で割って単位をそろえる
+  # 重みは毎 step `(ratio / 3) × BC ÷ 項` (値だけ使い勾配は流さない、RO-12)、各項 weight_max で上限。
+  # fk: null なら l4_enabled=true 時に G1WristFKTorch.from_default_urdf() で auto-load
+  # (model/ramen_ori/assets/urdf/g1_29dof_mode_15_with_dex1_1.urdf、Phase B で copy 済)。
+  # abs のみ (rel と併用するとエラー)。統計 (FK の量の std) は学習の開始時に計算して ckpt に入る
+  fk: null
+  l4_enabled: false
+  fk_loss:
+    ratio: 0.2          # FK の 3 項の合計を BC の何割にするか
+    weight_max: 1.2     # 各項の重みの上限。学習前の model で測った重みの median (最大は左側 0.123、β) の約 10 倍 (Issue #141 Phase 3)
+
+  # Issue #141 RO-4 / RO-6: state / action を model の中で次元ごとに平均・std 正規化する。
+  # 統計は学習の開始時に全 frame から skill ごとに同じ重みで計算し、model の buffer (ckpt) に入る。
+  # 既定は Phase K と同じ off (推論が base.yaml から組み立てるため)。abs のみ (rel と併用するとエラー)
+  normalization:
+    enabled: false
+    std_min: 1.0e-3     # std の下限 (元の単位: rad / m / hand の値)。変化しない次元 (腰の tracking_err) 用
+    # 正規化した後の state を ±state_clip に切り詰める。std の小さい次元 (velocity の腰、std 0.0016) は正規化後に最大 32 になり、
+    # 入口の層に勾配が集中して学習が崩れた (Issue #141、c32 の 30k step)。±10 で削られるのは tracking_err 0.02% / velocity 0.28% の frame
+    state_clip: 10.0
+
+optim:
+  # adamw | muon。muon は中間の 2D の重みを Muon、それ以外を AdamW (optim_utils.py、Issue #141 の 6 本目 retrain/c32_muon.yaml)。
+  # lr・weight_decay は両方に共通 (Muon は更新の大きさを AdamW に合わせる match_rms_adamw)、betas は AdamW だけ
+  name: adamw
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-2
+  muon:
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    # 直交化 (Newton–Schulz) の計算の経路。既定は torch.optim.Muon と同じ bf16 + baddbmm。
+    # c32_muon は 2 回ともこの辺りで GPU の kernel の異常 (Xid 13 / 43) を起こして落ちた (2026-09-14) ので、選べるようにした
+    ns_dtype: bfloat16   # bfloat16 | float32
+    ns_impl: baddbmm     # baddbmm | matmul (転置の view を渡さず、毎回連続した memory の普通の行列積)
+    # AdamW に回す module (生の入力を受ける入口の層と出口の層)。Embedding と 2D でない param は自動で AdamW
+    adamw_modules:
+      - state.fc1
+      - obb.projection
+      - action_expert.action_proj
+      - action_expert.time_embed.mlp.0
+      - action_expert.output_proj
+    # まとめて持っている行列を分けて直交化する [param 名の末尾, 個数]: MHA の q/k/v、DiT の adaLN (9 個)、最終 adaLN (2 個)
+    split:
+      - [in_proj_weight, 3]
+      - [adaln.1.weight, 9]
+      - [adaln_final.1.weight, 2]
+  # 勾配の全体の norm の上限 (null = clip しない、Phase K と同じ)。Issue #141 の再学習は 1.0 (LeRobot の π0 / π0.5 の既定と同じ)
+  grad_clip_norm: null
+  # Issue #129 Phase C (2026-08-31): partial-train + LLRD (Session 32 案 A)。
+  # enabled=false (default) なら single group AdamW (backbone は loader が凍結したまま)。
+  # enabled=true なら (model.vision.freeze=false と組にする):
+  #   1. model.vision.backbone 全 param を freeze
+  #   2. last N blocks (default 4/12) のみ unfreeze
+  #   3. backbone base LR = optim.lr * backbone_lr_ratio (OpenVLA 準拠、0.2)
+  #   4. block ごと LLRD 適用 (MAE/BEiT v2 標準 0.75)、last=base_lr、以前 = decay^dist_from_last
+  # Backbone: LingBot / RADIO 両対応 (optim_utils.find_backbone_blocks で dispatch)。
+  # WarmupCosineScheduler も multi-group で per-group ratio 保持で動作 (Phase C refactor 済)。
+  partial_train:
+    enabled: false
+    last_n_blocks: 4           # design doc §Axis A 案 A
+    llrd_decay: 0.75           # MAE / BEiT v2 ViT-B 標準
+    backbone_lr_ratio: 0.2     # backbone LR = optim.lr * 0.2 (OpenVLA 準拠)
+
+# Issue #122 LR schedule (warmup + cosine to end_lr)。enabled=false で fix LR (smoke)。
+lr_schedule:
+  enabled: false
+  warmup_steps: 2000
+  cosine_end_lr: 1.0e-5
+
+# Issue #122 EMA (learnable param のみ shadow copy、decay 0.9999)。
+ema:
+  enabled: false
+  decay: 0.9999
+  update_every: 1
+  eval_use_ema: true       # val eval 時に EMA weight を使う
+
+# Issue #122 Precision。null=fp32、"bfloat16" で autocast (Phase K の run と Issue #141 の再学習は bfloat16)。
+# FK (FK の loss と val の手首の誤差) は autocast の下でも fp32 で計算する (fk.py の forward_detailed)
+precision:
+  autocast_dtype: null
+
+# Issue #129 Phase I-0-7 (2026-09-01): 精度影響ゼロ or 実務的に無視できる範囲の高速化 opt。
+# fallback: OOM や速度低下時に flag off で eager mode に戻せる (default false = backward compat)。
+speedup:
+  # 重い部分 (vision / temporal / fusion / action_expert / FK) をその場で compile する (Issue #141)。
+  # 旧実装は torch.compile(model) で model 全体を包んでいたが、学習が呼ぶ compute_loss は forward ではない
+  # ので compile されず (Phase K で速度に効いていなかった)、key に _orig_mod. が付いて EMA が更新されなかった。
+  # 初回の batch で compile (数分)。形が変わる所 (batch 数など) では compile し直しになる。
+  torch_compile: false
+  # "default" (kernel をまとめる)。"reduce-overhead" (CUDA graph) は memory の番地と形を固定するため、
+  # val で EMA が param を入れ替える処理などとの組み合わせが読みにくく、使わない。
+  # "max-autotune-no-cudagraphs" (autotune、初回が長い) は必要なら試す
+  torch_compile_mode: default
+  # SDPA の backend は PyTorch の自動選択。Flash だけに絞る指定 (force_flash_attention) は Issue #141 で削除:
+  # この model では fp32 だと LingBot の attention、bf16 だと fusion の attention に使える Flash の kernel が無く、
+  # 最初の step で止まる (Phase K の run も false で起動していた)
+
+# Issue #122 Data aug (光系中心、head 強 / wrist 弱、YAML tune 前提)。
+# feedback_head_wrist_light_gradient: head の方が天井≈遠光源で環境照明変動大 → head > wrist。
+# Issue #129 Phase D (2026-08-31): Pipeline 順 Photometric→CameraDomain→RandomErasing→Overlay→Geometric→Normalize。
+# Issue #129 Phase G (2026-08-31): 追加 aug (GR00T 継承 sharpness + geometric、拡張 GaussianNoise + JPEG)、
+# saturation 拡大 (head 0.15→0.3、wrist 0.1→0.2)、geometric は head only (wrist は state-image causal link 保護)。
+augmentation:
+  enabled: false
+  head:
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.3           # Phase G: 0.15 → 0.3 (照明色温度 domain gap 拡張)
+      hue: 0.02
+    gaussian_blur:
+      kernel_size: 3
+      sigma_min: 0.1
+      sigma_max: 1.5
+      p: 0.3
+    # Phase G: sharpness (GR00T 由来、backbone 高周波特徴保護)
+    sharpness:
+      factor: 1.5
+      p: 0.5
+    # Phase G: camera domain (real robot sensor noise + JPEG stream artifact)
+    gaussian_noise:
+      sigma: 0.010
+      p: 0.5
+    jpeg:
+      quality: [60, 90]
+      p: 0.3
+  wrist:
+    color_jitter:
+      brightness: 0.1
+      contrast: 0.1
+      saturation: 0.2           # Phase G: 0.1 → 0.2 (head の半分維持、feedback_head_wrist_light_gradient)
+      hue: 0.01
+    gaussian_blur:
+      kernel_size: 3
+      sigma_min: 0.1
+      sigma_max: 1.0
+      p: 0.3
+    sharpness:
+      factor: 1.5
+      p: 0.5
+    gaussian_noise:
+      sigma: 0.010
+      p: 0.5
+    jpeg:
+      quality: [60, 90]
+      p: 0.3
+  random_erasing:
+    p: 0.15
+    scale_min: 0.02
+    scale_max: 0.15
+  # Phase G: geometric aug は head only (wrist geometric skip = user 決定、state-image causal link 保護)。
+  # RandomAffine(±degrees rotation + ±translate% translate)、affine matrix は data 側で
+  # OBB coord (Run 2/6) にも同 matrix で warp。geometric.enabled=false で完全 skip。
+  geometric:
+    enabled: false
+    degrees: [-5.0, 5.0]        # ±5° rotation (GR00T 継承)
+    translate: [0.05, 0.05]     # ±5% pixel translate
+  # camera key の substring で head/wrist dispatch。default: "wrist" を含めば wrist、他は head。
+  wrist_key_substring: wrist
+  # substring で判定できない source 名の wrist cam (Issue #139)。RAMEN-Ori の camera_keys は
+  # cam_0 / cam_2 / cam_3 なので、これが無いと wrist が head 扱い (強 aug + geometric) になる。
+  wrist_cam_keys:
+    - observation.images.cam_2
+    - observation.images.cam_3
+
+# Issue #122 Train/val/test split (episode 単位 80/10/10、seed 固定、leakage 回避)。
+# val は eval_use_ema と組み合わせて EMA weight で loss 測定。
+val:
+  enabled: false
+  val_ratio: 0.1
+  # Issue #129 Phase A (2026-08-31): test 廃止 (実機 eval が究極 arbiter、
+  # software test set は marginal 価値)、9:1 (train:val) で学習 data 最大化。
+  test_ratio: 0.0
+  seed: 42
+  val_every: 1000
+  val_max_batches: 20        # walltime 節約 (batch 数 cap)
+  # 手首の誤差 (ee_error_exec_mm) を測る先頭の行数 = 推論の execution_steps。埋め草の行は除く (Issue #141)
+  ee_error_rows: 8
+  val_batch_size: null       # null → training.batch_size と同じ
+  # Issue #122: GR00T と同じ split にするときの split JSON の path (null なら seed で on-the-fly に分ける)
+  split_json: null
+
+training:
+  batch_size: 4
+  num_workers: 2
+  max_steps: 100
+  log_every: 10
+  ckpt_every: 50
+  ckpt_dir: outputs/ramen_ori_smoke
+  seed: 42
+  # Issue #122: DataLoader knobs (Run 1 shm crash 起因で prefetch 4→2、default 明示化)
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  # Issue #122: N step ごと gc.collect() + torch.cuda.empty_cache() で python 側の
+  # dead ref を掃除 (proc_rss stable 化には効くが、shm leak には無効なので下記の
+  # shm_cleanup_every が本質対策)。
+  gc_every: 1000
+  # Issue #122: /dev/shm/torch_* の orphan file を /proc/*/maps 走査で判定して
+  # os.unlink する機能。**race condition が発覚 (Run 3 MeanFlow step 4000 で
+  # RuntimeError: unable to open shared memory object ... crash 実測)**:
+  # worker が shm 作成 → fd close (mmap 前) → main が open する前の瞬間、
+  # /proc/*/maps に該当なし → 誤 orphan 判定 → unlink → main open で crash。
+  # 対策困難 (age-based filter でも race window ゼロ化は難しい) なので default disable。
+  # /dev/shm 全体の rm は Monitor 側で 50GB threshold auto-rm を推奨。
+  shm_cleanup_every: 0
+  shm_cleanup_on_ckpt: false
+  # Issue #122: Race-free shm cleanup (Run 4 crash pattern の workaround、"cap" 用)。
+  # ckpt save 直後、DataLoader workers を完全 _shutdown_workers() で殺してから
+  # /dev/shm/torch_* を rm → workers respawn で fresh state に戻す。
+  # workers 死んでから rm するため race window ゼロ。overhead: ~3-5sec/ckpt。
+  # 100k step + ckpt_every=5000 の場合 total overhead 60-100sec = 訓練時間の 0.2%。
+  #
+  # **Default false**: PYTORCH_SHM_STRATEGY=file_descriptor (train.py 冒頭で default 化) を
+  # 使えば kernel-level auto-unlink で shm leak そのものが起きない (docs/infra/pytorch_shm_leak.md
+  # 参照)。この cleanup は file_system strategy を使うレガシー経路の fallback として残す
+  # (fd 累積 crash 再発時の緊急退避で `training.safe_shm_cleanup_on_ckpt=true` + 環境変数
+  # `PYTORCH_SHM_STRATEGY=file_system` を組合わせて有効化)。
+  safe_shm_cleanup_on_ckpt: false
+  # Issue #122: Resume from ckpt (crash 復旧 or hyperparam 継続用)。ckpt 完全 state 復元:
+  # model / optim (Adam m/v) / ema shadow / lr_scheduler._step を restore して連続 train。
+  # 対応 wandb resume は wandb.resume_run_id で指定 (同 run に append)。
+  resume_from: null
+  # Issue #122: ckpt を HF に push する (/nvme は Sakura の停止で消える)。every_n_ckpt × ckpt_every step ごと。
+  # Issue #141: push は別 process で流し、学習は待たない (最後の push だけ学習の終わりに待つ、background_push.py)
+  hf_autopush:
+    enabled: false
+    repo_id: null
+    every_n_ckpt: 2
+    private: true
+  # A-5 balancing (task_uniform) — curriculum disabled 時に使用
+  balancing:
+    enabled: false
+    strategy: task_uniform
+  # H-3 Skill curriculum (Alt-5) — enabled 時 balancing より優先
+  curriculum:
+    enabled: false
+    stages: []           # 各 stage: {step: int, skills: [skill_id, ...]}
+  # H-7 AWR twist (Alt-6) — per-episode advantage weight を sampler に inject
+  awr:
+    enabled: false
+    method: inverse      # "inverse" | "z_score" | "rank"
+    temperature: 1.0     # z_score 用
+
+# Issue #141: ckpt に書く学習と推論の約束 (contract.py)。
+contract:
+  # 焼き込みの設定 file (repo root からの相対 path)。data.frame_cache_mode=baked_overlay のとき必須で、
+  # overlay の YOLO の重み・閾値・線の太さをここから読む (焼き込み済みの cache 自体は条件を持たない)
+  bake_config: null
+
+wandb:
+  enabled: false            # Phase 1 smoke default off、real train で on
+  project: ramen_ori
+  entity: ken05-matuo-llm-88_llm_2025_suzuki
+  run_name: null            # null = auto-generate
+  # Issue #122: crash 復旧時に既存 wandb run に append (id + resume="allow")。
+  # null なら新規 run 作成。train loop の step (start_step 以降) をそのまま log step に流すので、
+  # start_step > 既存 run 最終 step なら plot 上で連続 curve になる。
+  resume_run_id: null
+  # Issue #122: auto-merge on resume — crash-time output.log の path を指定すると、
+  # [done] 後に crash log + resume log を merge した新 wandb run を自動作成する。
+  # 元 wandb run 側で resume 時 log 全 reject される問題への workaround (実測 1k step 空白)。
+  # 例: `wandb.auto_merge_source_log=/home/ubuntu/GitHub/.../wandb/run-20260819_XXX/files/output.log`
+  auto_merge_source_log: null

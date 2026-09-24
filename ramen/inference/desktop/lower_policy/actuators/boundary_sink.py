@@ -1,0 +1,415 @@
+"""Orchestrator の 19-D action を大会 boundary (`:5556`) へ出す sink。
+
+# なぜ要るか
+
+自前経路 (`entrypoint.py`) は action を `rt/arm_sdk` へ直接 publish する。腕と歩行は
+それで動くが、**グリッパは動かない** — `rt/dex1/*/cmd` を購読する serial↔DDS 中継
+(`dex1_1_gripper_server`) は我々のラボ構成にしか無く、会場には存在しない
+(`docs/setup/thor_pc2_environment.md` §9.6)。
+
+会場でグリッパまで動かせる経路は 1 本だけで、それが boundary:
+
+    我々 → (T,25) を :5556 に publish → 運営 wbc_adapter (pure relay) → WBC → ロボット
+
+`WBC_RUNBOOK` §7 が "wbc_driver.py's gripper path is a verified pure relay (raw values
+in, raw values out)" と明記しているとおり、hand 列もそのまま流れる。
+
+# 何を自前で書かないか
+
+publish 側 (bind / 検証 / フレーミング) は **運営の実装をそのまま使う**
+(`inference/desktop/boundary/actions.py:DecoupledSink`、vendor・無改変)。
+同梱の README が "a local edit here will pass your tests and fail on the robot" と
+警告している当のものなので、同等品を自作しない。
+
+自前で持つのは **19-D → 38-D の組み立てだけ**で、そこから先の 38-D → (T,25) は
+既存の `taskspace_adapter.groot_chunk_to_taskspace()` を通す。
+
+# 注意
+
+- **`:5556` は client が bind する側。** 運営の adapter がこちらへ dial-in する
+  (`boundary/actions.py` が "THE CLIENT BINDS ... trips everyone up once" と警告)。
+  本 sink を Thor 上で動かす場合、adapter の `--actions-host` をそちらへ向けてもらう
+  必要がある (**2026-09-20 時点で未検証**)。
+- `ee_frame_transform` は既定 `None` (= pelvis/root-link frame)。運営 IK が期待する
+  EE 原点が未確定のため (2026-09-15 に質問済み・未回答)。判明したら値を渡すだけ。
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from typing import Any, Callable, Optional, Sequence
+
+import numpy as np
+
+from inference.desktop.lower_policy.policies.taskspace_adapter import (
+    groot_chunk_to_taskspace,
+)
+from inference.desktop.lower_policy.skills.vla_skill import (
+    ACTION_DIM_TOTAL,
+    ARMS_SLICE,
+    HAND_SLICE,
+    WAIST_SLICE,
+)
+
+# G1 canonical body order の脚 12 dof (G1JointIndex 0..11)。腰・腕は action で
+# 上書きするが、脚は policy が出さないので **実測値をそのまま使う**。
+LEG_DOF = 12
+BODY_DOF = 29
+
+
+def waist_joints_to_torso_rpy(waist_yaw_roll_pitch: Sequence[float]) -> np.ndarray:
+    """Convert the G1 yaw->roll->pitch serial chain to standard XYZ RPY.
+
+    The three G1 waist joint values are *not* generally the Euler angles of the
+    torso.  The URDF composes ``Rz(yaw) @ Rx(roll) @ Ry(pitch)``, whereas the
+    organizer's torso RPY command represents ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
+    They coincide for one-axis motion but diverge when roll and pitch are both
+    non-zero, which also makes the WBC torso frame disagree with the frame used
+    for the wrist FK.  Convert through the actual rotation matrix.
+    """
+
+    q = np.asarray(waist_yaw_roll_pitch, dtype=np.float64).reshape(-1)
+    if q.shape != (3,) or not np.all(np.isfinite(q)):
+        raise ValueError("waist_yaw_roll_pitch must be finite 3-D")
+    yaw, roll, pitch = (float(v) for v in q)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    rz = np.asarray(((cy, -sy, 0.0), (sy, cy, 0.0), (0.0, 0.0, 1.0)))
+    rx = np.asarray(((1.0, 0.0, 0.0), (0.0, cr, -sr), (0.0, sr, cr)))
+    ry = np.asarray(((cp, 0.0, sp), (0.0, 1.0, 0.0), (-sp, 0.0, cp)))
+    rotation = rz @ rx @ ry
+
+    # Inverse of Rz(yaw) @ Ry(pitch) @ Rx(roll), away from the unreachable
+    # gimbal singularity (G1 waist pitch is mechanically limited to +/-0.52).
+    standard_pitch = float(np.arcsin(np.clip(-rotation[2, 0], -1.0, 1.0)))
+    standard_roll = float(np.arctan2(rotation[2, 1], rotation[2, 2]))
+    standard_yaw = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    return np.asarray(
+        [standard_roll, standard_pitch, standard_yaw], dtype=np.float64
+    )
+
+
+class BoundaryWalkActuator:
+    """Navigation command holder for the decoupled 25-D boundary row.
+
+    This deliberately has no Unitree SDK client.  ``set_velocity`` updates the
+    boundary command and asks the configured publisher to emit immediately.
+    """
+
+    def __init__(self) -> None:
+        self.latest = np.zeros(3, dtype=np.float64)
+        self._publish: Optional[Callable[[], None]] = None
+
+    def set_publish_callback(self, callback: Callable[[], None]) -> None:
+        self._publish = callback
+
+    def set_velocity(
+        self, vx: float, vy: float, vyaw: float, *, duration: float | None = None
+    ) -> None:
+        del duration
+        value = np.asarray([vx, vy, vyaw], dtype=np.float64)
+        if not np.all(np.isfinite(value)):
+            raise ValueError("boundary navigation command must be finite")
+        self.latest = value
+        if self._publish is not None:
+            self._publish()
+
+
+class BoundaryArmActuator:
+    """Small arm ownership adapter with no DDS publisher.
+
+    It gives the existing safety/transition machinery the same measured-state
+    and last-target surface as ``G1ArmActuator`` while every physical command
+    is routed exclusively through ``BoundaryActionSink``.
+    """
+
+    def __init__(self) -> None:
+        self._sender: Optional[Callable[[Sequence[float]], bool]] = None
+        self._state_getter: Optional[Callable[[], Optional[np.ndarray]]] = None
+        # No command has been published yet.  In particular, zero joint angles
+        # are never a safe substitute for a missing first state sample.
+        self._last: Optional[np.ndarray] = None
+        self._initial: Optional[np.ndarray] = None
+        self._started = False
+        self._has_motion_target = False
+
+    def configure(
+        self,
+        *,
+        sender: Callable[[Sequence[float]], bool],
+        state_getter: Callable[[], Optional[np.ndarray]],
+    ) -> None:
+        self._sender = sender
+        self._state_getter = state_getter
+        # State may not have arrived during construction. start() re-reads it
+        # after the final preflight/operator gate.
+        self._last = None
+        self._initial = None
+        self._has_motion_target = False
+
+    def start(self) -> None:
+        if self._state_getter is None or self._sender is None:
+            raise RuntimeError("boundary arm actuator is not configured")
+        measured = self._state_getter()
+        if measured is None:
+            raise RuntimeError("fresh measured arm state unavailable at boundary start")
+        measured = np.asarray(measured, dtype=np.float64).reshape(-1)
+        if measured.shape != (14,) or not np.all(np.isfinite(measured)):
+            raise RuntimeError("boundary start requires finite measured arm state (14-D)")
+        self._last = measured.copy()
+        self._initial = measured.copy()
+        self._has_motion_target = False
+        self._started = True
+
+    def send_action(self, arms14: Sequence[float]) -> None:
+        """腕 14-D を boundary へ出す。**唯一の送信窓口**。
+
+        「最後に送った target」は publish に成功したときだけ更新する。歩行指令の
+        再送・model 遷移の起点・終了時の保持はこの値を読むので、publish されて
+        いない target (関節 state 未受信の tick、検証で弾かれた row) を記録すると、
+        実機が一度も向かっていない姿勢へ跳ぶ。起動前 (`start` 前) は publish
+        しないので記録もしない。
+        """
+        target = np.asarray(arms14, dtype=np.float64).reshape(-1)
+        if target.shape != (14,) or not np.all(np.isfinite(target)):
+            raise ValueError("boundary arm target must be finite 14-D")
+        if not self._started:
+            return
+        if self._sender is None:
+            raise RuntimeError("boundary arm publisher is not configured")
+        if self._sender(target.copy()):
+            if self._initial is not None and np.max(np.abs(target - self._initial)) > 0.01:
+                self._has_motion_target = True
+            self._last = target.copy()
+
+    @property
+    def has_motion_target(self) -> bool:
+        """Whether an arm target distinct from the initial hold was published."""
+        return self._has_motion_target
+
+    def read_arm_positions(self) -> np.ndarray:
+        if self._state_getter is None:
+            raise RuntimeError("boundary state source is not configured")
+        measured = self._state_getter()
+        if measured is None:
+            raise RuntimeError("boundary state is unavailable")
+        return np.asarray(measured, dtype=np.float64).copy()
+
+    def read_last_published_targets(self):
+        if self._last is None:
+            raise RuntimeError("boundary arm hold target is unavailable before start")
+        return self._last.copy(), None
+
+    def clear_waist_action(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        self._started = False
+
+
+def assemble_action38(
+    action19: Sequence[float],
+    body_q29: Sequence[float],
+) -> np.ndarray:
+    """19-D action + 実測 body_q(29) → GR00T raw 38-D (root7 + body29 + hand2)。
+
+    提出側 `components/ramen/orchestrator_driver.py` が同じ組み立てをしている。
+    FK は root7 を使わない (pelvis 基準の相対 chain) ので、root は identity で埋める。
+
+    Args:
+        action19: `vla_skill` の 19-D (waist3 + arms14 + hand2)。
+        body_q29: `rt/lowstate` 由来の実測関節角 (G1JointIndex 順)。脚 12 dof のみ使う。
+
+    Returns:
+        (38,) float64。`groot_chunk_to_taskspace` にそのまま渡せる。
+    """
+
+    action = np.asarray(action19, dtype=np.float64).reshape(-1)
+    if action.shape != (ACTION_DIM_TOTAL,):
+        raise ValueError(f"action19 must be ({ACTION_DIM_TOTAL},), got {action.shape}")
+    body = np.asarray(body_q29, dtype=np.float64).reshape(-1)
+    if body.shape != (BODY_DOF,):
+        raise ValueError(f"body_q29 must be ({BODY_DOF},), got {body.shape}")
+    if not np.all(np.isfinite(action)):
+        raise ValueError("action19 must be finite")
+    if not np.all(np.isfinite(body[:LEG_DOF])):
+        raise ValueError("body_q29 legs must be finite")
+
+    # root7 = 位置 0 + 単位 quat (w-first)。FK が使わないので値は効かないが、
+    # 38-D の形を崩さないために埋める。
+    root = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    body29 = np.concatenate([body[:LEG_DOF], action[WAIST_SLICE], action[ARMS_SLICE]])
+    return np.concatenate([root, body29, action[HAND_SLICE]])
+
+
+def assemble_action19(
+    waist3: Optional[Sequence[float]],
+    arms14: Sequence[float],
+    hand2: Optional[Sequence[float]],
+    *,
+    measured_waist3: Optional[Sequence[float]] = None,
+    fallback_hand2: Sequence[float] = (0.0, 0.0),
+) -> np.ndarray:
+    """腰 / 腕 / 手の 3 断片から 19-D action を組み直す。
+
+    orchestrator が `actuator_send_fn` に渡すのは **腕 14-D だけ**で、腰と手は skill が
+    それぞれの actuator へ直接送っている。boundary へ出すには 19-D 全体が要るので、
+    mock actuator が保持している直近 target (`latest`) から組み直す
+    (提出側 `orchestrator_driver.py` の `assemble_19d` と同じ考え方)。
+
+    Args:
+        waist3: 腰 actuator の直近 target。skill がまだ送っていなければ `None`。
+        arms14: orchestrator から来た腕 14-D。
+        hand2: 手 actuator の直近 target。未送信なら `None`。
+        measured_waist3: `waist3` が `None` のときに使う実測腰角。これも無ければ 0。
+        fallback_hand2: `hand2` が `None` のときの値。
+    """
+
+    arms = np.asarray(arms14, dtype=np.float64).reshape(-1)
+    if arms.shape != (14,):
+        raise ValueError(f"arms14 must be (14,), got {arms.shape}")
+
+    if waist3 is not None:
+        waist = np.asarray(waist3, dtype=np.float64).reshape(-1)
+    elif measured_waist3 is not None:
+        waist = np.asarray(measured_waist3, dtype=np.float64).reshape(-1)
+    else:
+        waist = np.zeros(3, dtype=np.float64)
+    if waist.shape != (3,):
+        raise ValueError(f"waist must be (3,), got {waist.shape}")
+
+    hand = np.asarray(
+        hand2 if hand2 is not None else fallback_hand2, dtype=np.float64
+    ).reshape(-1)
+    if hand.shape != (2,):
+        raise ValueError(f"hand must be (2,), got {hand.shape}")
+
+    return np.concatenate([waist, arms, hand])
+
+
+class BoundaryActionSink:
+    """19-D action を (T,25) にして運営 boundary へ publish する。
+
+    `rt/arm_sdk` 直の actuator と**同時には使わない**。両方が同じ関節を動かすため。
+
+    Args:
+        fk: `G1WristFK` 相当 (`compute_ee_transforms` を持つもの)。
+        port / host: `DecoupledSink` にそのまま渡す。
+        ee_frame_transform: root-link → 運営 IK が期待する frame の 4x4。未確定なので
+            既定 `None` (変換なし)。
+        log_fn: `dict` を 1 件受け取る callable。publish した raw (T,25) を残す
+            (`WBC_RUNBOOK` §5:「グリッパが閉じたかは自分の publish 値で分かる」)。
+        sender_clock_offset_fn: 運営 bridge (PC2) の壁時計 − この host の壁時計 [s] を
+            返す callable (`ZmqFrameSource.sender_clock_offset_s`)。運営 adapter は
+            `issued_at` を PC2 の時計と比べて 1.0 s より古い chunk を捨てるので、
+            Thor で動かすときは送信時刻を PC2 の時計に揃える (Issue #161、C2-01)。
+            None を返す間 (まだカメラが来ていない) は今までどおりこの host の時計。
+    """
+
+    def __init__(
+        self,
+        fk: Any,
+        *,
+        port: int = 5556,
+        host: str = "*",
+        ee_frame_transform: Optional[np.ndarray] = None,
+        log_fn: Any = None,
+        sender_clock_offset_fn: Optional[Callable[[], Optional[float]]] = None,
+    ) -> None:
+        if fk is None or not callable(getattr(fk, "compute_ee_transforms", None)):
+            raise ValueError(
+                "official decoupled boundary requires the G1 URDF wrist FK; "
+                "refusing to publish zero/undefined end-effector poses"
+            )
+        # boundary は zmq / cv2 / msgpack を引くので lazy import
+        # (default env から本 module を import しても壊さない)。
+        from inference.desktop.boundary import DecoupledSink
+
+        self._fk = fk
+        self._ee_frame_transform = ee_frame_transform
+        self._log_fn = log_fn
+        self._sender_clock_offset_fn = sender_clock_offset_fn
+        self._sink = DecoupledSink(port=port, host=host)
+        self._sent = 0
+        print(
+            f"[boundary] DecoupledSink bound on {host}:{port} "
+            "(the organizer's adapter dials in to this)",
+            file=sys.stderr,
+        )
+
+    @property
+    def sent_count(self) -> int:
+        return self._sent
+
+    def send_action(
+        self,
+        action19: Sequence[float],
+        body_q29: Sequence[float],
+        *,
+        navigate_cmd: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """1 tick 分の 19-D action を (1,25) chunk として publish する。"""
+
+        action38 = assemble_action38(action19, body_q29)
+        chunk = groot_chunk_to_taskspace(
+            action38[None, :], self._fk, ee_frame_transform=self._ee_frame_transform
+        )
+        navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
+        if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
+            raise ValueError("navigate_cmd must be finite 3-D")
+        chunk[:, 18:21] = navigation
+        # action19 stores the three serial G1 waist joints (yaw->roll->pitch),
+        # while the organizer contract wants the resulting torso orientation
+        # as standard XYZ RPY.  A reorder is insufficient for compound motion.
+        # The entrypoint fills the waist with the *measured* angle (the
+        # organizer's adapter ignores [22:25] and holds the measured waist), so
+        # these columns report the actual torso orientation.
+        waist_yaw_roll_pitch = np.asarray(action19, dtype=np.float64)[:3]
+        chunk[:, 22:25] = waist_joints_to_torso_rpy(waist_yaw_roll_pitch)
+        # 送信時刻を運営 adapter の時計 (PC2) に揃える。推定がまだ無ければ
+        # DecoupledSink の既定 (この host の time.time()) のまま。
+        offset = (
+            None
+            if self._sender_clock_offset_fn is None
+            else self._sender_clock_offset_fn()
+        )
+        issued_at = None if offset is None else time.time() + float(offset)
+        # 検証は DecoupledSink.send_chunk が中でやる (不正なら ActionError)。
+        if issued_at is None:
+            self._sink.send_chunk(chunk)
+        else:
+            self._sink.send_chunk(chunk, issued_at=issued_at)
+        self._sent += 1
+        if self._log_fn is not None:
+            row = np.asarray(chunk[0], dtype=np.float64)
+            self._log_fn(
+                {
+                    "event": "boundary_taskspace",
+                    "seq": self._sent,
+                    # hand 列は「掴んだか」の一次証拠。-1=open / +1=closed。
+                    "left_hand": row[0:2].tolist(),
+                    "right_hand": row[2:4].tolist(),
+                    "left_ee_pos": row[4:7].tolist(),
+                    "right_ee_pos": row[11:14].tolist(),
+                    "taskspace_25": row.tolist(),
+                    # None = この host の時計で付けた (送信側の時計の差がまだ無い)。
+                    "issued_at": issued_at,
+                    "sender_clock_offset_s": offset,
+                    # 逆算用: この tick で読めた実測関節角。静止保持中の後半を使えば
+                    # 「指令した EE」と「到達した関節を自前 FK に通した EE」の差 =
+                    # 運営 IK が期待する frame とのオフセットが解ける (EE 原点が
+                    # どの資料にも無いため、実測から求めるしかない)。
+                    "measured_body_q29": np.asarray(
+                        body_q29, dtype=np.float64
+                    ).tolist(),
+                }
+            )
+
+    def close(self) -> None:
+        """冪等。"""
+
+        sink, self._sink = self._sink, None
+        if sink is not None:
+            sink.close()

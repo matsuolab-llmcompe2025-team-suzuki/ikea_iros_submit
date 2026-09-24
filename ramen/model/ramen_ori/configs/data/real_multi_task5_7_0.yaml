@@ -1,0 +1,69 @@
+# RAMEN-Ori Phase K β task: task5 (rotate) + task7 (move) + task0 (insert) の
+# 3-sub-dataset multi wrapper (Issue #129 Phase K、2026-09-01)。
+#
+# α (real_multi_task5_7) と同じ multi wrapper 経路、task0 (combined_task0、34 chunks merge 済)
+# を追加した 1:1:1 mix 想定。task0 は frame 数 (5.8M) が rotate/move (~440K each) より
+# 大きいため、frame 素直な random sampling では 87% が task0 に偏る → task_uniform balancing
+# 必須。
+#
+# CLI override 例:
+#   pixi run train --config-name=real_multi_task5_7_0 \
+#     data.frame_cache_mode=baked_overlay \
+#     data.sub_datasets.0.frame_cache_root_baked=/nvme/rotate_table_base/frame_cache_v2/overlay \
+#     data.sub_datasets.1.frame_cache_root_baked=/nvme/task7/frame_cache_v2/overlay \
+#     data.sub_datasets.2.frame_cache_root_baked=/nvme/merged_sources/combined_task0/frame_cache_v2/overlay \
+#     data.frame_cache_num_variants=10
+#
+_target_: model.ramen_ori.data_lerobot.RamenOriMultiDataset
+
+# ---- shared kwargs (全 sub broadcast) ----
+chunk_len: 16
+img_size: 224
+camera_keys:
+  - observation.images.cam_0    # head_left
+  - observation.images.cam_2    # left_wrist
+  - observation.images.cam_3    # right_wrist
+top_K: 4
+num_classes: 7
+num_cams: 4
+obb_source: none
+overlay_conf_threshold: 0.30
+overlay_line_thickness: 2
+overlay_class_filter: null
+state_variant: 71d
+include_depth_target: false
+depth_target_size: [32, 32]
+depth_target_num_cams: 3
+use_relative_action: false
+# Issue #129 Phase K (2026-09-01): β unified stats (task0+5+7 pooled、N=675876)。
+# 計算方法: per-task 実行 → /tmp/compute_unified_stats.py で N-weighted pool。
+# Run 5 (β rel) 起動時のみ意味を持つ (default false では ignore)。
+relative_stats_path: /nvme/relative_stats_task5_7_0_unified.pt
+frame_cache_mode: online
+frame_cache_num_variants: 1
+auto_precompute_frame_cache: true
+
+# ---- per-sub config ----
+# skill_id は各 sub の episode meta の source_task_index を skill_mapping.py の表で変換する
+# (Issue #141 RO-1、config には対応表を持たない)。1 sub = 1 skill なので task_uniform balancing は sub 間 1:1。
+sub_datasets:
+  # sub0: rotate_table_base (source_task_index=5 → skill_id=4)
+  - merged_source_root: /nvme/rotate_table_base
+    repo_id: local/ramen_ori_task5_rotate
+    frame_cache_root_baked: null
+    obb_precomputed_root: null
+    obb_precomputed_hash: null
+
+  # sub1: move_table_base (source_task_index=7 → skill_id=5)
+  - merged_source_root: /nvme/task7
+    repo_id: local/ramen_ori_task7_move
+    frame_cache_root_baked: null
+    obb_precomputed_root: null
+    obb_precomputed_hash: null
+
+  # sub2: insert_table_leg (combined_task0 = 34 chunks merged、source_task_index=0 → skill_id=0)
+  - merged_source_root: /nvme/merged_sources/combined_task0
+    repo_id: local/ramen_ori_task0_insert
+    frame_cache_root_baked: null
+    obb_precomputed_root: null
+    obb_precomputed_hash: null

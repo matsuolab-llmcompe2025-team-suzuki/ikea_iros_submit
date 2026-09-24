@@ -1,0 +1,37 @@
+# Issue #139: rotate_table_base を Diffusion Policy で学習 (GR00T 以外の比較軸、19-D absolute action)。
+# 起動: cd model/subtask_policy_training && pixi run train-act-dp act_diffusion/configs/diffusion_rotate_table_base.yaml
+# 値の上書き (smoke 等): 上記の末尾に KEY=VALUE を並べる (例: TRAIN_STEPS=40 TRAIN_BATCH_SIZE=2)
+
+run_id: diffusion_rotate_table_base_unified_overlay
+description: Diffusion Policy (horizon 32 / n_action_steps 8 / n_obs_steps 2)、640x480 x 3cam、Issue #139 で作り直した overlay cache (YOLO-OBB 全件)
+
+env:
+  SUBTASK: rotate_table_base
+  POLICY_TYPE: diffusion
+  USE_MERGED_HF_REPO: true
+  JOB_NAME: diffusion_rotate_table_base_unified_overlay   # wandb の run 名 (旧 cache の v1 run と区別)
+
+  # === 学習条件 ===
+  DIFFUSION_HORIZON: 32              # 1.07s。U-Net downsampling factor 8 の倍数
+  DIFFUSION_N_ACTION_STEPS: 8        # 0.27s。GR00T の execution_steps と同値
+  DIFFUSION_N_OBS_STEPS: 2
+  DIFFUSION_NUM_INFERENCE_STEPS: 10
+  TRAIN_BATCH_SIZE: 64               # H100 実測 VRAM 72.3GB (PyTorch 確保 55.8GB)。余裕 ~9GB
+  TRAIN_STEPS: 100000                # ≈ 55 epoch (train split)。ACT と同 step / 同 batch、RAMEN-Ori / GR00T と同 step
+  TRAIN_SAVE_FREQ: 10000
+  TRAIN_IMAGE_TRANSFORMS_ENABLE: false
+
+  # === frame cache: ACT と同じ cache を共有 ===
+  LEROBOT_FRAME_CACHE_ENABLE: true
+  FRAME_CACHE_NUM_VARIANTS: 10
+  FRAME_CACHE_PRECOMPUTE: false
+  FRAME_CACHE_STRICT: true              # cache miss で mp4 を decode せず即停止 (学習中に video を読まない)
+  FRAME_CACHE_ROOT_OVERRIDE: /nvme/frame_cache_v2/rotate_table_base/overlay
+  OBB_OVERLAY_ENABLE: false
+
+  # === logging / upload ===
+  WANDB_ENABLE: true
+  WANDB_ENTITY: ken05-matuo-llm-88_llm_2025_suzuki
+  POLICY_REPO_ID: Team-RAMEN/IROS2026_RAMEN_hara_rotate_table_base_diffusion_v1   # 旧 cache で学習した版を上書き
+  UPLOAD_AFTER_TRAIN: false
+  PUSH_TO_HUB: false

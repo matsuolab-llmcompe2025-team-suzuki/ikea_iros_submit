@@ -1,0 +1,42 @@
+# Issue #129 Run 1: T0-1 (左手 loss weight 2x) 単独効果測定
+#
+# 目的: T0-1 だけで rotate_table_base の「左手空振り」が改善するかを baseline との
+#       比較で判定する。L1/L4 は default (off) のまま。
+# 起動: bash model/subtask_policy_training/scripts/launch_rotate_specialist_run.sh \
+#         model/subtask_policy_training/configs/rotate_specialist/run1_t01_only.yaml
+
+run_id: run1_t01
+description: T0-1 単独 (GROOT_LEFT_HAND_LOSS_WEIGHT=2.0)、L1/L4 は off
+
+env:
+  # === Aux loss features (Issue #129 patch 経由) ===
+  GROOT_LEFT_HAND_LOSS_WEIGHT: 2.0
+  GROOT_BILATERAL_LOSS_WEIGHT: 0.0
+  GROOT_FK_ANCHOR_LOSS_WEIGHT: 0.0
+
+  # === Common: GR00T + rotate 単独 ===
+  # Overlay は precompute で bake 済 (Issue #129 case F) なので runtime hook は disable。
+  # precompute 時に OBB_PRECOMPUTED_ROOT / hash を渡す。詳細は handoff §2.5 参照。
+  SUBTASK: rotate_table_base
+  POLICY_TYPE: groot
+  USE_MERGED_HF_REPO: "true"
+  OBB_OVERLAY_ENABLE: "false"    # ← precompute 側で bake 済、runtime hook 廃止
+
+  # === Training params (5-run baseline と整合) ===
+  GROOT_STEPS: 100000
+  GROOT_BATCH_SIZE: 32
+  GROOT_USE_BF16: "true"
+
+  # === Issue #129: offline aug precompute cache 使用 (44h → ~25h 高速化) ===
+  # 前提: precompute_augmented_frame_cache.py で 10 variants 生成済
+  # (data_s bottleneck を online aug から offline cache に置換、apples-to-apples 保持)
+  GROOT_IMAGE_TRANSFORMS_ENABLE: "false"    # online aug 二重適用回避
+  LEROBOT_FRAME_CACHE_ENABLE: "true"        # frame cache patch 有効化
+  FRAME_CACHE_NUM_VARIANTS: 10              # random variant 選択
+
+  # === HF autopush (Sakura 停止で ckpt lost 回避) ===
+  HF_AUTOPUSH_REPO_ID: Team-RAMEN/IROS2026_RAMEN_hara_rotate_table_base_specialist_run1_t01_v1
+
+sakura:
+  expected_hours: 4
+  expected_cost_yen: 5000

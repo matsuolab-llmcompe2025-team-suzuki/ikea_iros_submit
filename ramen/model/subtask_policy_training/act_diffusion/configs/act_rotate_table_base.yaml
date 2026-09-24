@@ -1,0 +1,35 @@
+# Issue #139: rotate_table_base を ACT で学習 (GR00T 以外の比較軸、19-D absolute action)。
+# 起動: cd model/subtask_policy_training && pixi run train-act-dp act_diffusion/configs/act_rotate_table_base.yaml
+# 値の上書き (smoke 等): 上記の末尾に KEY=VALUE を並べる (例: TRAIN_STEPS=40 TRAIN_BATCH_SIZE=2)
+
+run_id: act_rotate_table_base_unified_overlay
+description: ACT (chunk 100 / n_action_steps 10)、640x480 x 3cam、Issue #139 で作り直した overlay cache (YOLO-OBB 全件)
+
+env:
+  SUBTASK: rotate_table_base
+  POLICY_TYPE: act
+  USE_MERGED_HF_REPO: true
+  JOB_NAME: act_rotate_table_base_unified_overlay   # wandb の run 名 (旧 cache の v1 run と区別)
+
+  # === 学習条件 ===
+  ACT_CHUNK_SIZE: 100          # 3.3s。平均 episode 3.5s / 天板 8° 到達 p90 3.0s を 1 chunk に収める
+  ACT_N_ACTION_STEPS: 10       # 0.33s。100 (open-loop) は flip_table ACT で二次要因と特定済
+  TRAIN_BATCH_SIZE: 64         # H100 実測 VRAM 48.2GB (PyTorch 確保 41.8GB)
+  TRAIN_STEPS: 100000          # ≈ 55 epoch (train split 1125 episode、1 epoch ≈ 1,820 step)
+  TRAIN_SAVE_FREQ: 10000
+  TRAIN_IMAGE_TRANSFORMS_ENABLE: false   # aug は frame cache の variant 側で済んでいる
+
+  # === frame cache: Issue #139 で作り直した共通 overlay cache (YOLO-OBB 全件 + Phase G aug、GR00T / RAMEN-Ori と同じ) ===
+  LEROBOT_FRAME_CACHE_ENABLE: true
+  FRAME_CACHE_NUM_VARIANTS: 10           # v0 + v1..v9。学習時は v1..v9 から選ばれ全 sample に overlay が乗る
+  FRAME_CACHE_PRECOMPUTE: false          # 既存 cache を使う。true だと merged source 側に v0 を再 decode する
+  FRAME_CACHE_STRICT: true              # cache miss で mp4 を decode せず即停止 (学習中に video を読まない)
+  FRAME_CACHE_ROOT_OVERRIDE: /nvme/frame_cache_v2/rotate_table_base/overlay   # frame_cache_v2_tars の restore.sh 展開先 (Sakura)
+  OBB_OVERLAY_ENABLE: false              # overlay は bake 済。runtime hook は使わない
+
+  # === logging / upload ===
+  WANDB_ENABLE: true
+  WANDB_ENTITY: ken05-matuo-llm-88_llm_2025_suzuki
+  POLICY_REPO_ID: Team-RAMEN/IROS2026_RAMEN_hara_rotate_table_base_act_v1   # 旧 cache で学習した版を上書き
+  UPLOAD_AFTER_TRAIN: false    # 途中 ckpt と最終 model は ckpt_uploader が上げる (run_config.py が強制)
+  PUSH_TO_HUB: false

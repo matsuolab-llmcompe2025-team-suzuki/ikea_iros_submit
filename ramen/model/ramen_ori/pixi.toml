@@ -1,0 +1,68 @@
+[workspace]
+authors = ["hara2323 <roze23vpa40769@gmail.com>"]
+channels = ["conda-forge"]
+name = "iros-ramen-ori-training"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+# RAMEN-Ori VLA training sub-workspace (Issue #115)。
+# LingBot-B backbone (frozen) + Frame delta + OBB coord token + Flow Matching DiT で
+# skill 別 BC training を行う。root workspace の runtime feature (Unitree SDK) や
+# model/yolo_obb sub-workspace (ultralytics) とは独立、install で衝突しない。
+#
+# Phase 0 (Issue #115) 時点: torch + 基本 tool のみ pin。
+# Phase 2 (Issue #120) で lerobot fork (matsuolab-llmcompe2025-team-suzuki/lerobot ramen branch)
+# を local editable path で追加、torch<2.11 / numpy<2.3 制約に合わせて downgrade。
+# ramen_ori は sub-workspace で独立 pixi env のため、yolo_obb sub-workspace (torch==2.12.1) との
+# 直接衝突は発生せず (env 分離)。ultralytics は Phase D (offline YOLO detection precompute) で追加。
+
+[tasks]
+# module unit test。使用例: cd model/ramen_ori && pixi run test
+test = { cmd = "pytest model/ramen_ori/tests/ -v", cwd = "../.." }
+
+# BC training entry (Hydra config)。使用例:
+#   pixi run train                              # base.yaml で smoke
+#   pixi run train training.max_steps=1000      # CLI override
+#   pixi run train device=cpu training.max_steps=2  # CPU smoke
+train = { cmd = "python -m model.ramen_ori.train", cwd = "../.." }
+
+# Phase 1 M11 smoke: 100 iter train + inference latency measurement (GPU 必須)
+smoke = { cmd = "python -m model.ramen_ori.scripts.smoke_train_and_latency", cwd = "../.." }
+
+[dependencies]
+python = "==3.12.13"
+numpy = "==2.2.6"          # lerobot fork <2.3 制約に合わせ downgrade (Phase 2 Issue #120)
+pyarrow = "==24.0.0"
+huggingface_hub = "==1.20.1"
+tqdm = "==4.68.3"
+pytest = "==9.1.1"
+python-dotenv = "==1.2.2"
+pyyaml = "==6.0.3"
+packaging = "==25.0"       # lerobot fork <26.0 制約 (conda default 26.3 と衝突回避)
+fsspec = "==2025.9.0"      # datasets 4.1 の fsspec[http]<=2025.9.0 制約 (conda default 2026.x と衝突回避)
+# ffmpeg は conda dep として追加しない (torchcodec 5.x binding は libavutil 依存で解決困難、
+# LeRobotDataset(video_backend="pyav") で pyav 経由に切替、av==15.1.0 が持つ ffmpeg で済ませる)。
+
+[pypi-dependencies]
+torch = "==2.10.0"          # lerobot fork <2.11 に合わせ downgrade (Phase 2 Issue #120)
+torchvision = "==0.25.0"    # torch 2.10 と pair (PyPI 実在 version)
+# LingBot-B vision backbone (A-1、frozen)。model.pt を HF から DL、load_pretrained_backbone(variant="base") で復元。
+# 2026-07-08 の commit SHA に pin (main の README 更新時点、3-day rule 満たす)。
+lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
+# LeRobot fork (ramen branch、matsuolab-llmcompe2025-team-suzuki/lerobot)。
+# local editable path で MultiLeRobotDataset + delta_timestamps を使用 (Phase A-2)。
+lerobot = { path = "../../../lerobot", editable = true }
+# lerobot transitive の明示 pin (curation_tool と同 pin、Phase 2 で必要)。
+torchcodec = "==0.10.0"    # lerobot v3 mp4 decode 依存 (>=0.2.1,<0.11 制約 fit の latest)
+av = "==15.1.0"            # lerobot ffmpeg wrapper (curation_tool と同 pin)
+datasets = "==4.1.0"       # lerobot fork datasets>=4.0.0,<5.0.0 制約 (curation_tool は 0.6.0 で 5.x pin、ここは 0.5.1 pin なので分岐)
+# LingBot-B の config parse に必要。/install で supply-chain check 済 (2026-06-11 公開、guarddog low 3.3)。
+omegaconf = "==2.3.1"
+# Training config framework。/install で supply-chain check 済 (2026-08-05 公開、guarddog clean 0.0)。
+hydra-core = "==1.3.5"
+# lingbot-vision transitive dep。conda 側の opencv と feature 重複を避けるため headless 版を明示 pin。
+opencv-python-headless = "==4.13.0.92"
+pillow = "==11.3.0"
+# A-2 RADIO backbone (Alt-4) の hubconf.py 依存 (Issue #122、rwightman/pytorch-image-models)。
+# /install で supply-chain check 済 (2026-07-11 公開、guarddog clean 0.0)。
+timm = "==1.0.28"

@@ -1,0 +1,71 @@
+# RAMEN-Ori Phase 2 real dataset config (Issue #120、Phase A-4、Phase 2 A-0 で Hydra group 化)。
+# Issue #122 で本走 recipe 確定: batch=32、warmup+cosine、EMA、val split、光系 aug。
+# task 5 (rotate_table_base) + task 7 (move_table_base) の 9 chunk repos を使う。
+#
+# 使用例:
+#   pixi run train --config-name=real_task5_7                     # 本走 (100k step、H100 想定)
+#   pixi run train --config-name=real_task5_7 training.max_steps=10000  # pilot 10k step
+#
+# alternative swap 例 (Issue #120 の 7 axis):
+#   pixi run train --config-name=real_task5_7 model.fusion._target_=model.ramen_ori.fusion.FusionCrossAttn
+
+defaults:
+  - base
+  - override /data: real_task5_7  # base の dummy data group を real_task5_7 に差替
+  - _self_
+
+# Issue #129 Phase I-0-7 (2026-09-01): 本走 speedup opt を有効化。
+# Phase J smoke で regression check → OK なら Phase K で採用継続、NG なら flag off。
+speedup:
+  torch_compile: true
+  torch_compile_mode: reduce-overhead
+
+training:
+  batch_size: 32        # H100 80GB 想定、dry-run (3060 Ti) は smoke config で batch=1
+  # Issue #129 Phase I-0-7 (2026-09-01): 24 vCPU で 20 worker (4 は train loop + system 用余裕)。
+  # baked cache mode 前提 (video decode 不要、jpg decode のみ) なら CPU 律速回避に十分。
+  # OOM や CPU 100% で hang 時は 12-16 に戻す (base.yaml の default 2 が safe fallback)。
+  num_workers: 20
+  # Issue #129 Phase I-0-7 (2026-09-01): prefetch 2 → 4。worker が 4 batch 先読みして
+  # GPU への feed が途切れないようにする。RSS が上がりすぎたら 2 に戻す。
+  prefetch_factor: 4
+  max_steps: 100000     # 本走 target (dataset 6.27M / batch 32 ≈ 200k step/epoch、1 epoch pass 前)
+  log_every: 100
+  ckpt_every: 5000
+  ckpt_dir: outputs/ramen_ori_phase2
+  seed: 42
+  # A-5 balancing (未実装、YAML placeholder のみ用意)
+  balancing:
+    enabled: false      # A-5 実装後 true にすると task 均等 (1:1) の WeightedRandomSampler 有効化
+    strategy: task_uniform  # "task_uniform" | "sample_uniform"
+  # Issue #122: HF autopush (crash 時 resume 用に ckpt を HF Hub に自動 push)
+  # Run 起動時に enabled=true + repo_id=<Team-RAMEN/...> を override 必須。
+  # 上り帯域見積り: ckpt ~5GB × push 回数 (10 push/run @ every_n_ckpt=2 で ~50GB/run)
+  hf_autopush:
+    enabled: false          # default 無効、Run 起動時に true で on 化
+    repo_id: null           # 例: Team-RAMEN/IROS2026_RAMEN_hara_task_5_7_ramen_ori_default_100k_v1
+    every_n_ckpt: 2         # ckpt_every=5000 との積で push 頻度、default=10k step 毎 (最悪 5k step ロスト)
+    private: true           # HF repo は private で作成
+
+# Issue #122: 本走 recipe
+lr_schedule:
+  enabled: true         # warmup 2k + cosine to 1e-5
+
+ema:
+  enabled: true         # decay 0.9999、val は EMA weight 使用
+
+augmentation:
+  enabled: true         # head 強 / wrist 弱、RandomErasing 併用
+
+val:
+  enabled: true         # episode 80/10/10、seed=42、1000 step ごと eval
+  # Issue #122: cross-server で GR00T と strict identical split を保証する場合、
+  # Sakura で作った split JSON path を指定 (null なら on-the-fly 計算)。
+  # 使用例: pixi run train ... val.split_json=outputs/split_task5_7.json
+  split_json: null
+
+wandb:
+  enabled: true         # 本走は wandb 必須
+  project: ramen_ori
+  entity: ken05-matuo-llm-88_llm_2025_suzuki
+  run_name: null

@@ -1,0 +1,116 @@
+{
+  "schema_version": "dex1_g1_synergy_v1",
+  "dex1": {
+    "open": 4.5,
+    "closed": 0.0,
+    "closed_fraction": "clamp((4.5 - dex1) / 4.5, 0, 1)"
+  },
+  "official_dataset": {
+    "repo_id": "nvidia/PhysicalAI-Robotics-GR00T-Teleop-G1",
+    "revision": "0d7bdd06e67f3ca0868892d0ec8f03bcd3e49e40",
+    "episodes": [
+      {
+        "path": "g1-pick-pear/data/chunk-000/episode_000000.parquet",
+        "sha256": "b690dc55acb94aa1d9725e5879168c2217115d8acd74f283a57b3959e1a37810"
+      },
+      {
+        "path": "g1-pick-apple/data/chunk-000/episode_000000.parquet",
+        "sha256": "a0d5b462c5d27a7378b4bef68cbd6fdfcd85c5c033f5e9bd2abca47fe67fa22d"
+      },
+      {
+        "path": "g1-pick-grapes/data/chunk-000/episode_000000.parquet",
+        "sha256": "db15aa7f4c001c4908141f5988dbca2a43b592846dc876c20974d9b412ee91d3"
+      },
+      {
+        "path": "g1-pick-starfruit/data/chunk-000/episode_000000.parquet",
+        "sha256": "1ad10858a46d7b20d7e0b8eaa560cd710d3712e92b04e622e744ea7f69d64732"
+      }
+    ],
+    "estimator": "componentwise median over sustained open/closed command plateaus"
+  },
+  "joint_order": [
+    "index_0",
+    "index_1",
+    "middle_0",
+    "middle_1",
+    "thumb_0",
+    "thumb_1",
+    "thumb_2"
+  ],
+  "left": {
+    "state_open": [
+      -0.02683282,
+      -0.04160357,
+      -0.01959911,
+      -0.03661333,
+      0.02973923,
+      0.01893211,
+      0.03047548
+    ],
+    "state_closed": [
+      -0.37561488,
+      -0.8420769,
+      -0.37721264,
+      -0.88223854,
+      0.02973566,
+      0.411158,
+      0.42756794
+    ],
+    "action_open": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "action_closed": [
+      -0.6,
+      -1.2,
+      -0.6,
+      -1.2,
+      0.0,
+      0.7,
+      0.7
+    ]
+  },
+  "right": {
+    "state_open": [
+      0.02757786,
+      0.03916214,
+      0.04285535,
+      0.04071818,
+      0.1246092,
+      -0.02990671,
+      -0.02422737
+    ],
+    "state_closed": [
+      0.51562783,
+      1.03771693,
+      0.43578929,
+      0.94835755,
+      0.12406537,
+      -0.5062798,
+      -0.51158381
+    ],
+    "action_open": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "action_closed": [
+      0.6,
+      1.2,
+      0.6,
+      1.2,
+      0.0,
+      -0.7,
+      -0.7
+    ]
+  }
+}

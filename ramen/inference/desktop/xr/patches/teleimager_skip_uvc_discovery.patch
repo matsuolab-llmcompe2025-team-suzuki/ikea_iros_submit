@@ -1,0 +1,38 @@
+diff --git a/src/teleimager/image_server.py b/src/teleimager/image_server.py
+index 8cd455f..a33cb24 100644
+--- a/src/teleimager/image_server.py
++++ b/src/teleimager/image_server.py
+@@ -557,6 +557,26 @@ class CameraFinder:
+     """
+     def __init__(self, realsense_enable=False, verbose=False):
+         self.verbose = verbose
++        # A head-only OpenCV deployment may already know the physical USB path
++        # and must not probe every UVC/RealSense node.  On Jetson this probe can
++        # block while unrelated D405 devices are present.  Keep the default
++        # discovery behavior for the upstream multi-camera configuration.
++        if os.getenv("TELEIMAGER_SKIP_UVC_DISCOVERY") == "1":
++            self.uvc_devices = []
++            self.uid_map = {}
++            self.video_paths = self._list_video_paths()
++            self.rs_serial_numbers = []
++            self.rs_video_paths = []
++            self.rs_rgb_video_paths = []
++            self.uvc_rgb_video_paths = []
++            self.uvc_rgb_video_ids = []
++            self.uvc_rgb_physical_paths = []
++            self.uvc_rgb_uids = []
++            self.uvc_rgb_dev_info = []
++            self.uvc_rgb_serial_numbers = []
++            self.uvc_rgb_cameras = {}
++            logger_mp.info("[CameraFinder] skipping broad UVC discovery")
++            return
+         # uvc
+         reload_uvc_driver()
+         self.uvc_devices = uvc.device_list()
+@@ -1449,4 +1469,4 @@ def main():
+     os.killpg(os.getpgrp(), 9)
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()

@@ -1,0 +1,53 @@
+[workspace]
+authors = ["hara2323 <roze23vpa40769@gmail.com>"]
+channels = ["conda-forge"]
+name = "iros-subtask-policy-training"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+# subtask_policy_training のローカル sub-workspace (ACT / Diffusion Policy)。
+#
+# 役割分担:
+#   - Sakura 本番学習: scripts/setup_env.sh が作る .venv (uv + requirements.txt)。pin の正は requirements.txt。
+#   - 本 env: ローカルでの smoke (VRAM / config 検証) と module unit test。pin は requirements.txt に揃える。
+#
+# root workspace の default env (numpy + pyyaml + pytest の最小構成) や model/ramen_ori
+# (lerobot fork + torch 2.10) とは独立した env なので、互いの install を壊さない。
+
+[tasks]
+# module unit test。使用例: cd model/subtask_policy_training && pixi run test
+test = { cmd = "pytest model/subtask_policy_training/tests/ -v", cwd = "../.." }
+
+# ACT / Diffusion Policy の学習 smoke (合成バッチ、GPU 必須)。使用例:
+#   pixi run smoke-vram --batch-sizes 1,2,4
+smoke-vram = { cmd = "python -m model.subtask_policy_training.act_diffusion.smoke_vram", cwd = "../.." }
+
+# ACT / Diffusion Policy の学習 (run 設定 YAML + 背景 ckpt uploader)。使用例:
+#   pixi run train-act-dp act_diffusion/configs/act_rotate_table_base.yaml
+#   pixi run train-act-dp act_diffusion/configs/act_rotate_table_base.yaml TRAIN_STEPS=40
+train-act-dp = { cmd = "bash act_diffusion/run.sh" }
+
+# GR00T の relative-EEF processor patch。ACT / DP の学習には不要だが、module test の
+# GR00T 系 1 件がこの patch を前提にしている。`pixi install` で site-packages が
+# 作り直されると patch も消えるので、その後に 1 回叩く (idempotent)。
+patch-groot = { cmd = "python scripts/patch_lerobot_groot_relative_eef.py" }
+
+[dependencies]
+python = "==3.12.13"
+pytest = "==9.1.1"
+# lerobot 0.6.0 の packaging<26.0 制約 (conda default 26.3 と衝突するので明示 pin、model/ramen_ori と同事情)。
+packaging = "==25.0"
+
+[pypi-dependencies]
+# 学習本体。requirements.txt と同 pin (groot extra はローカル smoke では不要なので外す)。
+# extras は requirements.txt と揃える (dataset = LeRobotDataset 経路、training = 学習 loop 依存)。
+# diffusion extra = Diffusion Policy の scheduler (diffusers)。groot extra は 3B 用なので外す。
+lerobot = { version = "==0.6.0", extras = ["dataset", "training", "diffusion"] }
+numpy = "==2.2.6"
+pyarrow = "==24.0.0"
+huggingface-hub = "==1.22.0"
+pillow = "==11.3.0"
+tqdm = "==4.67.1"
+# lerobot 0.6.0 は torch<2.11 制約。CUDA 付き wheel を明示 pin (model/ramen_ori と同組合せ)。
+torch = "==2.10.0"
+torchvision = "==0.25.0"

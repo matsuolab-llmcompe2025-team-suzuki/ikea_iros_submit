@@ -1,0 +1,235 @@
+{
+  "schema_version": "subtask_training_v1",
+  "organization": "Team-RAMEN",
+  "subtask": "pick_leg",
+  "dataset_repo_template": "Team-RAMEN/IROS2026_RAMEN_suzuki_{subtask}_1",
+  "groot_dataset_repo_template": "Team-RAMEN/IROS2026_RAMEN_suzuki_{subtask}_1",
+  "policy_repo_template": "Team-RAMEN/IROS2026_RAMEN_suzuki_{subtask}_{policy_type}_1",
+  "merged_repo_template": "Team-RAMEN/IROS2026_RAMEN_HARA_{subtask}_merged_v1",
+  "robot_type": "unitree_g1",
+  "fps": 30,
+  "subtasks": {
+    "move_to_work_pose": {
+      "task": "move to work pose"
+    },
+    "pick_leg": {
+      "task": "pick table leg"
+    },
+    "coarse_insert": {
+      "task": "coarse align table leg to table base"
+    },
+    "final_insert_contact": {
+      "task": "insert table leg with contact"
+    },
+    "tighten": {
+      "task": "rotate leg to tighten"
+    },
+    "rotate_table_base": {
+      "task": "rotate table base",
+      "dataset_repos": [
+        "Team-RAMEN/IROS2026_RAMEN_HARA_rotate_table_base_merged_v1"
+      ]
+    },
+    "move_table_base": {
+      "task": "move table base",
+      "dataset_repos": [
+        "Team-RAMEN/IROS2026_RAMEN_HARA_task_7_optimal_v1"
+      ]
+    },
+    "combined_task5_7": {
+      "task": "rotate and move table base (combined 5+7)",
+      "component_subtasks": [
+        "rotate_table_base",
+        "move_table_base"
+      ],
+      "dataset_repos": [
+        "Team-RAMEN/IROS2026_RAMEN_HARA_task_7_optimal_v1",
+        "Team-RAMEN/IROS2026_RAMEN_HARA_rotate_table_base_merged_v1"
+      ]
+    },
+    "recover_or_regrasp": {
+      "task": "recover or regrasp"
+    },
+    "flip_table": {
+      "task": "flip table"
+    }
+  },
+  "cameras": [
+    "head_left",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "source_dataset": {
+    "camera_map": {
+      "head_left": "observation.images.cam_0",
+      "head_right": "observation.images.cam_1",
+      "left_wrist": "observation.images.cam_2",
+      "right_wrist": "observation.images.cam_3"
+    },
+    "ignored_video_keys": [
+      "observation.images.cam_1",
+      "observation.images.cam_0_ir",
+      "observation.images.cam_1_ir",
+      "observation.images.cam_2_ir",
+      "observation.images.cam_3_ir"
+    ],
+    "state_keys": {
+      "ee_state": "observation.state.ee_state",
+      "robot_q_current": "observation.state.robot_q_current",
+      "hand_state": "observation.state.hand_state"
+    },
+    "action_keys": {
+      "ee_action": "action.ee_action",
+      "robot_q_desired": "action.robot_q_desired",
+      "hand_cmd": "action.hand_cmd"
+    },
+    "eef_pose_format": {
+      "ordering": "left_then_right",
+      "per_hand": "xyz_euler_xyz",
+      "angle_unit": "radian",
+      "reference_frame": "root_link"
+    }
+  },
+  "image": {
+    "height": 480,
+    "width": 640,
+    "channels": 3
+  },
+  "state": {
+    "key": "observation.state",
+    "dimension": 19,
+    "names": [
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint",
+      "left_shoulder_pitch_joint",
+      "left_shoulder_roll_joint",
+      "left_shoulder_yaw_joint",
+      "left_elbow_joint",
+      "left_wrist_roll_joint",
+      "left_wrist_pitch_joint",
+      "left_wrist_yaw_joint",
+      "right_shoulder_pitch_joint",
+      "right_shoulder_roll_joint",
+      "right_shoulder_yaw_joint",
+      "right_elbow_joint",
+      "right_wrist_roll_joint",
+      "right_wrist_pitch_joint",
+      "right_wrist_yaw_joint",
+      "left_gripper_q",
+      "right_gripper_q"
+    ]
+  },
+  "action": {
+    "key": "action",
+    "dimension": 19,
+    "semantics": "upper_body_absolute_target",
+    "names": [
+      "waist_yaw_joint_target",
+      "waist_roll_joint_target",
+      "waist_pitch_joint_target",
+      "left_shoulder_pitch_joint_target",
+      "left_shoulder_roll_joint_target",
+      "left_shoulder_yaw_joint_target",
+      "left_elbow_joint_target",
+      "left_wrist_roll_joint_target",
+      "left_wrist_pitch_joint_target",
+      "left_wrist_yaw_joint_target",
+      "right_shoulder_pitch_joint_target",
+      "right_shoulder_roll_joint_target",
+      "right_shoulder_yaw_joint_target",
+      "right_elbow_joint_target",
+      "right_wrist_roll_joint_target",
+      "right_wrist_pitch_joint_target",
+      "right_wrist_yaw_joint_target",
+      "left_gripper_q_cmd",
+      "right_gripper_q_cmd"
+    ]
+  },
+  "training": {
+    "policy_type": "act",
+    "control_scope": "upper_body",
+    "output_dir_template": "outputs/train/{policy_type}_{subtask}",
+    "job_name_template": "{policy_type}_{subtask}",
+    "training_view_root_template": "outputs/training_views/{policy_type}_{subtask}",
+    "materialize_training_view": true,
+    "force_training_view": false,
+    "wandb_project_template": "iros2026-ramen-{subtask_kebab}",
+    "device": "cuda",
+    "wandb_enable": false,
+    "push_to_hub": false,
+    "upload_after_train": true,
+    "private": true
+  },
+  "validation": {
+    "seed": 42,
+    "validation_fraction": 0.1,
+    "test_fraction": 0.1
+  },
+  "policy_defaults": {
+    "act": {
+      "chunk_size": 100,
+      "n_action_steps": 10,
+      "image_transforms_enable": true,
+      "batch_size": 8,
+      "steps": 300000,
+      "save_freq": 50000,
+      "eval_steps": 10000,
+      "max_eval_samples": 512,
+      "log_freq": 100
+    },
+    "diffusion": {
+      "horizon": 32,
+      "n_action_steps": 8,
+      "n_obs_steps": 2,
+      "num_inference_steps": 10,
+      "image_transforms_enable": true,
+      "batch_size": 8,
+      "steps": 300000,
+      "save_freq": 50000,
+      "eval_steps": 10000,
+      "max_eval_samples": 512,
+      "log_freq": 100
+    },
+    "flow_matching": {
+      "action_horizon": 24,
+      "n_action_steps": 6,
+      "flow_inference_steps": 10,
+      "model_dim": 384,
+      "transformer_layers": 6,
+      "transformer_heads": 8,
+      "image_transforms_enable": true,
+      "batch_size": 32,
+      "steps": 75000,
+      "save_freq": 5000,
+      "eval_steps": 2500,
+      "max_eval_samples": 256,
+      "log_freq": 100
+    },
+    "groot": {
+      "base_model_path": "nvidia/GR00T-N1.7-3B",
+      "base_model_revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495",
+      "embodiment_tag": "real_g1_relative_eef_relative_joints",
+      "chunk_size": 16,
+      "n_action_steps": 16,
+      "use_relative_actions": true,
+      "relative_exclude_joints": [
+        "hand",
+        "waist",
+        "base_height",
+        "navigate"
+      ],
+      "require_native_relative_eef_processor": true,
+      "processor_overlay_root": "outputs/groot_base_overlays/real_g1_relative_eef_3cam",
+      "use_bf16": true,
+      "image_transforms_enable": true,
+      "batch_size": 64,
+      "steps": 20000,
+      "save_freq": 5000,
+      "env_eval_freq": 0,
+      "eval_steps": 10000,
+      "max_eval_samples": 512,
+      "log_freq": 10
+    }
+  }
+}

@@ -1,0 +1,17 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: 土台 16 (chunk だけ 16、土台 32 の対照)
+# 起動: pixi run train --config-name=retrain/c16
+defaults:
+  - /retrain/common
+  - _self_
+
+model:
+  chunk_len: 16
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c16
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c16
+
+wandb:
+  run_name: ramen_ori_141_c16

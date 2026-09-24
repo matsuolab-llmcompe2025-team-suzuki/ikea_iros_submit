@@ -1,0 +1,23 @@
+# @package _global_
+# Issue #141 RAMEN-Ori 再学習: c32_muon の回し直し用 (2026-09-15、全部の学習の後に GPU に 1 本だけで回す段取りの 2 番目)
+# 起動: pixi run train --config-name=retrain/c32_muon_ns32
+#
+# c32_muon は 2 回とも、Muon の直交化 (Newton–Schulz) の辺りで GPU の kernel の異常 (Xid 13 / 43) を起こして落ちた
+# (2026-09-14、step 約 6,100 と約 3,700)。直交化を fp32 にし、転置の view を渡す baddbmm をやめて連続した memory の matmul にする。
+# それ以外は c32_muon と同じ
+defaults:
+  - /retrain/c32_muon
+  - _self_
+
+optim:
+  muon:
+    ns_dtype: float32
+    ns_impl: matmul
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_141_c32_muon_ns32
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_muon_ns32
+
+wandb:
+  run_name: ramen_ori_141_c32_muon_ns32

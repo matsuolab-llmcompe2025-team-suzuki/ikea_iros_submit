@@ -1,0 +1,70 @@
+# RAMEN-Ori Phase K α task 用 top-level config (Issue #129 Phase K、2026-09-01)。
+# real_task5_7.yaml と同 recipe だが data group を real_multi_task5_7 (multi wrapper)
+# に差替、+ training.balancing.enabled=true で 1:1 mix を保証。
+#
+# Merge を skip する新経路: task5 (rotate) と task7 (move) の baked frame_cache_v2 を
+# それぞれ pointing、dataloader 側で task_uniform balancing (skill 4:5 = 1:1)。
+# 詳細は data_lerobot.RamenOriMultiDataset docstring 参照。
+#
+# 使用例 (Run 1、overlay + abs + α):
+#   pixi run --frozen python -m model.ramen_ori.train \
+#     --config-name=real_multi_task5_7 \
+#     data.frame_cache_mode=baked_overlay \
+#     data.sub_datasets.0.frame_cache_root_baked=/nvme/rotate_table_base/frame_cache_v2/overlay \
+#     data.sub_datasets.1.frame_cache_root_baked=/nvme/task7/frame_cache_v2/overlay \
+#     data.frame_cache_num_variants=10 \
+#     training.max_steps=100000 \
+#     training.ckpt_dir=/nvme/train_outputs/phasek_run1_overlay_abs_alpha \
+#     training.hf_autopush.enabled=true \
+#     training.hf_autopush.repo_id=Team-RAMEN/IROS2026_RAMEN_ramen_ori_r6_run1_overlay_abs_alpha_v1 \
+#     wandb.run_name=r6_run1_overlay_abs_alpha
+
+defaults:
+  - base
+  - override /data: real_multi_task5_7
+  - _self_
+
+speedup:
+  torch_compile: true
+  torch_compile_mode: reduce-overhead
+
+training:
+  batch_size: 32
+  num_workers: 20
+  prefetch_factor: 4
+  max_steps: 100000
+  log_every: 100
+  ckpt_every: 5000
+  ckpt_dir: outputs/ramen_ori_phase_k
+  seed: 42
+  # Issue #129 Phase K: multi wrapper では task_uniform balancing 有効化必須 (sub 間 mix ratio 保証)。
+  # 各 sub が単一 skill_id を持つため task_uniform ≡ sub-dataset uniform = 1:1 mix (α) / 1:1:1 (β)。
+  # OFF にすると sub の frame 数比で自然 sampling (α は ~50/50 で問題無いが β は task0 が 87% 占める)。
+  balancing:
+    enabled: true
+    strategy: task_uniform
+  hf_autopush:
+    enabled: false
+    repo_id: null
+    every_n_ckpt: 2
+    private: true
+
+lr_schedule:
+  enabled: true
+
+ema:
+  enabled: true
+
+augmentation:
+  enabled: true
+
+val:
+  enabled: true
+  # multi wrapper は split_json 未対応 (per-sub json list schema 未整備)、Phase K は on-the-fly split。
+  split_json: null
+
+wandb:
+  enabled: true
+  project: ramen_ori
+  entity: ken05-matuo-llm-88_llm_2025_suzuki
+  run_name: null
