@@ -303,9 +303,12 @@ COPY components/ /app/components/
 COPY tools/prefetch_weights.py /app/tools/prefetch_weights.py
 
 # 会場は実行時オフライン: 重みは HF の cache (読み取り専用で mount) から読み、取りに行かない。
+# YOLO_OFFLINE: ultralytics は import 時に DNS でネットの有無を調べ、推論の開始時に Google Analytics
+# へ利用統計を送る (GB10 で strace、2026-09-25)。true で両方止まる。
 # VLM の compile 結果の置き場は /cache (container は run ごとに作り直すので host の directory を mount)。
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
+    YOLO_OFFLINE=true \
     RAMEN_VLM_CACHE_DIR=/cache
 
 # コピー漏れをここで止める: 会場で動く入口を、それぞれの環境で import する。

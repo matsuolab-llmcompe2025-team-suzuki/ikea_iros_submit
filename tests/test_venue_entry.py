@@ -22,6 +22,7 @@ FIXED = [
     "--boundary-host", "0.0.0.0",
     "--spawn-vlm-server",
 ]
+DOCKERFILE = SUBMIT_ROOT / "docker" / "Dockerfile.thor"
 
 
 def _run(tmp_path: Path, *args: str, orin_host: str | None = "192.168.123.164"):
@@ -70,6 +71,30 @@ def test_no_arguments_print_the_usage(tmp_path) -> None:
     result = _run(tmp_path)
     assert result.returncode == 2
     assert "--stage N" in result.stderr
+
+
+def _image_env() -> dict[str, str]:
+    """Dockerfile.thor の ENV 命令 (行の継続を含む) を KEY=VALUE で集める。"""
+    text = DOCKERFILE.read_text().replace("\\\n", " ")
+    env: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.startswith("ENV "):
+            for item in line[len("ENV "):].split():
+                key, _, value = item.partition("=")
+                env[key] = value
+    return env
+
+
+def test_the_image_keeps_every_library_offline() -> None:
+    """会場は実行時にネットに出ない。重み (HF / transformers) と YOLO の問い合わせを image で止める。
+
+    ultralytics は import 時に DNS でネットの有無を調べ、推論の開始時に Google Analytics へ
+    利用統計を送っていた (GB10 で strace、2026-09-25)。YOLO_OFFLINE=true で両方止まる。
+    """
+    env = _image_env()
+    assert env.get("HF_HUB_OFFLINE") == "1"
+    assert env.get("TRANSFORMERS_OFFLINE") == "1"
+    assert env.get("YOLO_OFFLINE") == "true"
 
 
 def test_the_fixed_options_exist_in_the_copied_entrypoint() -> None:

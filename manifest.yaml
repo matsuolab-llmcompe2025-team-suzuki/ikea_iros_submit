@@ -45,8 +45,10 @@ organizer_stack_on_pc2:
 
 runtime:
   network: >-
-    none at run time: HF_HUB_OFFLINE=1, the VLM runs with usage stats off and every outbound
-    endpoint pointed at a closed local port; weights are read from the mounted cache
+    none at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
+    online check or analytics), the VLM runs with usage stats off and every outbound endpoint
+    pointed at a closed local port; weights are read from the mounted cache. Verified with strace
+    on an arm64 GB10: no connect() other than loopback and Unix sockets
   # Mounted read-only as a Hugging Face cache (~86 GB). Prefetch and offline check:
   # tools/prefetch_weights.py (list derived from policy_config.yaml); details in WEIGHTS.md.
   weights:
