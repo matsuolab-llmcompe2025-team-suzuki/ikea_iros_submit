@@ -380,6 +380,7 @@ def _resolve_groot_checkpoint_root(
             )
         return checkpoint_root.resolve()
 
+    from huggingface_hub import constants as hf_constants
     from huggingface_hub import snapshot_download
 
     repo_id = checkpoint_ref
@@ -401,6 +402,13 @@ def _resolve_groot_checkpoint_root(
         download_kwargs["allow_patterns"] = [
             f"{checkpoint_subdir.rstrip('/')}/**"
         ]
+    if hf_constants.HF_HUB_OFFLINE:
+        # 会場は実行時オフライン。commit hash を指定した snapshot_download は、新しい
+        # huggingface_hub (GR00T worker の desktop env は 1.28) だと file 一覧の記録
+        # (trees/<commit>.json) が無いときネットへ取りに行き、OfflineModeIsEnabled で落ちる。
+        # 事前取得は runtime env (1.20.1) で行うので記録は書かれない (GB10 で確認、2026-09-25)。
+        # オフラインなら cache の snapshot だけを見る。
+        download_kwargs["local_files_only"] = True
     snapshot_root = Path(snapshot_download(**download_kwargs)).resolve()
     checkpoint_root = (
         snapshot_root / checkpoint_subdir
