@@ -782,6 +782,9 @@ class _GrootWorkerClient:
         command = [
             pixi,
             "run",
+            # 実行時に環境の install も lock の更新もしない (会場は実行時オフライン。image の
+            # build で --frozen で入れた環境をそのまま使う。VLM の起動 script と同じ)
+            "--as-is",
             "--manifest-path",
             str(manifest),
             "python",
