@@ -7,8 +7,8 @@
 # 相対パスでコピー) で作り、この Dockerfile には Python 以外 (apt / CycloneDDS の C ライブラリ /
 # unitree SDK のソース / pixi 本体) だけを書く。
 #
-# ⚠️ 今は環境の部分だけ。本体コードの COPY と起動コマンドは、submit と inference の
-#    つなぎを決めてから足す (それまでこの image は競技には使えない)。
+# 本体コードは ramen/ (tools/sync_ramen.sh が本体の 1 commit からコピー、手で直さない) を
+# 環境の層の後に入れる。起動口は docker/venue_entry.sh (会場は `… <image> --stage N --actuate`)。
 # ⚠️ linux/arm64。.github/workflows/build-thor-image.yml が ubuntu-24.04-arm でネイティブに焼く。
 
 # torch は pixi が cu130 の wheel で入れる (CUDA のランタイムも wheel に同梱。sm_110 を含むのは
@@ -287,5 +287,33 @@ PY
 RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_conv3d.py \
     && rm /tmp/probe_conv3d.py
 
-# 起動コマンドは、submit と inference のつなぎを決めてから入れる。
-CMD ["bash"]
+# --- 7) 本体のコード ------------------------------------------------------------
+# 環境の層の後に置き、コードを直しても環境を入れ直さないようにする。
+COPY ramen/ ./
+COPY docker/venue_entry.sh /usr/local/bin/ramen-venue
+
+# 会場は実行時オフライン: 重みは HF の cache (読み取り専用で mount) から読み、取りに行かない。
+# VLM の compile 結果の置き場は /cache (container は run ごとに作り直すので host の directory を mount)。
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    RAMEN_VLM_CACHE_DIR=/cache
+
+# コピー漏れをここで止める: 会場で動く入口を、それぞれの環境で import する。
+#   runtime    : entrypoint (と --help で CLI の定義)、VLM の起動と待ち
+#   desktop    : GR00T 53D の worker
+#   groot-pick : GR00T pick の worker の script (依存は上の probe_pick で確認済み)
+#   vlm        : VLM の起動 script
+RUN pixi run --as-is -e runtime python -c \
+      "import inference.desktop.entrypoint, inference.desktop.pick_leg_hybrid.vlm_server" \
+    && pixi run --as-is -e runtime python -m inference.desktop.entrypoint --help > /dev/null \
+    && pixi run --as-is --manifest-path inference/desktop/pixi.toml python -c \
+      "import inference.desktop.lower_policy.policies.groot_worker" \
+    && model/subtask_policy_training/.venv/bin/python -m py_compile \
+      model/subtask_policy_training/deployment/real_groot_n17_worker.py \
+    && bash -n inference/desktop/pick_leg_hybrid/run_venue_vlm_server.sh \
+    && echo "[build] ramen code OK (entrypoint / VLM server / GR00T 53D worker / pick worker)"
+
+# --- 8) 起動口 ------------------------------------------------------------------
+# 会場: docker run … <image> --stage N --actuate。`-` で始まらない引数はそのまま実行する。
+ENTRYPOINT ["/usr/local/bin/ramen-venue"]
+CMD []
