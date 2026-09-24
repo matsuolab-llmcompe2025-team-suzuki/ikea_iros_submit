@@ -1,5 +1,34 @@
 # Team RAMEN — IKEA IROS 提出物
 
+## Team RAMEN の部分と直す場所
+
+**推論のコードの正本は本体（`iros_2026_ramen`）。** この repo の `ramen/` は本体の 1 commit の写しで、
+`tools/sync_ramen.sh` だけが書き換える。**`ramen/` は手で直さない**（次のコピーで黙って消え、本体のどの
+commit と同じなのかも分からなくなる）。
+
+| 直したいもの | 直す場所 |
+|---|---|
+| 推論の中身（skill・model の読み込み・VLM・設定の YAML・`policy_config.yaml` の model の選択） | **本体**を直して push → この repo で `./tools/sync_ramen.sh <commit>` → commit |
+| image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
+| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
+| 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
+| conformance の受け口 | `components/` |
+
+更新の流れ:
+
+```mermaid
+flowchart LR
+  A[本体で直す・test] --> B[本体を push]
+  B --> C["sync_ramen.sh &lt;commit&gt;<br/>(push 前の commit・境界の食い違いは止まる)"]
+  C --> D[submit の test → commit → push]
+  D --> E[CI が arm64 で image を焼く]
+  E --> F["VERIFY.md<br/>(GB10 で image を起動して確認)"]
+```
+
+- コピー元の commit は `ramen/RAMEN_SOURCE.txt` に残る。コピーしたら差分を読んでから commit する。
+- image を焼き直したら、会場の前に `VERIFY.md` の手順（Vast.ai の GB10 で image を起動し、ネット無しで全 stage が
+  立ち上がるか・外に接続しないか）で確かめる。
+
 ## 運営の責任範囲
 
 運営が用意するもの。**ここに書いたもの以外は、すべて Team RAMEN のもの。**
