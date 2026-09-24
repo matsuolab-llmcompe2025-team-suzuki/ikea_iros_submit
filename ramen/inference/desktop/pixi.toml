@@ -24,7 +24,7 @@ version = "0.1.0"
 description = "VLA policy inference-side loader + preprocessing verify env (Issue #125)"
 authors = ["Team RAMEN"]
 channels = ["conda-forge"]
-# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #163)。
+# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #161)。
 platforms = ["linux-64", "linux-aarch64"]
 
 [dependencies]
@@ -56,12 +56,36 @@ pyyaml = "==6.0.3"
 # 必須、Issue #134 Phase H)。root runtime env / model/ramen_ori pixi.toml と同 rev。
 lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
 
-# Thor (linux-aarch64 / sm_110) の torch (Issue #163)。linux-64 は lerobot の制約で決まる版
+# Thor (linux-aarch64 / sm_110) の torch (Issue #161)。linux-64 は lerobot の制約で決まる版
 # (lock では 2.11.0 / 0.26.0) を、aarch64 は同じ版で cu130 から取る。PyPI 既定の aarch64 torch は
 # (少なくとも 2.8 までは) CPU 版で、sm_110 を含むのは cu130 の aarch64 build だけ。
 [target.linux-aarch64.pypi-dependencies]
 torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
 torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" }
+
+# --- vlm 環境: pick hybrid の VLM server (vLLM + Qwen/Qwen3-VL-8B-Instruct) (Issue #161) ---
+# vLLM は torch と transformers の版を強く固定する (0.29.0 = torch 2.13.0 / transformers>=5.10.4) ので、
+# default env (lerobot 0.6.1 = torch 2.11 / transformers 5.5) とは両立しない → 独立した環境にする。
+# 0.29.0 は develop が 2026-09-20 に RTX 5090 (vllm/vllm-openai:latest) で動かした時点の最新。
+# 開発機は今までどおり pick_leg_hybrid/run_local_vlm_server.sh (docker) でよい。この環境は提出 image 用。
+[feature.vlm.dependencies]
+python = "==3.12.13"
+
+[feature.vlm.pypi-dependencies]
+vllm = "==0.29.0"
+
+# Thor (linux-aarch64 / sm_110): torch は cu130 (aarch64 build だけ sm_110 を含む)。
+# FlashInfer は 0.6.18 本体が Python だけで kernel を実行時に compile する (Thor の初回起動で
+# 5〜15 分の報告がある) ので、sm_110a 入りの事前 compile 済み kernel (flashinfer-jit-cache) を入れる。
+# Qwen3-VL-8B の言語部分 (bf16 / head_dim 128) の prefill・decode の kernel が入っていることを確認済み。
+[feature.vlm.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" }
+torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+flashinfer-jit-cache = { version = "==0.6.18", index = "https://flashinfer.ai/whl/cu130" }
+
+[environments]
+vlm = { features = ["vlm"], no-default-feature = true }
 
 [tasks]
 # VLA policy tests (default env の test-desktop とは別、torch / lerobot 依存を含む)

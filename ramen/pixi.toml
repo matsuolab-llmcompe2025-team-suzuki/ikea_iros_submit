@@ -2,7 +2,7 @@
 authors = ["hara2323 <roze23vpa40769@gmail.com>"]
 channels = ["conda-forge"]
 name = "iros-2026-ramen"
-# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #163)。
+# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #161)。
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.1.0"
 
@@ -79,7 +79,7 @@ einops = "==0.8.2"
 lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
 unitree-sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
 
-# Thor (linux-aarch64 / sm_110) の torch (Issue #163)。PyPI 既定の aarch64 torch は
+# Thor (linux-aarch64 / sm_110) の torch (Issue #161)。PyPI 既定の aarch64 torch は
 # (少なくとも 2.8 までは) CPU 版で、sm_110 を含むのは cu130 の aarch64 build だけ
 # (pytorch の .ci/manywheel/build_cuda.sh)。版は linux-64 と同じにして、取り先だけ変える。
 [feature.runtime.target.linux-aarch64.pypi-dependencies]
