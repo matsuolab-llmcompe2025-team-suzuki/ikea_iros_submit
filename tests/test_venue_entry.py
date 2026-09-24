@@ -80,7 +80,8 @@ def test_the_fixed_options_exist_in_the_copied_entrypoint() -> None:
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "PYTHONPATH": str(SUBMIT_ROOT / "ramen")},
+        # ramen/ は本体のコピーなので、bytecode も残さない
+        env={**os.environ, "PYTHONPATH": str(SUBMIT_ROOT / "ramen"), "PYTHONDONTWRITEBYTECODE": "1"},
     )
     assert result.returncode == 0, result.stderr[-2000:]
     for option in (o for o in FIXED if o.startswith("--")):

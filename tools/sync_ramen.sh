@@ -101,4 +101,4 @@ mkdir -p "${DEST}"
 rsync -a --delete --exclude '.pixi/' --exclude 'third_party/' --exclude '__pycache__/' \
   "${WORK}/src/" "${DEST}/"
 
-echo "[ramen] copied $(find "${DEST}" -type f -not -path '*/.pixi/*' | wc -l | tr -d ' ') files into ramen/"
+echo "[ramen] copied $(find "${DEST}" -type f -not -path '*/.pixi/*' -not -path '*/__pycache__/*' | wc -l | tr -d ' ') files into ramen/"
