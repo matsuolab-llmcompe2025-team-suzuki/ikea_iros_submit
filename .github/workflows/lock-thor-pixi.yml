@@ -34,8 +34,9 @@ jobs:
   lock:
     runs-on: ubuntu-24.04-arm
     env:
-      PIXI_VERSION: v0.72.0
-      PIXI_SHA256: 8b48fd8b315552ee48d340e89d654a177d1f001810ab741f51f7dcdd7e00e1c1
+      # #152 の方の pixi と同じ版 (0.72 は noarch に空の run_exports を書き、lock の差分がちらつく)
+      PIXI_VERSION: v0.73.0
+      PIXI_SHA256: 0788f47eb37e0706de209c3ce81cc804ee128f7dd4ec09a686754a67170ddb64
       # docker/Dockerfile.thor と同じ版
       CYCLONEDDS_REF: "0.10.2"
       UNITREE_SDK_REF: 65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
@@ -234,3 +235,34 @@ jobs:
           sys.exit(1 if bad or not r["sm_110"] else 0)
           EOF
           pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py
+
+      - name: groot-pick env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick
+          cat > /tmp/probe_pick.py <<'EOF'
+          import importlib, importlib.metadata as md, json, sys
+
+          r = {}
+          import numpy as np
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+          r["numpy_bridge"] = "ok"
+          r["lerobot"] = md.version("lerobot")
+          # real_groot_n17_worker.py が使うもの (GR00T N1.7 と公式の前処理・後処理、遅延 import の 2 つ)
+          for name in ["lerobot.policies.groot.groot_n1_7", "lerobot.policies.groot.processor_groot",
+                       "lerobot.policies.groot.configuration_groot", "accelerate", "safetensors", "cv2",
+                       "transformers"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  r[name] = f"FAILED {type(exc).__name__}: {exc}"[:300]
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] or r["lerobot"] != "0.6.0" else 0)
+          EOF
+          pixi run --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick python /tmp/probe_pick.py
