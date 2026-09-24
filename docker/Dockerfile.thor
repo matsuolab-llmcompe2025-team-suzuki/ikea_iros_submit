@@ -121,6 +121,15 @@ RUN pixi run --frozen -e runtime python /tmp/patch_unitree_tracing.py \
       third_party/unitree_sdk2_python/unitree_sdk2py/core/channel_config.py \
     && rm /tmp/patch_unitree_tracing.py
 
+# vLLM の Conv3dLayer (Qwen3-VL の画像エンコーダの入口) に、Thor (sm_110) で F.linear の cuBLAS が
+# 落ちたときだけ畳み込み (F.conv3d、cuDNN) に切り替える fallback を入れる。報告元の直し方
+# (ms1design/thorllm の Patch 6) を、落ちたときだけ効く形にしたもの。理由と動きは
+# tools/patch_vllm_conv3d_sm110.py。RAMEN_VLLM_CONV3D=conv で最初から畳み込み。
+COPY tools/patch_vllm_conv3d_sm110.py /tmp/patch_vllm_conv3d_sm110.py
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm \
+      python /tmp/patch_vllm_conv3d_sm110.py \
+    && rm /tmp/patch_vllm_conv3d_sm110.py
+
 # --- 6) build 時の確認 ---------------------------------------------------------
 # GPU は無いので推論はできないが、「焼けたのに会場で import から落ちる」類はここで全部出す。
 # torch <-> numpy の受け渡しは NGC 25.08 で全推論が落ちた件の再発防止 (build は緑なのに
@@ -223,6 +232,60 @@ print("[build] vlm env OK: vllm", vllm.__version__, "| torch", torch.__version__
 PY
 RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py \
     && rm /tmp/probe_vlm.py
+
+# Conv3dLayer の fallback の動き (GPU 無しで、計算の中身を差し替えて確かめる):
+#   普段は行列の掛け算 (develop と同じ) / cuBLAS の例外なら畳み込みに切り替わり以後もそのまま /
+#   cuBLAS 以外の例外は握りつぶさない / RAMEN_VLLM_CONV3D=conv なら最初から畳み込み
+RUN cat > /tmp/probe_conv3d.py <<'PY'
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+from vllm.model_executor.layers.conv import Conv3dLayer as C
+
+CUBLAS = "CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasLtCreate(&handle)`"
+
+
+def layer(fail_with=None):
+    calls = []
+
+    def mulmat(x):
+        calls.append("mulmat")
+        if fail_with:
+            raise RuntimeError(fail_with)
+        return "mulmat"
+
+    def conv(x):
+        calls.append("conv")
+        return "conv"
+
+    ns = SimpleNamespace(enable_linear=True, calls=calls, _forward_mulmat=mulmat, _forward_conv=conv)
+    ns._forward_mulmat_or_conv = lambda x: C._forward_mulmat_or_conv(ns, x)
+    return ns
+
+
+C._ramen_use_conv = False
+assert C.forward_cuda(layer(), None) == "mulmat"
+assert C.forward_native(layer(), None) == "mulmat"
+failing = layer(CUBLAS)
+assert C.forward_cuda(failing, None) == "conv" and failing.calls == ["mulmat", "conv"], failing.calls
+assert C._ramen_use_conv is True
+after = layer()
+assert C.forward_cuda(after, None) == "conv" and after.calls == ["conv"], after.calls
+C._ramen_use_conv = False
+try:
+    C.forward_cuda(layer("some other error"), None)
+    sys.exit("cuBLAS 以外の例外を握りつぶした")
+except RuntimeError as exc:
+    assert "some other error" in str(exc)
+code = "from vllm.model_executor.layers.conv import Conv3dLayer as C; assert C._ramen_use_conv is True"
+subprocess.run([sys.executable, "-c", code], check=True, env=dict(os.environ, RAMEN_VLLM_CONV3D="conv"))
+print("[build] vLLM Conv3dLayer fallback OK (normal=mulmat / cuBLAS error -> conv, sticky / "
+      "other errors raised / RAMEN_VLLM_CONV3D=conv)")
+PY
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_conv3d.py \
+    && rm /tmp/probe_conv3d.py
 
 # 起動コマンドは、submit と inference のつなぎを決めてから入れる。
 CMD ["bash"]
