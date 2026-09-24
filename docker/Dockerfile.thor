@@ -34,6 +34,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git cmake build-essential libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# CUDA 13 の compiler 部品 (base image に入っている NVIDIA の apt source から)。VLM server 用:
+#   cuda-nvcc-13-0       : ptxas。Triton が同梱する ptxas は CUDA 12.8 版で sm_110a を知らない
+#                          (check-thor-vlm で確認) ので、TRITON_PTXAS_PATH でこちらを使わせる。
+#                          nvcc は FlashInfer の事前 compile 済み kernel に無い形が来たときの予備
+#   cuda-cudart-dev-13-0 : その予備の compile に要る header
+#   cuda-cuobjdump-13-0  : build 時の確認 (事前 compile 済み kernel に sm_110a があるか)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cuobjdump-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+
 # --- 2) CycloneDDS の C ライブラリ --------------------------------------------
 # python binding の cyclonedds 0.10.2 は linux/aarch64 の wheel が無く、pixi install が
 # CYCLONEDDS_HOME を見て sdist から build する。binding と同じ版を tag で固定する
@@ -51,8 +64,9 @@ RUN git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
 ENV CYCLONEDDS_HOME=/usr/local
 
 # --- 3) pixi (版と checksum を固定) --------------------------------------------
-ARG PIXI_VERSION=v0.72.0
-ARG PIXI_SHA256=8b48fd8b315552ee48d340e89d654a177d1f001810ab741f51f7dcdd7e00e1c1
+# #152 (実機評価) の方と同じ版。lock の書き方 (空の run_exports 等) がそろう。
+ARG PIXI_VERSION=v0.73.0
+ARG PIXI_SHA256=0788f47eb37e0706de209c3ce81cc804ee128f7dd4ec09a686754a67170ddb64
 RUN curl -fsSL -o /tmp/pixi.tar.gz \
       "https://github.com/prefix-dev/pixi/releases/download/${PIXI_VERSION}/pixi-aarch64-unknown-linux-musl.tar.gz" \
     && echo "${PIXI_SHA256}  /tmp/pixi.tar.gz" | sha256sum -c - \
@@ -75,16 +89,28 @@ RUN git clone https://github.com/unitreerobotics/unitree_sdk2_python \
 # --- 5) pixi の環境 (Python のものは全部ここ) ------------------------------------
 # lock どおりに入れ、解き直さない (--frozen)。定義だけを先に COPY して、コードの変更で
 # この重い層を作り直さないようにする。
-#   runtime                     : entrypoint 本体 / YOLO / RAMEN-Ori (py3.10)
-#   inference/desktop の default : GR00T 53D の worker (py3.12、lerobot 0.6.1)
-#   GR00T pick の worker         : #152 の .venv の版を確かめてから足す
+#   runtime                          : entrypoint 本体 / YOLO / RAMEN-Ori (py3.10)
+#   inference/desktop の default      : GR00T 53D の worker (py3.12、lerobot 0.6.1)
+#   inference/desktop の groot-pick   : GR00T pick の worker (py3.12.11、lerobot 0.6.0、#152 の .venv と同じ版)
+#   inference/desktop の vlm          : pick hybrid の VLM server (vLLM 0.29.0 + Qwen3-VL-8B)
+# 1 つの RUN で入れる: 同じ wheel (torch 2.11.0 は default と groot-pick の両方) を cache からの
+# hardlink で共有させ、image を小さくする。
 COPY ramen/pixi.toml ramen/pixi.lock ./
 COPY ramen/scripts/ scripts/
 COPY ramen/inference/desktop/pixi.toml ramen/inference/desktop/pixi.lock inference/desktop/
-RUN PIXI_CACHE_DIR=/tmp/pixi-cache UV_CACHE_DIR=/tmp/uv-cache pixi install --frozen -e runtime \
-    && PIXI_CACHE_DIR=/tmp/pixi-cache UV_CACHE_DIR=/tmp/uv-cache \
-       pixi install --frozen --manifest-path inference/desktop/pixi.toml \
+RUN export PIXI_CACHE_DIR=/tmp/pixi-cache UV_CACHE_DIR=/tmp/uv-cache \
+    && pixi install --frozen -e runtime \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml -e vlm \
     && rm -rf /tmp/pixi-cache /tmp/uv-cache
+
+# GR00T pick の worker は groot_pick_legs.py が repo root (/app/ramen) からのパス
+# model/subtask_policy_training/.venv/bin/python で起動する (開発機の uv の .venv)。コードは変えず、
+# そこに groot-pick 環境の python を置く。
+RUN mkdir -p model/subtask_policy_training/.venv/bin \
+    && ln -s /app/ramen/inference/desktop/.pixi/envs/groot-pick/bin/python \
+         model/subtask_policy_training/.venv/bin/python
 
 # unitree SDK の interface 指定の config から <Tracing> を落とす。cyclonedds 0.10.2 はこの
 # block を含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって core dump し、
@@ -144,6 +170,59 @@ print("[build] inference/desktop env OK:", torch.__version__, "numpy", np.__vers
 PY
 RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml python /tmp/probe_desktop.py \
     && rm /tmp/probe_desktop.py
+
+# GR00T pick の worker: 起動されるのと同じパス (.venv/bin/python) の python で確かめる。
+RUN cat > /tmp/probe_pick.py <<'PY'
+import importlib.metadata as md
+import sys
+
+import numpy as np
+import torch
+
+assert sys.version.startswith("3.12.11"), sys.version  # #152 の .venv と同じ
+assert torch.__version__.startswith("2.11.0+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+assert md.version("lerobot") == "0.6.0", md.version("lerobot")
+# real_groot_n17_worker.py が使うもの (GR00T N1.7 と公式の前処理・後処理、遅延 import の 2 つ、cv2)
+from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config  # noqa: F401
+from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors_from_pretrained  # noqa: F401
+import accelerate, safetensors, cv2  # noqa: E401,F401
+print("[build] groot-pick env OK:", sys.version.split()[0], torch.__version__, "sm_110 | lerobot",
+      md.version("lerobot"), "| accelerate", accelerate.__version__)
+PY
+RUN model/subtask_policy_training/.venv/bin/python /tmp/probe_pick.py && rm /tmp/probe_pick.py
+
+# VLM server: vLLM と、FlashInfer の事前 compile 済み kernel に Qwen3-VL-8B の言語部分
+# (bf16 / head_dim 128) の prefill・decode があり、sm_110a の機械語が入っていること。
+# Triton は TRITON_PTXAS_PATH の ptxas (CUDA 13) で sm_110a に compile できること。
+# vLLM の GPU の部品 (_C_stable_libtorch) は driver (libcuda.so.1) が要るので build 中は import しない。
+RUN cat > /tmp/probe_vlm.py <<'PY'
+import os, pathlib, subprocess, tempfile
+
+import torch
+import flashinfer, flashinfer_jit_cache, vllm
+
+assert vllm.__version__ == "0.29.0", vllm.__version__
+assert torch.__version__.startswith("2.13.0+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+cache = pathlib.Path(flashinfer_jit_cache.__file__).parent / "jit_cache"
+common = "dtype_q_bf16_dtype_kv_bf16_dtype_o_bf16_dtype_idx_i32_head_dim_qk_128_head_dim_vo_128_posenc_0_use_swa_False_use_logits_cap_False"
+for name in (f"batch_prefill_with_kv_cache_{common}_f16qk_False", f"batch_decode_with_kv_cache_{common}"):
+    so = cache / name / f"{name}.so"
+    assert so.is_file(), so
+    elf = subprocess.run(["cuobjdump", "--list-elf", str(so)], capture_output=True, text=True).stdout
+    assert "sm_110" in elf, f"{so.name} に sm_110 の機械語が無い"
+ptxas = os.environ["TRITON_PTXAS_PATH"]
+with tempfile.TemporaryDirectory() as d:
+    src = pathlib.Path(d, "k.ptx")
+    src.write_text(".version 9.0\n.target sm_110a\n.address_size 64\n.visible .entry k() { ret; }\n")
+    subprocess.run([ptxas, "-arch=sm_110a", str(src), "-o", str(pathlib.Path(d, "k.cubin"))], check=True)
+print("[build] vlm env OK: vllm", vllm.__version__, "| torch", torch.__version__, "sm_110 | flashinfer",
+      flashinfer.__version__, "jit-cache (Qwen3-VL prefill/decode sm_110) | TRITON_PTXAS_PATH sm_110a")
+PY
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py \
+    && rm /tmp/probe_vlm.py
 
 # 起動コマンドは、submit と inference のつなぎを決めてから入れる。
 CMD ["bash"]
