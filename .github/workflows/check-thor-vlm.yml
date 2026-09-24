@@ -1,0 +1,145 @@
+# Thor (aarch64 / sm_110) で VLM server (vLLM + Qwen3-VL-8B) を、起動時の JIT compile なしで動かせるかを
+# GPU の無い arm64 runner で確かめる (#10、VLM の環境の調査 V1)。
+#
+# 背景: Thor で vLLM を動かした報告では、初回起動で Triton / FlashInfer が sm_110a 用の kernel を
+# その場で compile して 5〜15 分かかる。1 run 3 分の会場では使えないので、
+#   - 最初から compile 済みの部品だけで動かせるか (--enforce-eager / FLASH_ATTN / FlashInfer 不使用)
+#   - 事前 compile 済みの kernel (flashinfer-jit-cache) を image に焼けるか
+# を、各ライブラリの中に sm_110 用の機械語が入っているか (cuobjdump) で確かめる。
+#
+# 版: vLLM 0.29.0 (develop が 09-20 に RTX 5090 で動かした時点の最新) が固定する
+#     torch 2.13.0 / torchvision 0.28.0 / torchaudio 2.11.0 (cu130) と flashinfer 0.6.18。
+#
+# 確認用。VLM の環境を pixi に定義して Dockerfile の build 時の確認に入れたら消す。
+
+name: check-thor-vlm
+
+on:
+  push:
+    branches: [issue/10-rebuild-as-inference-copy]
+    paths: [.github/workflows/check-thor-vlm.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    env:
+      # cuobjdump / 比較用の ptxas がある CUDA 13 の開発用 image (NVIDIA 公式、index digest で固定)
+      IMAGE: nvidia/cuda@sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266
+    steps:
+      - name: probe を書く
+        run: |
+          mkdir -p probe
+          cat > probe/run.sh <<'EOF'
+          set -u
+          export DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 python3-venv >/dev/null
+          python3 -m venv /opt/vlm
+          PIP=/opt/vlm/bin/pip
+          step() { if "$@"; then echo "PROBE_STEP $STEP=ok"; else echo "PROBE_STEP $STEP=FAILED"; fi; }
+          STEP=torch_install step $PIP install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple \
+            "torch==2.13.0+cu130" "torchvision==0.28.0+cu130" "torchaudio==2.11.0+cu130"
+          STEP=vllm_install step $PIP install --no-cache-dir "vllm==0.29.0"
+          # vLLM が torch を別の build に差し替えていないか (cu130 のままか)
+          /opt/vlm/bin/python -c "import torch; print('PROBE_STEP torch_after_vllm=' + torch.__version__)"
+          STEP=flashinfer_jit_cache_install step $PIP install --no-cache-dir \
+            --index-url https://flashinfer.ai/whl/cu130 --extra-index-url https://pypi.org/simple \
+            "flashinfer-jit-cache==0.6.18"
+          /opt/vlm/bin/python /probe/probe.py
+          EOF
+
+          cat > probe/probe.py <<'EOF'
+          import glob, importlib, json, os, re, subprocess, sys, tempfile
+
+          r = {}
+
+          def mod(name):
+              try:
+                  m = importlib.import_module(name)
+                  return getattr(m, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  return f"FAILED {type(exc).__name__}: {exc}"[:300]
+
+          import torch
+          r["torch"] = torch.__version__
+          r["torch_cuda"] = torch.version.cuda
+          r["torch_arch_flags"] = torch._C._cuda_getArchFlags()
+          for name in ["vllm", "vllm._C", "vllm._moe_C", "vllm.vllm_flash_attn",
+                       "flashinfer", "flashinfer_jit_cache", "triton", "transformers"]:
+              r[name] = mod(name)
+          try:
+              from vllm.vllm_flash_attn import flash_attn_varlen_func  # noqa: F401
+              r["fa_varlen_func"] = "ok"
+          except Exception as exc:  # noqa: BLE001
+              r["fa_varlen_func"] = f"FAILED {exc!r}"[:300]
+
+          # --- 各ライブラリに入っている GPU の機械語 (SASS) と PTX の対象 ---
+          def archs(path):
+              out = {}
+              for flag, kind in (("--list-elf", "sass"), ("--list-ptx", "ptx")):
+                  p = subprocess.run(["cuobjdump", flag, path], capture_output=True, text=True)
+                  out[kind] = sorted(set(re.findall(r"(?:sm|compute)_(\d+[a-z]?)", p.stdout)))
+              return out
+
+          site = sys.prefix + "/lib/python3.12/site-packages"
+          groups = {
+              "torch/libtorch_cuda": glob.glob(f"{site}/torch/lib/libtorch_cuda.so"),
+              "vllm/_C": glob.glob(f"{site}/vllm/_C*.so"),
+              "vllm/_moe_C": glob.glob(f"{site}/vllm/_moe_C*.so"),
+              "vllm/flash_attn": glob.glob(f"{site}/vllm/vllm_flash_attn/*.so"),
+              "flashinfer_jit_cache": glob.glob(f"{site}/flashinfer_jit_cache/**/*.so", recursive=True),
+          }
+          arch = {}
+          for label, files in groups.items():
+              sass, ptx = set(), set()
+              for f in files:
+                  a = archs(f)
+                  sass |= set(a["sass"]); ptx |= set(a["ptx"])
+              arch[label] = {"files": len(files), "sass": sorted(sass), "ptx": sorted(ptx),
+                             "has_sm_110": any(s.startswith("110") for s in sass)}
+          r["arch"] = arch
+
+          # --- Triton が同梱の ptxas で sm_110a 向けに compile できるか (GPU 不要) ---
+          ptx = """.version 9.0
+          .target sm_110a
+          .address_size 64
+          .visible .entry k() { ret; }
+          """.replace("\n          ", "\n")
+          with tempfile.TemporaryDirectory() as d:
+              src = os.path.join(d, "k.ptx"); open(src, "w").write(ptx)
+              import triton
+              cands = glob.glob(os.path.dirname(triton.__file__) + "/backends/nvidia/bin/ptxas*")
+              for label, exe in [("triton_ptxas", cands[0] if cands else None),
+                                 ("toolkit_ptxas", "/usr/local/cuda/bin/ptxas")]:
+                  if not exe:
+                      r[label] = "not found"; continue
+                  ver = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1:]
+                  p = subprocess.run([exe, "-arch=sm_110a", src, "-o", os.path.join(d, "k.cubin")],
+                                     capture_output=True, text=True)
+                  r[label] = {"path": exe, "version": ver, "sm_110a": "ok" if p.returncode == 0 else p.stderr.strip()[:300]}
+
+          # --- 足りない共有ライブラリ (driver の libcuda.so.1 は host から入るので除く) ---
+          missing = {}
+          for label, files in groups.items():
+              for f in files[:50]:
+                  out = subprocess.run(["ldd", f], capture_output=True, text=True).stdout
+                  for line in out.splitlines():
+                      if "not found" in line and "libcuda.so.1" not in line:
+                          missing.setdefault(line.split()[0], set()).add(label)
+          r["ldd_not_found_except_driver"] = {k: sorted(v) for k, v in missing.items()}
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          EOF
+
+      - name: probe
+        run: |
+          docker run --rm -v "$PWD/probe:/probe:ro" "$IMAGE" bash /probe/run.sh 2>&1 | tee probe.log
+          {
+            echo "### check-thor-vlm"
+            echo '```'
+            grep -E '^PROBE_(STEP|RESULT) ' probe.log || echo "PROBE_RESULT なし"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -q '^PROBE_RESULT ' probe.log
