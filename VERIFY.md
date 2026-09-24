@@ -65,13 +65,19 @@ curl -s -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/api/v0/inst
 
 `running` になったら PAT は要らない（revoke してよい）。SSH の鍵は、Vast の account に登録した公開鍵の対になる秘密鍵。
 
+- `running` でも SSH がすぐつながるとは限らない。host によっては Vast が SSH を入れる途中で失敗し続けて、
+  つながらないままになる（2026-09-25 のカナダの host。container の log は `PUT /api/v0/instances/request_logs/<id>/`
+  で読める）。10 分つながらなければ消して別の host を借りる（そのとき PAT がもう一度要る）。
+- 待つ script を zsh で書かない（`set -- $VAR` が単語に分かれず、つながっているのに気づかない）。
+
 ### 4-3 道具を置き、環境の GPU を確かめる
 
 bash で実行する（zsh は `$SSH` を単語に分けないので動かない）。
 
 ```bash
 SSH="ssh -i <秘密鍵> -p <port> root@<ip>"
-scp -i <秘密鍵> -P <port> tools/gb10/* root@<ip>:/root/
+# scp は使えない (Vast の SSH は sftp を通さない)。標準入力で送る
+for f in tools/gb10/*; do $SSH "cat > /root/$(basename $f) && chmod +x /root/$(basename $f)" < $f; done
 $SSH 'apt-get update -qq && apt-get install -y -qq strace'   # 使い捨ての container に OS の道具を入れるだけ
 $SSH 'bash /root/check_envs.sh'
 ```
@@ -113,19 +119,26 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
-## 6. 基準値（2026-09-25、image `gb10-test-d029549` に下の 2 つの直しを当てて計測）
+## 6. 基準値（2026-09-25、image `gb10-test-5fac481` = `sha256:3441f1e9…` をそのまま起動）
+
+既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。
 
 | 項目 | 値 |
 |---|---|
 | 4 環境の GPU | runtime torch 2.12.1 / desktop 2.11.0 / vlm 2.13.0 / pick 2.11.0、全部 cu130、`cap (12, 1)`・integrated |
-| 重みの取得 | 10 個 約 86 GB を 160 秒（回線 4.8 Gbps の host） |
-| Stage 1（strace 無し） | 全体 267 秒。VLM の起動 196 秒（うち重み 16.3 GiB の読み込み 125 秒）、慣らし 1.1 秒、`vlm_latency` 0.70 秒、model 3 つ 約 70 秒 |
-| Stage 5 / Stage 0 | 48 秒 / 12 秒（strace 下） |
-| GPU の使用量の最大 | Stage 1: 28.3 GB（1 つずつ読む場合）。**`--gpu-models all` の Stage 2: 41.9 GB、MemAvailable は 48 GB 残る** |
-| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 10.7 GB と出る。MemAvailable（74.6 GB）で判断しているので読み込める |
-| 外向き connect | 0 件（VLM・カメラ・状態の loopback と Unix socket だけ） |
+| 重みの取得 | 10 個 約 86 GB を 125 秒（回線 5.6 Gbps の host）。`--check` は all present |
+| Stage 1（strace 無し） | 全体 194 秒。VLM の起動 151 秒、慣らし 1.0 秒、`vlm_latency` 0.62 秒。その後 model 3 つ |
+| strace 下の各 stage | Stage 0: 8 秒 / Stage 1: 258 秒 / Stage 2: 239 秒 / Stage 5: 22 秒、すべて rc=0 |
+| GPU の使用量の最大 | Stage 1: 41.7 GB / **Stage 2: 42.7 GB（VLM と 4 model）** / Stage 5: 7.0 GB |
+| MemAvailable の最小 | Stage 2 で 44.8 GB 残る（Thor の 128 GB でも余裕） |
+| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 11〜17 GB と出る。MemAvailable（56〜67 GB）で判断しているので読み込める |
+| 外向き connect | **全 stage で 0 件**（VLM `:8000`・カメラ `:5555`・状態 `:5557`・FlashInfer の閉じた `:9` と Unix socket だけ） |
+| conformance | PASS |
 
-この確認で見つけて直したもの:
+VLM の起動秒は host の disk の速さで変わる（前日の別の host は 196 秒、うち重みの読み込み 125 秒）。
+費用: 1 回目（不具合の調査を含む）$0.90、2 回目（SSH が上がらない host を 1 台挟んだ）$3.00。
+
+この確認で見つけて直したもの（1 回目、image `gb10-test-d029549`。2 回目で直った image を確認）:
 
 1. **GR00T 53D（insert・締め付け・flip）がネット無しで読めなかった**。worker の環境の huggingface_hub 1.28 は、
    commit hash 指定でも cache に file 一覧の記録が無いとネットへ取りに行く。事前取得は runtime 環境
