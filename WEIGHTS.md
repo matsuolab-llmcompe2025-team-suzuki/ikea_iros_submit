@@ -42,24 +42,39 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
 
 ## 3. USB に入れる物（チェックリスト）
 
-128 GB・**exFAT**（4 GB を超える file があるので FAT32 は不可）。合計 約 105 GB。
+**exFAT**（4 GB を超える file があるので FAT32 は不可）。重み 約 86 GB + image（無圧縮）。
+2026-09-24 に 250 GB の USB へ重みと `SHA256SUMS` を入れ、USB の上で `--check` が `all present` になることを確かめた。
 
-- [ ] **Thor の image**（15〜20 GB）
-  `docker save <IMAGE> | zstd -T0 -3 > ikea-thor_<TAG>.tar.zst`
-- [ ] **重み**（約 86 GB）。HF cache は中で symbolic link を使い、exFAT はそれを持てないので **tar に固める**
-  `tar -C $RAMEN_HOST_DIR -cf hf_cache.tar hf_cache`
-- [ ] **`SHA256SUMS`**（USB への書き込み・会場での読み出しで壊れていないかを確かめる）
-  `shasum -a 256 ikea-thor_<TAG>.tar.zst hf_cache.tar > SHA256SUMS`
+- [ ] **重み**（約 86 GB）。USB の上に HF cache を**直接**作る（tar は要らない）
+  ```bash
+  HF_HOME=<USB>/hf_cache HF_HUB_OFFLINE=0 HF_HUB_DISABLE_SYMLINKS=1 HF_XET_CHUNK_CACHE_SIZE_BYTES=0 \
+    python tools/prefetch_weights.py        # HF_TOKEN は 2 と同じく環境変数で。huggingface_hub は runtime と同じ 1.20.1
+  ```
+  **`HF_HUB_DISABLE_SYMLINKS=1` は必須**。HF cache は普段 symbolic link を使うが、macOS は exFAT の上の
+  symbolic link を独自形式（XSym）の普通の file として書くので、Thor（Linux）からは壊れた file に見える。
+  この設定だと `snapshots/` に本物の file が置かれる（新しい file は移動なので、容量は倍にならない）。
+  Linux で取るときは 2 の `docker run` に `-e HF_HUB_DISABLE_SYMLINKS=1` を足し、`-v` を `<USB>/hf_cache` にする。
+- [ ] **`SHA256SUMS`**（path は `hf_cache` からの相対。USB の上でも Thor に copy した先でも確かめられる）
+  ```bash
+  cd <USB>/hf_cache && find ./hub -type f ! -path './hub/.locks/*' -print0 | sort -z | xargs -0 shasum -a 256 > ../SHA256SUMS
+  ```
+- [ ] **Thor の image**（無圧縮。Thor に zstd が無くても `docker load` だけで入る）
+  ```bash
+  docker save -o <USB>/ikea-thor_<TAG>.tar <IMAGE>
+  cd <USB> && shasum -a 256 ikea-thor_<TAG>.tar > SHA256SUMS.image
+  ```
 - [ ] （任意）運営 package（`iacevaltest/iros_g1_orin_package`、手順の根拠）
 
 ## 4. 会場での確認（**既にある物は入れない**）
 
 運営が image を事前に取っていたり、前の session の重みが Thor に残っていたりする。足りない物だけを USB から入れる。
+USB は Thor に mount して使う（exFAT は Linux 5.7 以降なら標準で読める）。
 
 1. **image**
    ```bash
-   docker images --digests | grep ikea-thor      # manifest.yaml の images.thor の digest があれば load 不要
-   zstd -dc ikea-thor_<TAG>.tar.zst | docker load  # 無いときだけ
+   docker images --digests | grep ikea-thor                 # manifest.yaml の images.thor の digest があれば load 不要
+   cd <USB> && sha256sum -c SHA256SUMS.image                # 無いときだけ。USB の中身が壊れていないか
+   docker load -i <USB>/ikea-thor_<TAG>.tar
    ```
 2. **重み**（image を使って、ネット無しで確かめる）
    ```bash
@@ -69,8 +84,9 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
    1 行ずつ `OK`（大きさ）/ `MISSING`（何が・なぜ）が出て、最後に `all present` か `N missing`。
 3. **足りなければ**
    ```bash
-   shasum -a 256 -c SHA256SUMS                    # USB の中身が壊れていないか
-   tar -C $RAMEN_HOST_DIR -xf hf_cache.tar        # 既にある file はそのまま、足りない分が増える
+   mkdir -p $RAMEN_HOST_DIR/hf_cache
+   cp -a <USB>/hf_cache/. $RAMEN_HOST_DIR/hf_cache/                            # 既にある物に重ねる (中身は同じ)
+   cd $RAMEN_HOST_DIR/hf_cache && sha256sum -c --quiet <USB>/SHA256SUMS         # copy した後の中身が壊れていないか
    ```
-   もう一度 2 を回して `all present` を確かめる。展開先は `-v` で mount する `$RAMEN_HOST_DIR/hf_cache` と同じにする
-   （別の場所に展開すると container から見えない）。
+   もう一度 2 を回して `all present` を確かめる。copy 先は `-v` で mount する `$RAMEN_HOST_DIR/hf_cache` と同じにする
+   （別の場所に copy すると container から見えない）。
