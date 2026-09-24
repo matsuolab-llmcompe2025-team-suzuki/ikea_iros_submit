@@ -110,10 +110,12 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 ```
 
 - `-it` 必須（Enter を押すため）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
-- 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動など）は image の起動口
+- 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
   （`docker/venue_entry.sh`）が付ける。打つのは `--stage N --actuate` だけ。後ろに足した option は上書きになる
-  （例: `--gpu-models all`）。
+  （例: `--gpu-models 2`）。
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
+  目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
+  （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。GPU は VLM 込みで最大 42 GB。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
 - go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
 
