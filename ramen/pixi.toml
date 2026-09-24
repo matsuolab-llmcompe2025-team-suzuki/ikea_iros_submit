@@ -1,0 +1,98 @@
+[workspace]
+authors = ["hara2323 <roze23vpa40769@gmail.com>"]
+channels = ["conda-forge"]
+name = "iros-2026-ramen"
+# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #163)。
+platforms = ["linux-64", "linux-aarch64"]
+version = "0.1.0"
+
+[tasks]
+# Desktop pipeline 全体の unit test (default env)。cv2/ultralytics/SDK は lazy import
+# なので default env で collection・実行でき、cyclonedds / YOLO weight 依存の test だけ
+# default env では skip される (それらは runtime env で走らせる)。#97 で desktop 配下
+# 全体が default env 完走可能になった。
+test-desktop = "pytest inference/desktop/ -v"
+# Lower Policy (inference) tests (Issue #39)。SDK-free、default env で動く
+# (test-desktop の部分集合、細粒度で lower_policy だけ回したいとき用)。
+test-lower-policy = "pytest inference/desktop/lower_policy/tests/ -v"
+
+# URDF/model asset drift 予防 (Issue #134 Phase E)。inference/orin/ 側の URDF (単一
+# source of truth) を model/ramen_ori/assets/urdf/ に copy して sync。
+# Issue #129 Phase B で copy 済 file の drift を防ぐ。drift 検出は
+# model/ramen_ori/tests/test_fk.py::TestConstantDriftFromInference で継続実施、
+# drift あれば本 task で re-sync。
+sync-model-assets = "cp inference/orin/ros2_ws/src/g1_description/urdf/unitree_g1/g1_29dof_mode_15_with_dex1_1.urdf model/ramen_ori/assets/urdf/g1_29dof_mode_15_with_dex1_1.urdf"
+
+[dependencies]
+# default env は lower_policy unit test (`test-lower-policy`) 用の最小構成に絞る。
+# pyarrow / huggingface_hub / tqdm / python-dotenv は vit_phase1 preprocess (task 除去済)
+# 用だったため drop。YOLO 系は model/yolo_obb sub-workspace 側で持つ。
+python = "==3.12.13"
+numpy = "==2.5.0"
+pytest = "==9.1.1"
+pyyaml = "==6.0.3"
+
+[pypi-dependencies]
+
+# YOLO-OBB training は sub-workspace 化: `cd model/yolo_obb && pixi run <task>`
+# 参照: model/yolo_obb/pixi.toml (root の runtime feature とは独立、SDK 不要)
+
+# G1 SDK runtime: 実 G1 制御専用 env (Issue #39 Phase C)。
+# unitree_sdk2py が cyclonedds==0.10.2 (cp310 wheel only) を hard pin する
+# ため base の Python 3.12 とは非互換 → no-default-feature で完全分離。
+# 使い方: `pixi run -e runtime python -m inference.desktop.lower_policy.scripts.run_g1_walk_to_table ...`
+# 前提: third_party/unitree_sdk2_python が clone 済 (`git clone --depth 1
+#   https://github.com/unitreerobotics/unitree_sdk2_python.git third_party/unitree_sdk2_python`)
+[feature.runtime.dependencies]
+python = "3.10.*"
+pytest = "==9.1.1"
+pinocchio = "==3.1.0"
+
+[feature.runtime.activation]
+# Load this environment's C++ runtime before Torch/OpenCV can bind the older
+# system libstdc++. Otherwise importing Pinocchio later fails (GLIBCXX_3.4.31).
+scripts = ["scripts/activate_runtime.sh"]
+
+[feature.runtime.pypi-dependencies]
+cyclonedds = "==0.10.2"
+numpy = "==1.26.4"
+opencv-python = "==4.11.0.86"
+torch = "==2.12.1"
+torchvision = "==0.27.1"
+ultralytics = "==8.4.80"
+huggingface_hub = "==1.20.1"
+wandb = "==0.29.0"
+# Venue boundary (:5555 camera / :5557 state / :5556 action) is an actual
+# runtime path, not a test-only extra. Keep both wire dependencies explicit.
+pyzmq = "==27.1.0"
+msgpack = "==1.1.2"
+# Submission conformance exercises the real Thor<->Orin websocket transport.
+websockets = "==15.0.1"
+# RAMEN-Ori physical inference loader.  Keep these aligned with
+# model/ramen_ori/pixi.toml; entrypoint loads the checkpoint in the SDK process.
+hydra-core = "==1.3.5"
+omegaconf = "==2.3.1"
+# NVIDIA RADIO hubconf/runtime dependency. Keep identical to
+# model/ramen_ori/pixi.toml so the RADIO evaluation path uses the training API.
+timm = "==1.0.28"
+einops = "==0.8.2"
+lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
+unitree-sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
+
+# Thor (linux-aarch64 / sm_110) の torch (Issue #163)。PyPI 既定の aarch64 torch は
+# (少なくとも 2.8 までは) CPU 版で、sm_110 を含むのは cu130 の aarch64 build だけ
+# (pytorch の .ci/manywheel/build_cuda.sh)。版は linux-64 と同じにして、取り先だけ変える。
+[feature.runtime.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.12.1", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.27.1", index = "https://download.pytorch.org/whl/cu130" }
+
+# runtime env で desktop 全体 test。default env の test-desktop で skip される
+# cyclonedds 依存 test も (cyclonedds install 済のため) 実行される。YOLO weight 依存
+# (test_yolo_obb) は weight を配置した時のみ走る (#96 M7)。二段構成の runtime 側。
+# 呼び出し: pixi run -e runtime test-desktop-runtime
+[feature.runtime.tasks]
+test-desktop-runtime = "pytest inference/desktop/ -v"
+
+[environments]
+default = { solve-group = "default" }
+runtime = { features = ["runtime"], no-default-feature = true }

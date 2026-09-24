@@ -1,0 +1,68 @@
+# inference/desktop VLA policy inference 用 pixi env (Issue #125)。
+#
+# 別 env 必要な理由:
+#   - lerobot 0.6.x = Python >= 3.12 要求
+#   - 既存 root runtime env = Python 3.10 pin (cyclonedds SDK の wheel が 3.10 のみ)
+#   - この 2 制約は同 env 内で両立不可 → VLA inference 用に別 env を切って解決
+#
+# 責務境界:
+#   root runtime env  (Python 3.10):  cyclonedds / unitree_sdk2py / ultralytics YOLO
+#                                     = SDK / ROS / perception 実体 (実機 driver)
+#   inference/desktop (本 env、3.12):  lerobot 0.6.x / GR00T / RAMEN-Ori policy
+#                                     load + forward verify (integration test 用)
+#
+# 実運用 (実機 loop) はruntime envのGr00tPolicy proxyが本envにUnix-socket
+# workerを起動する。DDS/actuatorはPython 3.10、model/LeRobotはPython 3.12に分離し、
+# 実機指令がmodel worker側に入らない境界を維持する。
+#
+# NOTE: 本 pixi.toml は project 内で完結 (`.pixi/envs/default/` に install、
+# global 汚染しない、user 指摘の "Global に入れるな" 準拠)。
+
+[workspace]
+name = "iros_inference_desktop"
+version = "0.1.0"
+description = "VLA policy inference-side loader + preprocessing verify env (Issue #125)"
+authors = ["Team RAMEN"]
+channels = ["conda-forge"]
+# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #163)。
+platforms = ["linux-64", "linux-aarch64"]
+
+[dependencies]
+python = "==3.12.13"
+pytest = "==9.1.1"
+# lerobot 0.6.1 は packaging <26 要求、conda default (26.3) と衝突するので pin
+packaging = "==25.0"
+
+[pypi-dependencies]
+# Core: 官方 upstream lerobot 0.6.x (Team-RAMEN training-side が使ってる fork と
+# 同世代、GrootConfig の新 field 群 = action_decode_transform / use_flash_attention
+# / use_relative_actions 等 = に対応)。
+# [groot] extra = transformers + Isaac-GR00T native deps (GR00T policy 走らせるのに必須)
+lerobot = { version = "==0.6.1", extras = ["groot"] }
+# lerobot 依存で自動 pull される (torch >=2.7 <2.12 / torchvision / numpy 2.x 等)、
+# 明示的な pin は unnecessary (lerobot の constraint に従う)
+
+# RAMEN-Ori loader 用 (model/ramen_ori/model.py の Hydra instantiate 経路で必要)
+hydra-core = "==1.3.5"
+omegaconf = "==2.3.1"
+
+# huggingface_hub は lerobot が pull するが明示的 pin (from_ckpt の HF DL 経路)
+huggingface_hub = "==1.28.0"
+
+# YAML load (config_loader.py の safe_load 経路)
+pyyaml = "==6.0.3"
+
+# LingBot-B vision backbone (RAMEN-Ori policy load 時の from_pretrained 経路で
+# 必須、Issue #134 Phase H)。root runtime env / model/ramen_ori pixi.toml と同 rev。
+lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
+
+# Thor (linux-aarch64 / sm_110) の torch (Issue #163)。linux-64 は lerobot の制約で決まる版
+# (lock では 2.11.0 / 0.26.0) を、aarch64 は同じ版で cu130 から取る。PyPI 既定の aarch64 torch は
+# (少なくとも 2.8 までは) CPU 版で、sm_110 を含むのは cu130 の aarch64 build だけ。
+[target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" }
+
+[tasks]
+# VLA policy tests (default env の test-desktop とは別、torch / lerobot 依存を含む)
+test-vla = "pytest lower_policy/policies/tests/ -v"
