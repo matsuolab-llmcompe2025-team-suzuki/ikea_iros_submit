@@ -145,6 +145,10 @@ jobs:
                   changed |= status != "unchanged"
                   aarch = after["environments"][env]["packages"].get("linux-aarch64", [])
                   print(f"{label} / {env} / linux-aarch64: {len(aarch)} packages")
+              for env in sorted(set(after["environments"]) - set(before["environments"])):
+                  pk = after["environments"][env]["packages"]
+                  print(f"{label} / {env} (new) / linux-64: {len(pk.get('linux-64', []))}, "
+                        f"linux-aarch64: {len(pk.get('linux-aarch64', []))} packages")
           sys.exit(1 if changed else 0)
           EOF
           pixi run --frozen -e default python /tmp/compare_locks.py
@@ -201,3 +205,32 @@ jobs:
           sys.exit(1 if bad or not r["sm_110"] else 0)
           EOF
           pixi run --frozen --manifest-path inference/desktop/pixi.toml python /tmp/probe_desktop.py
+
+      - name: vlm env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen --manifest-path inference/desktop/pixi.toml -e vlm
+          cat > /tmp/probe_vlm.py <<'EOF'
+          import importlib, json, sys
+
+          r = {}
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          # vLLM 0.29 の GPU の部品は _C_stable_libtorch / _moe_C_stable_libtorch
+          # (platforms/cuda.py)。GPU の無い runner で driver (libcuda.so.1) が無いことだけが
+          # 理由の失敗は、Thor では host から入るので失敗扱いにしない。
+          for name in ["vllm", "vllm._C_stable_libtorch", "vllm._moe_C_stable_libtorch",
+                       "flashinfer", "flashinfer_jit_cache", "transformers", "triton"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  msg = f"{type(exc).__name__}: {exc}"
+                  r[name] = ("NEEDS_DRIVER " if "libcuda.so.1" in msg else "FAILED ") + msg[:300]
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] else 0)
+          EOF
+          pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py
