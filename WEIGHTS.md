@@ -19,7 +19,7 @@
 | 6 | flip（Stage 5） | `Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints` | `1a408d8` | `checkpoints/020000/pretrained_model/` だけ（無いと約 102 GB） | 12.6 GB |
 | 7 | 4〜6 の base model | `nvidia/GR00T-N1.7-3B` | `2fc962b` | 全部 | 6.9 GB |
 | 8 | GR00T の backbone（tokenizer・前処理） | `nvidia/Cosmos-Reason2-2B` | main | 全部。**gated** | 4.9 GB |
-| 9 | YOLO（overlay・遷移） | `Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy` | `8221d0a` | `runs/m_lowaug_v11b/weights/best_20260818.pt` | 0.04 GB |
+| 9 | YOLO（overlay） | `Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy` | `8221d0a` | `runs/m_lowaug_v11b/weights/best_20260818.pt` | 0.04 GB |
 | 10 | VLM（hybrid pick の区間 1→2、Stage 1〜4） | `Qwen/Qwen3-VL-8B-Instruct` | main | 全部 | 17.5 GB |
 
 - Stage 0（歩く）は学習済み model を使わない。`ramen_ori_default` は `--phase1-11-arm-only` 専用なので入れない。

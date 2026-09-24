@@ -166,7 +166,7 @@ def build_items() -> list[Item]:
     yolo_repo, yolo_revision = _split_ref(yolo.ckpt_ref)
     items.append(
         Item(
-            "YOLO (overlay・遷移)",
+            "YOLO (overlay)",
             yolo_repo,
             yolo_revision or "main",
             yolo.ckpt_file,

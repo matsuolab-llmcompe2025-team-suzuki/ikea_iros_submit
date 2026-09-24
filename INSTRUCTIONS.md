@@ -31,7 +31,7 @@ flowchart LR
 
 | Stage | 中身 | Enter |
 |---|---|---|
-| 0 | 準備（台まで歩く・腕・初期姿勢） | 1 回（安全確認） |
+| 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | 1 回（安全確認） |
 | 1〜4 | 脚 1 本ずつ: 台を回す → pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | 2 回（安全確認 / policy 開始） |
 | 5 | 台を裏返す（flip） | 2 回 |
 
@@ -130,8 +130,11 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 ### その後
 
-- 開始姿勢に移って保持 → `Enter 2` で policy が始まる（Stage 0 は Enter 2 無し）。
-- 終わると手を開き、腕を下ろして container が終わる。
+- Stage 1〜5: 開始姿勢に移って保持 → `Enter 2` で policy が始まる。stage の中の model の切り替えは
+  自動（腕を次の開始姿勢へ → 保持 → 次の model）。次へ進むのは model の完了か時間切れだけ（YOLO では進まない）。
+- Stage 0（Enter 2 無し）: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
+  （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。
+- 終わると手を開き、腕を下ろして（同じ姿勢）container が終わる。
 
 ### なぜこの順番か
 
@@ -175,7 +178,10 @@ python conformance.py --lane decoupled
 
 1. 運営 README（「You do not run any of this」）と RUNBOOK（「you run the whole pipeline yourself」）のどちらが正か。
    manifest に PC2 用の image が無くてよいか
-2. bridge の起動 log が `head camera live at 1280x480` か
+2. bridge の起動 log が `head camera live at 1280x480` か。`3840x1080` のままだと頭の画像が横 3/4 に潰れる
+   （片目 1920x1080 を 640x480 へ縮めている）。**こちらでは補正しない**。運営に `reference/orin_bridge/real_orin_cameras.py`
+   の `HEAD_WIDTH = 3840` → `1280`、`HEAD_HEIGHT = 1080` → `480` を入れてもらうか、直したコピーで起動する許可をもらう
+   （学習データと自前実機はこの 1280x480 モード）。直した後の log が `head camera live at 1280x480` になることを確かめる
 3. `[groot] integrated GPU: …` の MemAvailable と cudaMemGetInfo の値
 4. model・VLM の読み込み秒、`vlm_latency`、定常の周期
 5. preflight の `--require-stereo` で落ちたら外してよい（単眼に落ちる）
