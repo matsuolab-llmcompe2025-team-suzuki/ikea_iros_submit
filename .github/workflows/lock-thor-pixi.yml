@@ -110,8 +110,17 @@ jobs:
               kind = "conda" if "conda" in entry else "pypi"
               return kind, entry[kind]
 
+          def normalized(rec):
+              # pixi 0.72 は noarch の conda package に空の run_exports ({}) を書き出すが、
+              # 以前の版は書かない。中身 (版・URL・hash) は同じなので同一とみなす
+              # (1 回目の run 35947696324 で、差はこの欄だけだったことを確認済み)。
+              rec = dict(rec)
+              if rec.get("run_exports") in (None, {}):
+                  rec.pop("run_exports", None)
+              return rec
+
           def records(lock):
-              return {key(rec): rec for rec in lock.get("packages", [])}
+              return {key(rec): normalized(rec) for rec in lock.get("packages", [])}
 
           changed = False
           for label, before_path, after_path in [
