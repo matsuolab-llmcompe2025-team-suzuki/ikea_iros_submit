@@ -292,6 +292,14 @@ RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python 
 COPY ramen/ ./
 COPY docker/venue_entry.sh /usr/local/bin/ramen-venue
 
+# 運営の conformance 一式 (template と同じ並び)。image の環境のまま回せるように /app に置く:
+#   docker run --rm <image> pixi run --as-is -e runtime python /app/conformance.py --lane decoupled
+# components/server.py は /app/ramen の本番と同じ受け口・送り口を使う (conformance 専用)。
+COPY conformance.py requirements.txt /app/
+COPY boundary/ /app/boundary/
+COPY mocks/ /app/mocks/
+COPY components/ /app/components/
+
 # 会場は実行時オフライン: 重みは HF の cache (読み取り専用で mount) から読み、取りに行かない。
 # VLM の compile 結果の置き場は /cache (container は run ごとに作り直すので host の directory を mount)。
 ENV HF_HUB_OFFLINE=1 \
