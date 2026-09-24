@@ -25,10 +25,11 @@ on:
   # `.github/ci-build-request.env` に書いて push する。main に入ったらこの push
   # trigger と env ファイルは落とし、workflow_dispatch だけにしてよい。
   push:
-    branches: [issue/1-vendor-sync-and-sdk-layer]
+    branches: [issue/10-rebuild-as-inference-copy]
     paths:
       - .github/workflows/build-thor-image.yml
       - .github/ci-build-request.env
+      - docker/Dockerfile.thor
   workflow_dispatch:
     inputs:
       tag:
