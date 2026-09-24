@@ -71,6 +71,13 @@ torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/
 [feature.vlm.dependencies]
 python = "==3.12.13"
 
+# vLLM 0.29.0 が固定する tilelang 0.1.12 の wheel は manylinux_2_34 (glibc 2.34 以上)。pixi は既定で
+# glibc 2.28 を前提に解くのでその wheel を選ばず、sdist の build (Cython 3.3 の Limited API 制約) で
+# 落ちる。この環境だけ glibc 2.34 以上を宣言する (提出 image = Ubuntu 24.04 は 2.39、workspace 全体に
+# 書くと既存の環境まで解き直しになるので feature に書く)。
+[feature.vlm.system-requirements]
+libc = { family = "glibc", version = "2.34" }
+
 [feature.vlm.pypi-dependencies]
 vllm = "==0.29.0"
 
@@ -84,8 +91,43 @@ torchvision = { version = "==0.28.0", index = "https://download.pytorch.org/whl/
 torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
 flashinfer-jit-cache = { version = "==0.6.18", index = "https://flashinfer.ai/whl/cu130" }
 
+# --- groot-pick 環境: GR00T pick の worker (Issue #161) ---
+# 開発機では model/subtask_policy_training/.venv (uv + requirements.txt、lock 無し) で動いていて、
+# groot_pick_legs.py がそのパスの python で worker を起動する。提出 image ではこの環境を作り、
+# 同じパスに置く (コードは変えない)。
+# 版は #152 の実機評価マシンの .venv (2026-09-24 の uv pip freeze、x86_64 / Python 3.12.11) に
+# 合わせる。数値の結果に効くものだけ pin し、残りは lock で固定する。学習用の dataset / training
+# extra (wandb / datasets / mcap 等) は推論に要らないので入れない。
+# pick の checkpoint は lerobot 0.6.0 の形式 (0.6.1 の 53D とは読めない) なので、default env とは別。
+[feature.groot-pick.dependencies]
+python = "==3.12.11"
+
+[feature.groot-pick.pypi-dependencies]
+lerobot = { version = "==0.6.0", extras = ["groot"] }
+torch = "==2.11.0"
+torchvision = "==0.26.0"
+transformers = "==5.5.4"
+tokenizers = "==0.22.2"
+accelerate = "==1.14.0"
+safetensors = "==0.8.0"
+diffusers = "==0.35.2"
+peft = "==0.20.0"
+timm = "==1.0.29"
+numpy = "==2.2.6"
+huggingface-hub = "==1.22.0"
+opencv-python-headless = "==4.13.0.92"
+pillow = "==11.3.0"
+dm-tree = "==0.1.10"
+einops = "==0.8.2"
+
+# Thor (linux-aarch64 / sm_110): 同じ版を cu130 から取る (aarch64 の cu130 build だけ sm_110 を含む)。
+[feature.groot-pick.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" }
+
 [environments]
 vlm = { features = ["vlm"], no-default-feature = true }
+groot-pick = { features = ["groot-pick"], no-default-feature = true }
 
 [tasks]
 # VLA policy tests (default env の test-desktop とは別、torch / lerobot 依存を含む)
