@@ -27,3 +27,9 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# pixi の環境の実体と SDK のソース。image の中で pixi install / git clone して作るので、
+# 手元で作ったものを build context に持ち込まない (巨大で、しかも手元の platform 用)。
+.pixi/
+**/.pixi/
+ramen/third_party/
