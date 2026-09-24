@@ -1,6 +1,7 @@
 """Post-walk collision-aware arm staging for the real Phase 1 profiles.
 
-The robot walks while holding its measured, lowered Regular-Mode arm pose.
+The robot walks with its arms lowered: stage 0 first lowers them to
+``skills.walk_lowered_pose`` and then holds the measured pose.
 Only after the base has stopped do the arms follow the proven evaluation path:
 shoulders backward, laterally outside the table, forward while still outside,
 then the learned-policy start pose.  No waist, hand, or walking command is
@@ -135,7 +136,14 @@ def validate_lowered_walk_pose(arm: Sequence[float]) -> np.ndarray:
 
 
 class MeasuredArmWalkHoldSkill(Skill):
-    """Hold a verified lowered measured pose before and throughout walking."""
+    """歩く前に腕を下ろした姿勢へ動かし、その実測を歩行中ずっと保持する。
+
+    下ろす先 (``lowered_pose_rad``) があるときは、実測がそこから離れていれば
+    (どれかの関節が到達判定の許容を超えていれば) 下ろし終わってから保持する。
+    歩行の範囲の中でも下ろす: 会場の開始姿勢 (運営 WBC の既定) は範囲の中だが、
+    前腕を前に出した姿勢のまま (2026-09-24)。下ろす先が無いときは従来どおり、
+    範囲の中ならその姿勢を保持し、外なら止める。
+    """
 
     name = "setup"
 
@@ -145,6 +153,10 @@ class MeasuredArmWalkHoldSkill(Skill):
         dwell_sec: float = 0.5,
         lowered_pose_rad: Sequence[float] | None = None,
         lowering_settings: dict | None = None,
+        measured_convergence_checker: Callable[
+            [np.ndarray, np.ndarray, np.ndarray], tuple[bool, str]
+        ]
+        | None = None,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
@@ -169,6 +181,12 @@ class MeasuredArmWalkHoldSkill(Skill):
                     f"lowered_pose_rad is itself outside the walk envelope: {violation}"
                 )
         self._lowering_settings = dict(lowering_settings or {})
+        # 下ろす必要があるかの判定は、下ろし終わりの判定 (pre-motion) と同じ許容で行う。
+        self._lowered_tolerance = float(
+            self._lowering_settings.get("measured_tolerance_rad", 0.10)
+        )
+        # 会場は運営 IK が別の関節角で同じ手首の姿勢に届くので、task-space で確かめる。
+        self._measured_convergence_checker = measured_convergence_checker
         self._time_fn = time_fn
         self._hold: np.ndarray | None = None
         self._lowering: "CollisionAwareArmPreMotionSkill | None" = None
@@ -184,27 +202,33 @@ class MeasuredArmWalkHoldSkill(Skill):
     def _on_stop(self) -> None:
         pass
 
+    def _latch(self, measured: np.ndarray) -> np.ndarray:
+        self._hold = validate_lowered_walk_pose(measured)
+        self._latched_at = self._time_fn()
+        print(
+            "[setup] measured lowered arm pose latched; walking will keep this pose",
+            file=sys.stderr,
+        )
+        return self._hold.copy()
+
     def step(self, obs: dict) -> np.ndarray:
         if self._hold is not None:
             return self._hold.copy()
         measured = _measured_arm(obs)
-        violation = lowered_walk_pose_violation(measured)
-        if violation is None:
-            self._hold = validate_lowered_walk_pose(measured)
-            self._latched_at = self._time_fn()
-            print(
-                "[setup] measured lowered arm pose latched; walking will keep this pose",
-                file=sys.stderr,
-            )
-            return self._hold.copy()
         if self._lowered_pose is None:
-            raise RuntimeError(
-                f"arms are not in the lowered walk envelope: {violation}; "
-                "walking/arm pre-motion is blocked"
-            )
+            violation = lowered_walk_pose_violation(measured)
+            if violation is not None:
+                raise RuntimeError(
+                    f"arms are not in the lowered walk envelope: {violation}; "
+                    "walking/arm pre-motion is blocked"
+                )
+            return self._latch(measured)
         if self._lowering is None:
+            distance = float(np.max(np.abs(measured - self._lowered_pose)))
+            if distance <= self._lowered_tolerance:
+                return self._latch(measured)
             print(
-                f"[setup] arms are above the walk envelope ({violation}); "
+                f"[setup] arms are {distance:.3f} rad away from walk_lowered_pose; "
                 "lowering before the walk",
                 file=sys.stderr,
             )
@@ -212,6 +236,7 @@ class MeasuredArmWalkHoldSkill(Skill):
                 tuple(self._lowered_pose.tolist()),
                 skill_name="lower_arms_for_walk",
                 waypoint_profile="direct",
+                measured_convergence_checker=self._measured_convergence_checker,
                 time_fn=self._time_fn,
                 **self._lowering_settings,
             )
@@ -223,6 +248,8 @@ class MeasuredArmWalkHoldSkill(Skill):
             raise RuntimeError(
                 f"lowering the arms before the walk failed: {stopped}"
             )
+        if self._lowering.is_complete:
+            return self._latch(measured)
         return command
 
     @property

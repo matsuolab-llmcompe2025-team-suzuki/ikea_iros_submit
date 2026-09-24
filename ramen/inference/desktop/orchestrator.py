@@ -90,6 +90,33 @@ DEFAULT_ENTER_CHECK: dict[str, Callable[[list[OBBDetection], SkillState], bool]]
 }
 
 
+class _NeverEnterCheck(dict):
+    """どの skill 名で引いても `enter_never` を返す enter_check の表。"""
+
+    def __missing__(
+        self, skill_name: str
+    ) -> Callable[[list[OBBDetection], SkillState], bool]:
+        return enter_never
+
+
+def stage_enter_check() -> dict[str, Callable[[list[OBBDetection], SkillState], bool]]:
+    """stage の run (会場と自前実機の ``--stage``) の enter_check。YOLO では次へ進まない。
+
+    上位 policy (YOLO の ``enter_*``) は、pick の途中など skill が終わる前に次の
+    skill へ進めることがあったので外す (2026-09-24 ユーザー決定)。stage の run は
+    skill の完了 (``is_complete``) と時間切れ (``timeout_reason`` /
+    ``max_seconds_hard``) だけで進む (``advance_finished_skill``)。
+
+    YOLO の検出そのものは止めない。``tick()`` は検出を policy 用の filter にも通し、
+    ``obs["cleaned"]`` として skill に渡す (台を回す model と hybrid の VLM の
+    overlay)。この表が決めるのは「次へ進むか」だけ。
+
+    表に無い名前も ``enter_never`` になるので、stage に skill を足しても YOLO の
+    判定が紛れ込まず、登録漏れで KeyError にもならない。
+    """
+    return _NeverEnterCheck()
+
+
 # =========================================================================
 # Phase 3 stage-based orchestration (Issue #128)
 # =========================================================================
@@ -110,10 +137,10 @@ DEFAULT_ENTER_CHECK: dict[str, Callable[[list[OBBDetection], SkillState], bool]]
 #       (final_pose = skill_config.yaml:skills.flip_table.initial_pose)
 
 STAGE_SKILL_SEQUENCES: dict[int, list[str]] = {
-    # Stage 0 ends with the arms still in the measured lowered pose, then runs the
-    # head procedure for the first pick.  Issue #141 (D7-1) moved the per-skill
-    # pre-motion into that head procedure, so these lists hold only the skills that
-    # are specific to the stage itself.
+    # Stage 0 waits for go-live first, lowers the arms and walks, then runs the rest
+    # of the head procedure for the first pick (build_stage_skill_sequence).
+    # Issue #141 (D7-1) moved the per-skill pre-motion into that head procedure, so
+    # these lists hold only the skills that are specific to the stage itself.
     0: ["setup", "move_to_table", "post_walk_settle"],
     1: ["pick_table_leg", "insert_table_leg", "rotate_leg_to_tighten"],
     2: [
@@ -210,7 +237,9 @@ def build_stage_skill_sequence(
     頭の手順 (手を開く → 腕の pre-motion → 手を開始の開度へ → N 秒保持) は、
     次に始める学習 skill の開始姿勢へ体を持っていく手順。
 
-    - stage 0: 歩いた後に、1 本目の pick 用の頭の手順を行う (列の最後)
+    - stage 0: go-live 待ちだけを先頭に置き (腕を下ろす・歩くのはロボットが指令に
+      従い始めてから。go-live 前の adapter は WBC に何も送らない)、残りの頭の手順
+      (手を開く → 腕の pre-motion → …) は歩いた後に行う
     - stage 1: stage 0 で済んでいるので入れない。**stage 1 から起動したときだけ**先頭に入れる
     - stage 2〜5: 前の脚の締め終わりから始まるので、必ず先頭に入れる
 
@@ -257,7 +286,9 @@ def build_stage_skill_sequence(
     if head_skill is None:
         return base
     head = head_procedure_skill_names(head_skill, include_hand=include_hand)
-    return base + head if stage == 0 else head + base
+    if stage == 0:
+        return head[:1] + base + head[1:]
+    return head + base
 
 
 # 脚を持ったまま次の model へ運ぶ境界 (Issue #159 T3)。ここだけは手をそのままにして
@@ -1022,8 +1053,8 @@ class Orchestrator:
         # 0) ``failure_reason`` は故障 (model・センサー・Dex1 が動かない、operator
         #    gate の入力が読めない、設定ミス)。次へ進めても動かないので HOLD して止める。
         #    目標に届かないまま締め切りを過ぎただけのものは故障ではない。skill は
-        #    ``timeout_reason`` で返し、下の 1b で次へ進む (次へ進む道は YOLO と
-        #    時間切れだけ、止めるのは人)。
+        #    ``timeout_reason`` で返し、下の 1b で次へ進む (stage の run で次へ進む道は
+        #    完了と時間切れだけ、止めるのは人)。
         failure_reason = (
             getattr(active_skill_obj, "failure_reason", None)
             if active_skill_obj is not None

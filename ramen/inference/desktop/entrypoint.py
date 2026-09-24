@@ -1894,6 +1894,7 @@ def main() -> None:
         build_stage_skill_sequence,
         build_stage_transitions,
         model_transition_pairs_for_stage,
+        stage_enter_check,
         validate_stage_model_transition_chain,
     )
     from inference.desktop.perception.cleaner import (
@@ -2472,7 +2473,6 @@ def main() -> None:
             if args.pick_leg_hybrid
             else frozenset()
         )
-        configured_model_transition_pairs: set[tuple[str, str]] = set()
 
         def _stage_sequence(stage: int) -> list[str]:
             return build_stage_skill_sequence(
@@ -2482,18 +2482,18 @@ def main() -> None:
                 skip_model_transition_pairs=model_transition_skips,
             )
 
-        selected_skill_names = {
-            name for stage in selected_stages for name in _stage_sequence(stage)
-        }
-
         # 歩行を含む stage 0 のみ MeasuredArmWalkHoldSkill + PostWalkArmSettleSkill
         # を挟む。continuous runでもStage 0は腕を下げたまま終える。
         if 0 in selected_stages:
             skill_registry["setup"] = MeasuredArmWalkHoldSkill(
-            dwell_sec=0.5,
-            lowered_pose_rad=_walk_lowered_pose(skill_cfg_raw),
-            lowering_settings=_walk_lowering_settings(skill_cfg_raw),
-        )
+                dwell_sec=0.5,
+                lowered_pose_rad=_walk_lowered_pose(skill_cfg_raw),
+                lowering_settings=_walk_lowering_settings(skill_cfg_raw),
+                # 会場は運営 IK の解を task-space で確かめる (頭の手順と同じ判定)
+                measured_convergence_checker=_boundary_convergence_checker(
+                    STAGE_HEAD_SKILL[0]
+                ),
+            )
             skill_registry["post_walk_settle"] = PostWalkArmSettleSkill(
                 actuator,
                 minimum_settle_sec=PHASE1_POST_WALK_SETTLE_SECONDS,
@@ -2534,7 +2534,6 @@ def main() -> None:
                 is_start_stage=(stage == first_phase3_stage),
                 skip_model_transition_pairs=model_transition_skips,
             ):
-                configured_model_transition_pairs.add((previous_skill, next_skill))
                 for transition_skill in assembly.build_model_transition_procedure(
                     skill_config=skill_cfg_raw,
                     previous_skill=previous_skill,
@@ -2626,51 +2625,10 @@ def main() -> None:
                 skip_model_transition_pairs=model_transition_skips,
             )
         )
-        # enter_check: DEFAULT_ENTER_CHECK に加え、新規 pre-motion / post_walk_settle
-        # は timer + is_complete で進むので enter_check は常に False (dwell 経路)。
-        phase_enter_check = dict(DEFAULT_ENTER_CHECK)
-        # Learned models may be entered only after their finite pose scaffold
-        # completes.  Perception predicates are moved to the *first* boundary
-        # skill below; otherwise a visible object could skip arm/hand staging.
-        learned_stage_names = {
-            name for stage in STAGE_SKILL_SEQUENCES.values() for name in stage
-        }
-        for learned_name in learned_stage_names:
-            phase_enter_check[learned_name] = lambda _dets, _state: False
-        for extra in (
-            "post_walk_settle",
-            "arm_pre_motion_for_rotate_table_base",
-            "arm_pre_motion_for_flip_table",
-            "rotate_table_base",
-        ):
-            phase_enter_check[extra] = lambda _dets, _state: False
-        for finite_name in selected_skill_names:
-            if finite_name.startswith(
-                (
-                    "wait_for_go_live_",
-                    "hand_open_",
-                    "hand_pose_",
-                    "hand_grasp_",
-                    "arm_pre_motion_for_",
-                    "hold_pose_for_",
-                    "hand_release_",
-                    "arm_transition_",
-                    "hand_transition_",
-                    "hold_transition_",
-                )
-            ):
-                phase_enter_check[finite_name] = lambda _dets, _state: False
-        from inference.desktop.orchestrator import model_transition_skill_names
-
-        for previous_skill, next_skill in configured_model_transition_pairs:
-            first_boundary = model_transition_skill_names(
-                previous_skill,
-                next_skill,
-                include_hand=include_hand_in_head,
-            )[0]
-            phase_enter_check[first_boundary] = DEFAULT_ENTER_CHECK.get(
-                next_skill, lambda _dets, _state: False
-            )
+        # enter_check: stage の run は YOLO (上位 policy) で次の skill へ進まない。
+        # 進むのは完了と時間切れだけ。YOLO の検出は overlay 用に policy へ渡し続ける
+        # (orchestrator.stage_enter_check)。
+        phase_enter_check = stage_enter_check()
 
         # A separately selected Stage starts only after its frame-zero arm/hand pose
         # has converged and the operator explicitly confirms it.  Keep Stage 0
@@ -2694,7 +2652,6 @@ def main() -> None:
                 name=gate_name,
                 next_skill_name=first_policy,
             )
-            phase_enter_check[gate_name] = lambda _dets, _state: False
             print(
                 f"[init] Stage {policy_start_gate_stage} policy-start gate: "
                 "initial pose -> "
@@ -2759,7 +2716,7 @@ def main() -> None:
         # The hybrid is a finite multi-controller state machine, not the old
         # learned pick expert.  Its validated wall-clock budget therefore owns
         # the pick timeout.  What happens on timeout stays the YAML
-        # ``skills.pick_table_leg.on_timeout`` (advance): 次へ進む道は YOLO と
+        # ``skills.pick_table_leg.on_timeout`` (advance): 次へ進む道は完了と
         # 時間切れだけで、止めるのは人。insert へは腕の遷移 (collision-aware) を
         # 通って入る。
         if args.pick_leg_hybrid:

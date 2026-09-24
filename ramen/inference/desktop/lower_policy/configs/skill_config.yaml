@@ -131,12 +131,20 @@ skills:
           R.shoulder_pitch: -0.20
           R.shoulder_roll:  -1.2
 
-  # 歩く前に腕が下がった範囲の外にあったとき、ここへ下ろしてから歩く (Issue #152)。
-  # 以前は範囲の外だと止まっていたので、人が腕を戻す必要があった。
-  # sparse 記法なので、書かない関節は 0.0 rad = 腕を真っ直ぐ下ろす。
-  # 実機を見て変えてよい (範囲: 肩 pitch 0.75 / 肩 roll 0.65 / 肘 1.00 + 余裕 0.05)。
+  # 腕を下ろした姿勢。stage 0 は歩く前に必ずここへ下ろし (Issue #152 / 2026-09-24)、
+  # run の終わりもここへ戻してから手放す。
+  # G1 は肘 0 で前腕が水平に前を向く (URDF、test_g1_arm_kinematics)。全部 0 は
+  # 「腕を前に出した HOME」= 運営 WBC の既定 (肩 roll ±0.2、他 0) とほぼ同じで、
+  # 下ろした姿勢ではない。肘 0.9 で手首は前 15 cm・torso から 7 cm 下 (肩の 32 cm 下、
+  # G1 URDF FK)。真下 (肘 1.57) は歩行の範囲 (肘 1.00 + 余裕 0.05) の外なので、
+  # 到達判定の許容 0.10 rad を足しても範囲に入る 0.9 に留める。
+  # 肩 roll ±0.2 は運営 WBC の既定と同じ (WBC の可動範囲は |roll| >= 0.19)。
   walk_lowered_pose:
-    pose_rad: {}
+    pose_rad:
+      L.shoulder_roll:  0.2
+      L.elbow:          0.9
+      R.shoulder_roll: -0.2
+      R.elbow:          0.9
 
   # MoveToTable: 組立台の前まで歩く Type A skill (Issue #64、Issue #81 Phase 2b で YAML 化)。
   #   - vx: 前進速度 [m/s]、default 0.185 は Issue #64 で実機確定した決め打ちルール。

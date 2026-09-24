@@ -1,4 +1,4 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 6e8efb1d9ec6f90ebe48e16eff524823e4ba2a8e
-subject: #161 fix:start_groot_workers_with_the_pixi_env_as_is
+commit: c0a1cbdac7491e3bac4c0bef51e92131d1ffa0d7
+subject: #161 fix:lower_the_arms_after_go_live_before_the_stage_0_walk

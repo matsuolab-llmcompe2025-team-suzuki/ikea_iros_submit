@@ -177,7 +177,7 @@ class Phase3RuleController:
     """Observation-driven post-carry FSM.
 
     段の時間切れは ``timeout_reason`` で返し、pick を終えて次の skill へ進ませる
-    (次へ進む道は YOLO と時間切れだけ、止めるのは人)。
+    (次へ進む道は完了と時間切れだけ、止めるのは人)。
     """
 
     def __init__(
