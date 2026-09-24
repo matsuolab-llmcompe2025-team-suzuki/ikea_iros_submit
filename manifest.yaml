@@ -9,7 +9,9 @@
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# Fields marked TBD are filled when the image is released (digest) and measured (memory).
+# Before release this exact image (same digest) was started offline on an arm64 GB10 with
+# 128 GB unified memory: every stage's preflight passed and nothing connected outside
+# loopback (procedure and numbers: VERIFY.md).
 
 team: RAMEN
 lane: decoupled
@@ -17,8 +19,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:TBD"
-    digest: "sha256:TBD"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260925-rebuild"
+    digest: "sha256:3441f1e96ecbc518facb0586fe478cff4be6638c42df441d523c17b1f66040c4"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for the two Enter prompts.
     run: >-
@@ -62,7 +64,10 @@ runtime:
     - "nvidia/Cosmos-Reason2-2B@main (gated)"
     - "Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@8221d0aef45d63666537c1f030810fb9b56dd1ed (runs/m_lowaug_v11b/weights/best_20260818.pt)"
     - "Qwen/Qwen3-VL-8B-Instruct@main"
-  peak_memory_thor_gb: TBD
+  # GPU memory with every model of the heaviest stage resident (Stage 2: VLM + 4 models,
+  # --gpu-models all from the image entry), measured on an arm64 GB10 with 128 GB unified
+  # memory; 45 GB stayed available. Re-measured on the Thor at the connection test.
+  peak_memory_thor_gb: 43
 
 conformance: >-
   docker run --rm --network host <image>
