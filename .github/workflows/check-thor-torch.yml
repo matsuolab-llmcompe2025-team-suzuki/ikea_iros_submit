@@ -65,11 +65,16 @@ jobs:
           set -u
           export PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1
           if [ -n "${TORCH:-}" ]; then
-            python -m pip install --no-cache-dir -q \
-              --index-url https://download.pytorch.org/whl/cu130 "torch==${TORCH}" \
+            # 本番の pixi と同じ取り方: torch / torchvision だけ cu130 から (+cu130 まで固定して
+            # PyPI の同じ版を選ばせない)、その他の依存は PyPI から。cu130 だけに絞ると、
+            # torch の依存の一部が wheel で取れずソース build (flit_core 不足) で止まる。
+            python -m pip install --no-cache-dir \
+              --index-url https://download.pytorch.org/whl/cu130 \
+              --extra-index-url https://pypi.org/simple "torch==${TORCH}+cu130" \
               && echo "PROBE_STEP torch_install=ok" || echo "PROBE_STEP torch_install=FAILED"
-            python -m pip install --no-cache-dir -q \
-              --index-url https://download.pytorch.org/whl/cu130 "torchvision==${TORCHVISION}" \
+            python -m pip install --no-cache-dir \
+              --index-url https://download.pytorch.org/whl/cu130 \
+              --extra-index-url https://pypi.org/simple "torchvision==${TORCHVISION}+cu130" \
               && echo "PROBE_STEP torchvision_install=ok" || echo "PROBE_STEP torchvision_install=FAILED"
             # numpy 2 との受け渡しを見るため (本体の各 env は numpy 2.2.6)。
             python -m pip install --no-cache-dir -q "numpy==2.2.6" \
