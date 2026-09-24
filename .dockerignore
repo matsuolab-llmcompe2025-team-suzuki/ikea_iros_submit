@@ -1,5 +1,5 @@
-# docker/Dockerfile.* は `COPY . ./` で repo を丸ごと image に焼く。
-# ここに書いたものは image に入らない。
+# docker/Dockerfile.thor は ramen/ と conformance 一式だけを COPY するが、build context には repo が
+# 丸ごと送られる。ここに書いたものは context に入らない (= image にも入らない)。
 #
 # 注意: build context は **git ではなく working directory** なので、.gitignore で
 # 無視されているだけのファイルも放っておくと image に入る。両方で弾く。

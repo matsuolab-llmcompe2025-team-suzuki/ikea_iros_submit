@@ -1,170 +1,186 @@
-# Run Instructions — IKEA IROS submission (Issue #116)
+# 会場での動かし方 — Team RAMEN（Thor の image 1 つ）
 
-運営が各コンテナをどう起動する想定かを明示する（Participant Guide §9 + 2026-08 訂正メール）。
+会場では、運営の RUNBOOK（`iacevaltest/iros_g1_orin_package` の `docs/RUNBOOK.md`）どおり、
+**全部を私たちが起動する**。PC2 では運営のプログラムだけを起動し、私たちの物は **Thor の container 1 つ**。
+PC2 用の container は無い（運営 template の「PC2 の client」は使わない。理由は下の「全体の形」）。
 
-## 前提
-- 2 コンテナは **別々にビルド**（GPU 世代が別: Thor sm_110 / Orin sm_87、1 image は両機で動かない）。
-- 両 image とも **linux/arm64 (aarch64)** で build（x86 host からは buildx + QEMU で cross-build）。
-- `boundary/` は**無改変**（ローカル改変はテストを通して実機で落ちる）。
-- weights は image に焼き込まない（`manifest.yaml` の `weights_uri` から取得）。
-- base image（運営訂正で確定）:
-  - Thor: `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`（標準 NGC CUDA、l4t ではない。代替 `nvcr.io/nvidia/pytorch:25.08-py3`）
-  - Orin: `nvcr.io/nvidia/l4t-jetpack:r35.3.1`（**JetPack 5.1.1**、device L4T に完全一致必須。client は推論しないので `l4t-base:r35.3.1` でも可）
+## 0. 全体の形
 
-## NGC login（nvcr.io は public でも必須）
-```bash
-# ngc.nvidia.com で無料アカウント作成 → API key 発行
-docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>
+```mermaid
+flowchart LR
+  subgraph PC2["PC2（ロボット搭載 = Orin）: 運営のプログラム"]
+    BR["bridge<br/>:5555 カメラ / :5557 状態"]
+    WBC["WBC<br/>run_wbc_with_dex1.py"]
+    AD["adapter<br/>wbc_driver.py --actions-host THOR"]
+  end
+  subgraph THOR["Thor: 私たちの container"]
+    EP["entrypoint<br/>:5556 を bind"]
+    VLM["VLM server<br/>127.0.0.1:8000（Stage 1〜4 だけ）"]
+  end
+  BR -- ":5555 / :5557 を直接購読" --> EP
+  AD -- ":5556 に接続" --> EP
+  AD --> WBC
+  EP -.-> VLM
 ```
 
-## ビルド（arm64）
-```bash
-cd <repo-root>
+- Thor の entrypoint が PC2 の `:5555` / `:5557` を**直接**読み、`:5556` は **Thor が bind** する。
+  PC2 の adapter は `--actions-host <THOR_IP>` で Thor につなぐ（adapter の `--actions-host` は
+  「:5556 を bind した側の host」、既定は 127.0.0.1 = PC2 自身）。
+- VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 の run の中で container が自分で起動し、run の終わりに止める。
+- container は run ごとに作り直す。重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
 
-# Thor (policy server)
-# これが提出 image の Dockerfile。旧 RAMEN-Ori トラック用の別 Dockerfile が
-# 並存していたが、2026-09-22 に削除して 1 本化した (紛らわしいうえ、そちらで
-# 焼くと lerobot[groot] / ultralytics / lingbot-vision が入らず全 policy が
-# load に失敗する)。
-docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor \
-  --provenance=false --sbom=false \
-  -t <registry>/ramen-thor:<tag> --push .
-
-# Orin (policy client)
-docker buildx build --platform linux/arm64 -f docker/Dockerfile.orin \
-  -t <registry>/ramen-orin:<tag> --push .
-```
-push で `@sha256:…` digest が生成される（chicken-and-egg 解消）。digest を `manifest.yaml`
-の各 `images.*.digest` に記入。**image は private Docker Hub / GHCR に push し、運営にアクセス付与**。
-
-## 起動（運営が実行する想定）
-Thor `192.168.100.1` / Orin `192.168.100.2`、両者は ethernet 直結。
-
-```bash
-# on the Thor (policy server)
-docker run --rm --runtime nvidia --network host \
-  -e NVIDIA_DISABLE_REQUIRE=1 \
-  -e HF_TOKEN=<token-if-gated> \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  <registry>/ramen-thor@sha256:<digest>
-# → components/server.py --lane decoupled --host 0.0.0.0 --port 8765
-
-# on the Orin (policy client)
-docker run --rm --runtime nvidia --network host \
-  <registry>/ramen-orin@sha256:<digest>
-# → components/client.py --lane decoupled --thor 192.168.100.1 --orin 192.168.100.2
-```
-- `--network host`: boundary の ZeroMQ 3 endpoint（cameras:5555 / state:5557 / actions:5556、Orin 上）と Thor↔Orin WebSocket:8765 のため。
-- `--runtime nvidia`: GPU アクセス。Orin は CUDA/driver userspace が host mount。
-- **`-e NVIDIA_DISABLE_REQUIRE=1`(Thor のみ、必須)**: base の `cuda:13.0.0-devel-ubuntu24.04` は driver-compat gate を焼き込んでおり、運営 Thor(driver 595.78)では `--runtime nvidia` だけだと GPU が全く渡らない(`nvidia-smi` が container 内で失敗)。このフラグで解消(運営 onboarding Finding 1 で確認済)。無いと RAMEN-Ori が CPU-only load or crash する。
-- **`-v ~/.cache/huggingface:/root/.cache/huggingface`(Thor、強く推奨)**: weights は image に焼かず runtime に `huggingface_hub.snapshot_download` で取る設計のため、mount が無いと**毎回空キャッシュから 8.90 GB を落とし直す**。準備時間は 1 スロット 20 分しかない。事前に host 側へ pull しておけば起動が即時になる。
-
-## 自前経路（same image、大会経路とは別プロセス）
-グリッパは `(T,25)` の `[0:2]`/`[2:4]` を運営 adapter が relay する大会経路でしか動かないが、
-歩行（Stage 0）と腕は `rt/arm_sdk` 直の自前経路の方が確実（運営 IK を通らないので EE frame の
-不確定性を受けない）。同じ image から起動できる:
-
-```bash
-docker run --rm --runtime nvidia --network host \
-  -e NVIDIA_DISABLE_REQUIRE=1 \
-  -e HF_TOKEN=<token-if-gated> \
-  -e PYTHONPATH=/app/components/ramen/vendor/desktop \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  <registry>/ramen-thor@sha256:<digest> \
-  python3 -m inference.desktop.entrypoint \
-    --head-source zmq --synthetic-hand-state --action-sink boundary
-```
-- `--head-source zmq`: 会場は ROS2 カメラを publish しない（boundary の `:5555` から取る）。
-- `--synthetic-hand-state`: 会場は hand state を publish しない（Dex1-1、`boundary/states.py` に「usually absent, synthesize whatever your model expects」と明記）。
-- `--action-sink boundary`: `(T,25)` を運営 adapter へ出す。外すと `rt/arm_sdk` へ直接出す（DDS 経路、CycloneDDS + `unitree_sdk2py` を image に同梱済み）。
-
-## pick の hybrid（任意。既定は GR00T のまま）
-
-`pick_table_leg` は既定で GR00T expert（`groot_pick_legs_v2`）で走る。**何もしなければ
-これまでどおり**。VLM で区間境界を判定する hybrid（本体 repo Issue #148）に切り替えたい
-場合だけ、VLM サーバを 1 つ足して env を渡す。
-
-```bash
-# Thor 上、policy server より先に起動しておく（8B の load に数分かかる）
-docker run -d --name ramen-vlm --runtime nvidia --network host \
-  -e NVIDIA_DISABLE_REQUIRE=1 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  vllm/vllm-openai@sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a \
-  Qwen/Qwen3-VL-8B-Instruct \
-  --served-model-name Qwen/Qwen3-VL-8B-Instruct \
-  --host 127.0.0.1 --port 8000 \
-  --dtype bfloat16 --max-model-len 4096 \
-  --max-num-seqs 1 --max-num-batched-tokens 4096 \
-  --mm-processor-cache-gb 0 \
-  --limit-mm-per-prompt '{"image":5,"video":0}' \
-  --gpu-memory-utilization 0.20
-
-curl -fsS http://127.0.0.1:8000/health    # これが通ってから policy server を起動する
-
-# policy server 側に足す env
-#   -e RAMEN_PICK_HYBRID=1
-```
-- digest は `vllm/vllm-openai:v0.29.0` の **linux/arm64**。`TORCH_CUDA_ARCH_LIST` に
-  `11.0`（sm_110 = Thor）を含み、CUDA 13.0.2 / `NVARCH=sbsa` でこちらの thor image と同系統。
-- `--gpu-memory-utilization 0.20`: Thor は 128 GB unified なので約 26 GB。`--max-model-len 4096`
-  かつ `--max-num-seqs 1` なので KV cache はごく小さく、weights（bf16 8B ≒ 16 GB）が主。
-  GR00T の常駐 2 つ（約 12 GiB）+ YOLO と同居させる前提の値。**開発機（RTX 5090）用の
-  `run_local_vlm_server.sh` は 0.64 なので、そのまま Thor に持ち込まないこと。**
-- `--host 127.0.0.1`: このサーバは同じ Thor の policy server からしか呼ばない。外に出さない。
-- **事前に HF cache へ pull しておくこと。** 準備は 1 スロット 20 分しかなく、
-  Qwen3-VL-8B を空キャッシュから落とすと間に合わない。
-- 別ホストに立てた場合は `-e RAMEN_PICK_VLM_ENDPOINT=http://<host>:8000/v1/chat/completions`。
-- **VLM に繋がらないと policy server は起動時に落ちる**（endpoint を skill を組む前に
-  probe している）。`pick_table_leg` に入ってから気付く形にすると、会場では
-  「掴まない」としか見えないため。hybrid をやめるなら `RAMEN_PICK_HYBRID` を外すだけでよい。
-
-## 会場で image を焼き直さずに変えられるもの（Thor、policy server の env）
-
-| env | 既定 | 何が変わるか |
+| Stage | 中身 | Enter |
 |---|---|---|
-| `RAMEN_POLICY` | `groot_pick_real` | `groot_orchestrator`（推奨、全 skill 自動遷移）/ `groot_53d_real` |
-| `RAMEN_VARIANT_<SKILL>` | policy_config.yaml | expert の差し替え（例 `RAMEN_VARIANT_ROTATE_TABLE_BASE=rotate_table_base_ramen_ori_141_c32`） |
-| `RAMEN_GPU_MODELS` | `2` | GPU に載せる model 数（今 + 次）。苦しければ `1` |
-| `RAMEN_PICK_HYBRID` | 未設定（GR00T） | `1` で pick を VLM/VLA/MP hybrid に |
-| `RAMEN_ON_TIMEOUT` | `advance` | `stop` で「時間切れなら止める」に。既定は YOLO が外しても先へ進む |
-| `RAMEN_START_LEG` | `1` | 何本目の脚から始めるか。途中で止まった run の続きをやる |
-| `RAMEN_END_LEG` | `4` | 何本目を終えたらやめるか |
-| `RAMEN_START_SKILL` | 未設定 | 脚の**途中**から戻すとき（`insert_table_leg` など） |
-| `RAMEN_ORCH_LOG` | 未設定 | `(T,25)` を JSONL に残す |
+| 0 | 準備（台まで歩く・腕・初期姿勢） | 1 回（安全確認） |
+| 1〜4 | 脚 1 本ずつ: 台を回す → pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | 2 回（安全確認 / policy 開始） |
+| 5 | 台を裏返す（flip） | 2 回 |
 
-### 途中の脚から再開する
-
-大会経路は 1 本の process が `pick → insert → rotate_leg → rotate_table_base → …`
-を回し続ける構成で、自前経路のように stage で切れていない。会場で 2 本目まで
-終わった状態から続けたいときは脚番号を渡す。
+## 1. 事前準備（会場の前に Thor で 1 回）
 
 ```bash
--e RAMEN_START_LEG=3     # 3 本目から。卓を回してから pick に入る
+# 置き場所（例）。以下の手順はこの 3 つを使う
+export RAMEN_HOST_DIR=~/ramen
+mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
+
+# image（digest は manifest.yaml の images.thor）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@<DIGEST>
+
+# 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）
+#   → tools/prefetch_weights.sh（一覧と使い方は script の先頭）
+# 取れているかをネット無しで確かめる（--check）
 ```
 
-これで `n_legs_completed` が 2 で始まる。この数は表示用ではなく**判定に効く**:
-`0` だと 1 本目用の規則（Kabsch）で脚を探し、`1..3` で 2 本目以降の規則に切り替わる。
-運営が `reset` を呼んでも 1 本目には戻らず、**この再開点に戻る**。
+- `vlm_cache` は VLM の compile 結果の置き場。1 回目の run だけ小さな kernel の compile が走り、2 回目以降は再利用する。
+- `outputs` に run ごとの log（`orch_logs/orch_*.jsonl`、VLM の `orch_logs/vlm_*.log`）が残る。
 
-1 本目は卓を回さず `pick_table_leg` から始まる（自前経路の
-`STAGE_SKILL_SEQUENCES[1]` と同じ）。脚の途中で止まった場合だけ
-`-e RAMEN_START_SKILL=insert_table_leg` のように skill を直接指定できるが、
-**その skill が前提とする物理状態（脚を握っている等）は運用側の責任**。
+## 2. 1 run の手順（**順番が大事**）
 
-## 提出時に添えるもの（運営チェックリスト、2026-08 訂正）
-1. Git repo link（無改変 `boundary/` + 各コンテナの Dockerfile）
-2. 両 image の **registry digest**（`:latest` ではなく `@sha256:…`）
-3. 各 image が load する **exact repo:tag**
-4. 両方 **linux/arm64 (aarch64)** build である旨の確認
-5. Model weights の HF link（image に焼き込まない）
-6. `manifest.yaml`（lane / image refs / base image / entrypoint / Thor↔Orin port / weights URI / Thor peak GPU mem）
-7. `python conformance.py --lane decoupled` の PASS ターミナル出力
-8. 各コンテナの exact `docker run` コマンド（`--runtime nvidia` / mount / env 含む）
-9. bench slot 中に連絡が取れる contact 1名
+```mermaid
+sequenceDiagram
+  participant P as PC2（人が SSH）
+  participant T as Thor（container）
+  P->>P: Step 0-1 環境・bridge（:5555 / :5557）
+  P->>P: Step 2 WBC（run_wbc_with_dex1.py）
+  P->>P: Step 3 adapter 試運転（--actions-host THOR、--live 無し）
+  T->>T: Step 4 docker run … --stage N --actuate（model・VLM の読み込み）
+  T->>T: Enter 1（安全確認）→ go-live 待ち（肩を少し動かし、実測がついてくるまで待つ）
+  P->>T: Step 5 人が go-live（--live --engage-policy）
+  T->>T: 開始姿勢・保持 → Enter 2 → policy（Stage 0 は Enter 2 無し）
+  T->>T: 終わり: 手を開き、腕を下ろして container が終了
+```
 
-## onboarding での確認（実機不要）
+### Step 0〜1 [PC2] 環境とカメラ・状態の配信
+
+RUNBOOK の Step 0（環境変数・`rt/lowcmd` を掴んでいる process が無いこと）と Step 1（`real_orin_cameras.py` と
+`real_orin_state.py` の 2 本）をそのまま行う。
+
+### Step 2 [PC2] WBC — **`run_wbc_with_dex1.py` で起動する**
+
 ```bash
-python3 conformance.py --lane decoupled   # PASS を確認してから提出
+conda activate g1_wbc
+cd ~/GR00T-WholeBodyControl
+python <運営 package の tools>/run_wbc_with_dex1.py \
+  --interface real --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen \
+  --dex1-max-speed 4.2
 ```
-現状は同梱の **hold-still Policy** で PASS 済み。RAMEN-Ori（#115）を載せる際は
-`Policy.act()` を差し替え、19D joint→(T,25) task-space adapter を通す。
+
+- RUNBOOK の `run_g1_control_loop.py` **ではない**。それだとグリッパ（Dex1-1）を動かすものが居ない
+  （`run_wbc_with_dex1.py` は同じ引数を受ける差し替えで、グリッパの指令を同じ `rt/lowcmd` に載せる）。
+- `--dex1-max-speed 4.2`: 学習データのグリッパの速さ（運営の既定は 2.0）。
+- `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある）。
+- 安定した保持状態になってから次へ（`ros2 topic hz /G1Env/env_state_act`）。
+
+### Step 3 [PC2] adapter の試運転（まだ `--live` を付けない）
+
+```bash
+conda activate g1_wbc
+cd ~/wbc_adapter
+python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --state-source boundary
+```
+
+### Step 4 [Thor] 私たちの container
+
+```bash
+docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host \
+  -e IROS_ORIN_HOST=<PC2_IP> \
+  -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
+  -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
+  -v $RAMEN_HOST_DIR/vlm_cache:/cache \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@<DIGEST> \
+  --stage N --actuate
+```
+
+- `-it` 必須（Enter を押すため）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
+- 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動など）は image の起動口
+  （`docker/venue_entry.sh`）が付ける。打つのは `--stage N --actuate` だけ。後ろに足した option は上書きになる
+  （例: `--gpu-models all`）。
+- 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
+- `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
+- go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
+
+### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
+
+```bash
+python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-policy
+```
+
+- **`--state-source boundary` を付けない**（既定の `wbc` のまま）。decoupled で `boundary` と `--live` を
+  一緒にすると adapter が `LAUNCH DENIED` で起動を拒否する（RUNBOOK の Step 6 の書き方はこの点でコードと違う）。
+- `--engage-policy` 必須（無いと WBC の下半身が学習済みの制御に入らないまま、他は全部正常に見える）。
+- E-stop 担当が付いてから。
+
+### その後
+
+- 開始姿勢に移って保持 → `Enter 2` で policy が始まる（Stage 0 は Enter 2 無し）。
+- 終わると手を開き、腕を下ろして container が終わる。
+
+### なぜこの順番か
+
+- PC2 の配信・WBC・adapter（試運転）を先に立て、Thor を最後に起動する（RUNBOOK と同じ）。
+- Thor を go-live より先に起動するのは、指令を 1 通も受けていない adapter は WBC に何も送らず、
+  WBC 自身の 1 秒の見張りが速度制限を通らない保持の目標を差し込むため。Thor が go-live 待ちで指令を
+  出している状態で go-live する。
+
+## 3. 次の run
+
+- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。
+- **adapter は止めない。** `--engage-policy` は押すたびに切り替わる。adapter を起動し直すなら WBC から起動し直す。
+
+## 4. よく出る表示
+
+| 表示 | 意味・すること |
+|---|---|
+| `error: PC2 … -e IROS_ORIN_HOST=<PC2 の IP> で渡す` | `docker run` に `-e IROS_ORIN_HOST=…` を付け忘れた |
+| `[vlm] loading... Ns (no time limit; …)` | VLM を読み込み中。待つ |
+| `[vlm] server ready` → `[vlm] warm-up done` → `[hybrid] … preflight passed … vlm_latency=…` | VLM の準備完了。`vlm_latency` は本番と同じ 5 枚の問い合わせ 1 回の秒数（5 秒以内に答えないと、ロボットが動く前の確認で止まる） |
+| `the VLM server exited while loading` | VLM が起動に失敗。末尾の log と `outputs/orch_logs/vlm_*.log` を見る |
+| `…:8000 is already in use` | 前の VLM が残っている。`docker ps` で古い container を確かめる |
+| `[groot] waiting for the GR00T worker to load... Ns` | GR00T の model を読み込み中。待つ |
+| `[groot] integrated GPU: load headroom from MemAvailable=…` | 情報。GR00T を読む前の空きメモリ |
+| `sender clock offset ~ ±x.xxxs` | 情報。PC2 と Thor の時計の差（指令の送信時刻をこの分だけ直している） |
+| 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`tools/prefetch_weights.sh --check` |
+
+## 5. conformance（運営の適合試験）
+
+```bash
+# Thor（本番の run を動かしていないとき。:5555-5557 を 127.0.0.1 で使う）
+docker run --rm --network host <IMAGE> pixi run --as-is -e runtime python /app/conformance.py --lane decoupled
+# 手元（submit repo の直下）
+python conformance.py --lane decoupled
+```
+
+`components/server.py` は conformance 専用（本番と同じ受け口・送り口で、実測の姿勢を保つ指令を送る）。
+会場の run はこの file を通らない。`components/client.py` は conformance が起動するための置き物。
+
+## 6. 09-27 の接続テストで確かめること
+
+1. 運営 README（「You do not run any of this」）と RUNBOOK（「you run the whole pipeline yourself」）のどちらが正か。
+   manifest に PC2 用の image が無くてよいか
+2. bridge の起動 log が `head camera live at 1280x480` か
+3. `[groot] integrated GPU: …` の MemAvailable と cudaMemGetInfo の値
+4. model・VLM の読み込み秒、`vlm_latency`、定常の周期
+5. preflight の `--require-stereo` で落ちたら外してよい（単眼に落ちる）
+6. 運営 package の HEAD が `47f4e1b` のままか
+7. go-live 前の揺れ / go-live から pick 開始までの時間 / 関節の到達判定（0.10 rad）/ :5557 のレート / 開 4.5 の `gripper_q`
+8. `sender clock offset` と、adapter の `[stats]` で stale が 0 か
+9. 準備動作の診断行の `speed=`（止まっているのに 0.08 を超えるなら受信時刻のゆらぎ）
