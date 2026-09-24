@@ -45,9 +45,8 @@ mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 # image（digest は manifest.yaml の images.thor）
 docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@<DIGEST>
 
-# 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）
-#   → tools/prefetch_weights.sh（一覧と使い方は script の先頭）
-# 取れているかをネット無しで確かめる（--check）
+# 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
+#   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
 ```
 
 - `vlm_cache` は VLM の compile 結果の置き場。1 回目の run だけ小さな kernel の compile が走り、2 回目以降は再利用する。
@@ -158,7 +157,7 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 | `[groot] waiting for the GR00T worker to load... Ns` | GR00T の model を読み込み中。待つ |
 | `[groot] integrated GPU: load headroom from MemAvailable=…` | 情報。GR00T を読む前の空きメモリ |
 | `sender clock offset ~ ±x.xxxs` | 情報。PC2 と Thor の時計の差（指令の送信時刻をこの分だけ直している） |
-| 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`tools/prefetch_weights.sh --check` |
+| 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`WEIGHTS.md` の 4（`prefetch_weights.py --check`） |
 
 ## 5. conformance（運営の適合試験）
 

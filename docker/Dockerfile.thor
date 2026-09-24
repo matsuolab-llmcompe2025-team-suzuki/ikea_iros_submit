@@ -299,6 +299,8 @@ COPY conformance.py requirements.txt /app/
 COPY boundary/ /app/boundary/
 COPY mocks/ /app/mocks/
 COPY components/ /app/components/
+# 重みの事前取得とネット無しの確認 (WEIGHTS.md)。/app/ramen の本物の解決関数を呼ぶ
+COPY tools/prefetch_weights.py /app/tools/prefetch_weights.py
 
 # 会場は実行時オフライン: 重みは HF の cache (読み取り専用で mount) から読み、取りに行かない。
 # VLM の compile 結果の置き場は /cache (container は run ごとに作り直すので host の directory を mount)。

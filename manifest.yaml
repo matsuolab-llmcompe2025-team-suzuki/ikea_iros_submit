@@ -47,7 +47,19 @@ runtime:
   network: >-
     none at run time: HF_HUB_OFFLINE=1, the VLM runs with usage stats off and every outbound
     endpoint pointed at a closed local port; weights are read from the mounted cache
-  weights: TBD   # read-only Hugging Face cache; list and prefetch in tools/prefetch_weights.sh
+  # Mounted read-only as a Hugging Face cache (~86 GB). Prefetch and offline check:
+  # tools/prefetch_weights.py (list derived from policy_config.yaml); details in WEIGHTS.md.
+  weights:
+    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b (ckpt_step_100000.pt)"
+    - "robbyant/lingbot-vision-vit-base@main"
+    - "Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a (checkpoint-40000 runtime files)"
+    - "Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k@0f0927bcc1aed6927fb26b82c017009961ee3d35"
+    - "Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26"
+    - "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff (checkpoints/020000/pretrained_model)"
+    - "nvidia/GR00T-N1.7-3B@2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+    - "nvidia/Cosmos-Reason2-2B@main (gated)"
+    - "Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@8221d0aef45d63666537c1f030810fb9b56dd1ed (runs/m_lowaug_v11b/weights/best_20260818.pt)"
+    - "Qwen/Qwen3-VL-8B-Instruct@main"
   peak_memory_thor_gb: TBD
 
 conformance: >-
