@@ -42,8 +42,8 @@ flowchart LR
 export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag 20260925-rebuild2。digest は manifest.yaml の images.thor と同じ。GB10 で確認済み = VERIFY.md）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:8ec61df29c2470aee487a45382ca848d7742bb4b3395a42823642bb660476018
+# image（tag 20260925-rebuild3。digest は manifest.yaml の images.thor と同じ。GB10 で確認済み = VERIFY.md）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:3064ee8bc0348bae4a31b7e7b98309850843eababbd2071cfe69b2cabcbaa8b8
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
@@ -112,7 +112,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:8ec61df29c2470aee487a45382ca848d7742bb4b3395a42823642bb660476018 \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:3064ee8bc0348bae4a31b7e7b98309850843eababbd2071cfe69b2cabcbaa8b8 \
   --stage N --actuate
 ```
 
