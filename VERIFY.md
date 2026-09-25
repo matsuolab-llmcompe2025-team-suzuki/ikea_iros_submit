@@ -120,9 +120,15 @@ strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は 
 
 ### 4-6 `--actuate` の経路
 
-`ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）を
-その秒数だけ続けてから、python に Ctrl+C（SIGINT）を送る。後始末（手を開いて腕を下ろす。模擬の PC2 は従わないので
-最大 60 秒待って諦める）まで通る。外向きの接続は 4-5 で見たので strace は付けない。
+`ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）が
+出てからその秒数だけ待って、python に Ctrl+C（SIGINT）を送る。外向きの接続は 4-5 で見たので strace は付けない。
+
+模擬の PC2 の関節は指令と関係なく sin 波で動くので、go-live 待ちは「ついてきた」と成立してしまい、その先の
+準備動作（腕を動かす）は指令に従わないので時間切れになる。見るのは、そこまでに指令の経路（実測の関節の読み取り・
+運営 IK と同じ URDF での手先の誤差・publish・後始末）がコードの誤り無しに動くこと。
+- Stage 5: 開始姿勢 → Enter 2 の問いで Ctrl+C → 後始末（腕を下ろせず諦める）→ rc=0
+- Stage 0: 腕を下ろす準備動作が時間切れ → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
+  `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
 
 ```bash
 $SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; done" \
@@ -145,29 +151,33 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 
 - `summarize.py` が exit 0: 全 stage が `rc=0`（`[preflight] … validation passed; NO command sent`）、**外向き connect 0 件**。
   候補（`stage*_all6`）と DP（`stage2_dp`）も同じ
-- `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、Ctrl+C で終わり（rc 0 か 130）、log に
-  コードの誤り（`NameError` など。後始末は例外を握って `[return] failed: …` と出す）が無い
+- `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、log にコードの誤り（`NameError` など。
+  後始末は例外を握って `[return] failed: …` と出すので、名前で見る）が無い。終わり方は Ctrl+C（rc 0 か 130）か
+  4-6 の設計どおりの停止（`RuntimeError: … did not converge`、rc=1）。それ以外の例外は不合格
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
-## 6. 基準値（2026-09-25、image `gb10-test-5fac481` = `sha256:3441f1e9…` をそのまま起動）
+## 6. 基準値（2026-09-25 午後、image `gb10-test-8c5f4f9` = `sha256:8ec61df2…` をそのまま起動 = 本番 `20260925-rebuild2`）
 
-既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。
+既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。host はスペイン（offer 41941375）。
 
 | 項目 | 値 |
 |---|---|
 | 4 環境の GPU | runtime torch 2.12.1 / desktop 2.11.0 / vlm 2.13.0 / pick 2.11.0、全部 cu130、`cap (12, 1)`・integrated |
-| 重みの取得 | 10 個 約 86 GB を 125 秒（回線 5.6 Gbps の host）。`--check` は all present |
-| Stage 1（strace 無し） | 全体 194 秒。VLM の起動 151 秒、慣らし 1.0 秒、`vlm_latency` 0.62 秒。その後 model 3 つ |
-| strace 下の各 stage | Stage 0: 8 秒 / Stage 1: 258 秒 / Stage 2: 239 秒 / Stage 5: 22 秒、すべて rc=0 |
-| GPU の使用量の最大 | Stage 1: 41.7 GB / **Stage 2: 42.7 GB（VLM と 4 model）** / Stage 5: 7.0 GB |
-| MemAvailable の最小 | Stage 2 で 44.8 GB 残る（Thor の 128 GB でも余裕） |
-| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 11〜17 GB と出る。MemAvailable（56〜67 GB）で判断しているので読み込める |
-| 外向き connect | **全 stage で 0 件**（VLM `:8000`・カメラ `:5555`・状態 `:5557`・FlashInfer の閉じた `:9` と Unix socket だけ） |
+| 重み | 既定・set の全部・`--variant` の DP で 約 85 GB。`--check` は all present |
+| Stage 1（strace 無し） | 全体 271 秒。VLM の起動 200 秒、`vlm_latency` 0.84 秒。その後 model 3 つ |
+| strace 下の各 stage（既定） | Stage 0: 26 秒 / Stage 1: 486 秒 / Stage 2: 442 秒 / Stage 5: 42 秒、すべて rc=0 |
+| 候補 `all6_400k` | Stage 2: 330 秒・GPU 30.6 GB（台を回す・insert・締め付けが all6）/ Stage 5: 20 秒（flip の RAMEN-Ori と YOLO） |
+| DP（`rotate_table_base_diffusion`） | Stage 2: 483 秒・GPU 43.4 GB |
+| GPU の使用量の最大（既定） | Stage 1: 41.7 GB / **Stage 2: 42.7 GB（VLM と 4 model）** / Stage 5: 7.1 GB |
+| MemAvailable の最小 | Stage 2 で 47.9 GB 残る（Thor の 128 GB でも余裕） |
+| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 6〜24 GB と出る。MemAvailable（53〜70 GB）で判断しているので読み込める |
+| 外向き connect | **strace を付けた全 run で 0 件**（VLM `:8000`・カメラ `:5555`・状態 `:5557`・FlashInfer の閉じた `:9` と Unix socket だけ） |
+| `--actuate`（4-6） | Stage 5: rc=0（103 秒）/ Stage 0: 設計どおりの停止（67 秒）。どちらもコードの誤り 0 件 |
 | conformance | PASS |
 
-VLM の起動秒は host の disk の速さで変わる（前日の別の host は 196 秒、うち重みの読み込み 125 秒）。
-費用: 1 回目（不具合の調査を含む）$0.90、2 回目（SSH が上がらない host を 1 台挟んだ）$3.00。
+起動秒は host の disk の速さで変わる。前回（ハンガリー、`gb10-test-5fac481`）は Stage 1 が strace 無しで 194 秒
+（VLM 151 秒）、strace 下で 258 秒。GPU の使用量は同じ。費用 $0.93（instance 1 台、約 1.3 時間）。
 
 この確認で見つけて直したもの（1 回目、image `gb10-test-d029549`。2 回目で直った image を確認）:
 
@@ -177,6 +187,14 @@ VLM の起動秒は host の disk の速さで変わる（前日の別の host �
    image の中の 4 環境で huggingface_hub の版が違う（1.20.1 / 1.28.0 / 1.32.0 / 1.22.0）ことに注意。
 2. **YOLO（ultralytics 8.4.80）が外に出ていた**。import 時に DNS でネットの有無を調べ、推論の開始時に
    Google Analytics へ利用統計を送る。→ image の ENV に `YOLO_OFFLINE=true`（submit `6c0c6e6`）。
+
+2 回目の image（`20260925-rebuild`）の後に見つけて直したもの（3 回目の上の表で確認）:
+
+3. **`--actuate` を付けると起動直後に止まった**。`main()` の会場の処理が `np` を使うのに import が無かった
+   （本体 #164 が見つけて直した）。確認が `--actuate` 無しだったので通っていた → 4-6 を追加。
+4. **DP（act_diffusion）がネット無しで起動できなかった**（読んで見つけた）。worker を `--as-is` 無しで起動していた、
+   cache だけを見る指定が無かった（1. と同じ）、ckpt の `pretrained_backbone_weights`（ImageNet の ResNet18）を
+   torchvision が model を作る時点でネットから取りに行く。→ 本体 `b591049`。
 
 ## 7. 費用
 

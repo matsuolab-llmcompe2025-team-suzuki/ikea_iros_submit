@@ -9,9 +9,11 @@
 - 外向き接続: strace の connect のうち loopback / Unix socket 以外。どの process か
   (execve したコマンド) も出す。会場は実行時にネットに出ないので、0 件が合格
 - --actuate の run (result.txt に mode=actuate、run_stage.sh の ACTUATE_HOLD): Enter 1 の問いと
-  go-live 待ち (`[go-live]`) まで進み、log にコードの誤り (NameError 等) が無く、Ctrl+C で
-  終わった (rc 0 か 130) のが合格。後始末は例外を握って `[return] failed: <例外>` と出すので、
-  rc だけでは誤りが見えない (2026-09-25 の本番 image の numpy の import 漏れがそうだった)
+  go-live 待ち (`[go-live]`) まで進み、log にコードの誤り (NameError 等) が無いのが合格。終わり方は
+  Ctrl+C (rc 0 か 130) か、模擬の PC2 が指令に従わないための設計どおりの停止 (準備動作の時間切れ。
+  Stage 0 は腕を下ろせないと歩かずに RuntimeError で止まる) のどちらか。それ以外の例外は不合格。
+  後始末は例外を握って `[return] failed: <例外>` と出すので、rc だけでは誤りが見えない
+  (2026-09-25 の本番 image の numpy の import 漏れがそうだった)
 """
 
 from __future__ import annotations
@@ -28,9 +30,13 @@ KEY_LINES = re.compile(
 )
 #: 会場のコードの誤り。後始末や判定の中で握られても log には名前が残る
 CODE_ERRORS = re.compile(
-    r"Traceback|NameError|AttributeError|TypeError|UnboundLocalError|ImportError|"
-    r"ModuleNotFoundError"
+    r"NameError|AttributeError|TypeError|UnboundLocalError|ImportError|ModuleNotFoundError"
 )
+#: Traceback の最後の例外の行
+EXCEPTION_LINE = re.compile(r"^\w+(?:Error|Exception|Interrupt)\b.*$", re.M)
+#: 模擬の PC2 は指令に従わない (関節は勝手に sin 波で動く) ので、腕を動かす準備動作は時間切れになる。
+#: 会場ではそこで止めるのが設計 (Stage 0 は腕を下ろせないまま歩かない)
+MOCK_STOP = re.compile(r"^RuntimeError: .*did not converge")
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0"}
 
 
@@ -88,8 +94,16 @@ def connect_summary(
 def actuate_problems(result: str, log: str) -> list[str]:
     """--actuate の run の不合格の理由 (空なら合格)。"""
     problems = []
-    if not re.search(r"\brc=(0|130)\b", result):
-        problems.append("Ctrl+C で終わっていない (rc が 0 / 130 以外)")
+    final = ""
+    if "Traceback (most recent call last):" in log:
+        tail = log.rsplit("Traceback (most recent call last):", 1)[1]
+        lines = EXCEPTION_LINE.findall(tail)
+        final = lines[-1] if lines else "(例外の行が無い)"
+    stopped_by_mock = bool(re.search(r"\brc=1\b", result) and MOCK_STOP.match(final))
+    if final and not stopped_by_mock:
+        problems.append(f"想定外の例外で止まった: {final[:120]}")
+    elif not stopped_by_mock and not re.search(r"\brc=(0|130)\b", result):
+        problems.append("Ctrl+C でも設計どおりの停止でもない終わり方 (rc)")
     if "Enter starts" not in log:
         problems.append("Enter 1 の問いまで進んでいない")
     if "[go-live]" not in log:

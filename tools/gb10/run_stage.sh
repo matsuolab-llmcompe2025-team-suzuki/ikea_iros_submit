@@ -12,8 +12,9 @@
 # ACTUATE_HOLD=<秒>: --actuate を付け、Enter 1 の問いが出たら改行を送り、go-live 待ち
 # (`[go-live]`) が出てから <秒> 待って Ctrl+C (python の process にだけ SIGINT) を送る。
 # 指令の経路 (boundary の publish・実測の関節の読み取り) が落ちずに動くことと、Ctrl+C の後の
-# 後始末 (手を開いて腕を下ろす) までを通す。模擬の PC2 は指令に従わないので、go-live は
-# 成立しない (待ち続けるのが正しい)。result.txt に mode=actuate を書く (summarize.py の判定)。
+# 後始末 (手を開いて腕を下ろす) までを通す。模擬の PC2 の関節は指令と関係なく sin 波で動くので、
+# go-live 待ちは成立し、その先の準備動作は時間切れになる (Stage 0 は腕を下ろせず設計どおり止まる)。
+# result.txt に mode=actuate を書く (summarize.py の判定)。
 #
 # 出力 (${RUNS_DIR:-/root/runs}/<出力名>/):
 #   run.log      起動口の出力            result.txt  rc と秒

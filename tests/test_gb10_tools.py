@@ -104,6 +104,38 @@ def test_an_error_swallowed_by_the_return_path_fails(tmp_path) -> None:
     assert "NameError" in result.stdout
 
 
+MOCK_STOP_TAIL = """\
+[setup] arms are 0.978 rad away from walk_lowered_pose; lowering before the walk
+[pre-motion 1/1] waiting: worst=left_elbow target=+0.900 measured=-0.138 error=1.038rad
+[return] lowering failed: pre-motion stage 'return_forward_outward_clearance' did not converge within 15s
+Traceback (most recent call last):
+  File "/app/ramen/inference/desktop/entrypoint.py", line 3812, in _run_cli_and_exit
+    raise RuntimeError(
+RuntimeError: lowering the arms before the walk failed: pre-motion stage 'policy_initial_pose' did not converge within 15s control
+"""
+
+
+def test_the_designed_stop_when_the_mock_does_not_follow_passes(tmp_path) -> None:
+    """模擬の PC2 は指令に従わないので Stage 0 は腕を下ろせず、設計どおり RuntimeError で止まる。
+
+    2026-09-25 の GB10 (gb10-test-8c5f4f9) の actuate0 の形。指令の経路はここまでに全部通っている。
+    """
+    run = _actuate_run(tmp_path, ACTUATE_LOG + MOCK_STOP_TAIL, "rc=1 secs=67 mode=actuate")
+    result = _summarize(run)
+    assert result.returncode == 0, result.stdout
+
+
+def test_an_unexpected_exception_fails(tmp_path) -> None:
+    tail = MOCK_STOP_TAIL.replace(
+        "RuntimeError: lowering the arms before the walk failed: pre-motion stage "
+        "'policy_initial_pose' did not converge within 15s control",
+        "ValueError: boundary action shape mismatch",
+    )
+    result = _summarize(_actuate_run(tmp_path, ACTUATE_LOG + tail, "rc=1 secs=40 mode=actuate"))
+    assert result.returncode == 1
+    assert "想定外の例外" in result.stdout
+
+
 def test_an_actuate_run_that_never_reached_go_live_fails(tmp_path) -> None:
     log = ACTUATE_LOG.replace("[go-live]", "[preflight]")
     result = _summarize(_actuate_run(tmp_path, log))
