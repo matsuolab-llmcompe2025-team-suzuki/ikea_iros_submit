@@ -117,7 +117,22 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。GPU は VLM 込みで最大 42 GB。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
+- 使う model は起動 log の `[init] policy variants: insert=… (config)` で分かる（`config` = 既定、`set:…` / `cli` = 切り替え）。
 - go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
+
+#### model を切り替えるとき（焼き直さない。既定は変わらない）
+
+既定の model は image の中の `policy_config.yaml`（`default_variant_by_skill`）。`--stage N --actuate` の後ろに
+足すだけで、その run だけ切り替わる。pick は hybrid（`groot_pick_legs_v1`）のまま。
+
+| 足す option | 切り替わるもの |
+|---|---|
+| `--policy-variant-set all6_400k` | pick 以外の全部（台を回す・insert・締め付け・flip）を 6 skill 統合 RAMEN-Ori（400k）に |
+| `--policy-variant-insert insert_table_leg_ramen_ori_all6_400k` | insert だけ。他は `--policy-variant-rotate-table-base` / `--policy-variant-rotate-leg` / `--policy-variant-flip` に `<skill>_ramen_ori_all6_400k` |
+
+- 切り替え先は **`WEIGHTS.md` の一覧にある重みを使う slot だけ**（会場はネット無し。`policy_config.yaml` の
+  `variant_sets` に書いた組み合わせは事前取得に入っている）。一覧に無い slot を指定すると、起動時に重みが無くて止まる。
+- 新しい model（学習中の insert の DP など）は、本体で slot と set を足して image を焼き直してから使う。
 
 ### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
 
