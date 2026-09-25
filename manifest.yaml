@@ -10,8 +10,9 @@
 #
 # The image is a private GHCR package: the organizer account needs read access.
 # Before release this exact image (same digest) was started offline on an arm64 GB10 with
-# 128 GB unified memory: every stage's preflight passed and nothing connected outside
-# loopback (procedure and numbers: VERIFY.md).
+# 128 GB unified memory: every stage's preflight passed (defaults, the all6_400k candidate
+# set and the rotate DP), nothing connected outside loopback, and the --actuate command path
+# ran to the go-live wait and the return-before-release (procedure and numbers: VERIFY.md).
 
 team: RAMEN
 lane: decoupled
@@ -19,8 +20,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260925-rebuild"
-    digest: "sha256:3441f1e96ecbc518facb0586fe478cff4be6638c42df441d523c17b1f66040c4"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260925-rebuild2"
+    digest: "sha256:8ec61df29c2470aee487a45382ca848d7742bb4b3395a42823642bb660476018"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for the two Enter prompts.
     run: >-
