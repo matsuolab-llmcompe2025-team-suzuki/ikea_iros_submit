@@ -426,6 +426,8 @@ class ZmqFrameSource:
         self._key_changed_monotonic_ns: dict[str, int] = {}
         # (受信 monotonic ns, 送信時刻 − 受信時刻 [s])。送信側の時計との差の推定用 (C2-01)。
         self._sender_clock_samples: list[tuple[int, float]] = []
+        # 最後の推定。カメラが窓 (5 s) より長く途切れても持ち続ける (Thor の時計に戻さない)。
+        self._sender_clock_offset: Optional[float] = None
         self._sender_clock_logged = False
 
         self._sock = zmq.Context.instance().socket(zmq.SUB)
@@ -608,6 +610,9 @@ class ZmqFrameSource:
                 item for item in self._sender_clock_samples if item[0] >= horizon_ns
             ]
             self._sender_clock_samples.append((received_monotonic_ns, sample))
+            self._sender_clock_offset = max(
+                item for _, item in self._sender_clock_samples
+            )
             first = not self._sender_clock_logged
             self._sender_clock_logged = True
         if first:
@@ -626,11 +631,12 @@ class ZmqFrameSource:
         action の時刻をこれで PC2 の時計に揃える (Issue #161、C2-01)。運営 bridge は
         JPEG にする前の時刻を付けるので、差はその時間 (数十 ms) だけ小さめに出る
         (= 古さは少し大きめに見える側、1.0 s に対して無害)。まだ無ければ None。
+
+        カメラが窓より長く途切れても、最後の推定を返し続ける。None (= この host の時計) に
+        戻すと、時計が 1 s 以上ずれていれば途切れの間の指令が運営 adapter に捨てられる。
         """
         with self._lock:
-            if not self._sender_clock_samples:
-                return None
-            return max(sample for _, sample in self._sender_clock_samples)
+            return self._sender_clock_offset
 
     def _recv_loop(self) -> None:
         """ZMQ 受信 thread。latest 1 frame だけ保持する (buffer を詰まらせない)。"""

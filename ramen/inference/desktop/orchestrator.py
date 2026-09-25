@@ -91,12 +91,24 @@ DEFAULT_ENTER_CHECK: dict[str, Callable[[list[OBBDetection], SkillState], bool]]
 
 
 class _NeverEnterCheck(dict):
-    """どの skill 名で引いても `enter_never` を返す enter_check の表。"""
+    """どの skill 名で引いても `enter_never` を返す enter_check の表。
+
+    `[]` だけでなく `.get()` と `in` も同じにする (dict の `__missing__` は `[]` でしか
+    呼ばれないので、`.get()` だと None が返り、呼んだ所で落ちる)。
+    """
 
     def __missing__(
         self, skill_name: str
     ) -> Callable[[list[OBBDetection], SkillState], bool]:
         return enter_never
+
+    def get(  # type: ignore[override]
+        self, skill_name: str, default: object = None
+    ) -> Callable[[list[OBBDetection], SkillState], bool]:
+        return self[skill_name]
+
+    def __contains__(self, skill_name: object) -> bool:
+        return True
 
 
 def stage_enter_check() -> dict[str, Callable[[list[OBBDetection], SkillState], bool]]:

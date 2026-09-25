@@ -33,6 +33,14 @@ SHOULDER_PITCH_INDICES = (0, 7)
 SHOULDER_ROLL_INDICES = (1, 8)
 ELBOW_INDICES = (3, 10)
 LOWERED_WALK_TRACKING_MARGIN_RAD = 0.05
+
+#: 下ろし終わった腕を歩行中の保持姿勢にする前の確かめ方 (`skills.walk_lowered_pose.latch_check`)。
+#:   joint     (既定): 関節ごとの歩行の範囲 (`validate_lowered_walk_pose`) に入っていること。
+#:                     外れていれば歩かずに止める (腕を上げたまま歩かない)
+#:   converged        : 下ろす動きが収束していれば、範囲をわずかに外れていても記録して保持する。
+#:                     会場の pose lane では収束を手先で判定し、運営 IK が同じ手先を別の関節角で
+#:                     作るので、範囲の検査だけで止まりうる (PR #167 のレビュー、接続テストで決める)
+WALK_LATCH_CHECKS = ("joint", "converged")
 # 歩行してよい腕の範囲 (関節群ごとの絶対値の上限 [rad])。
 _LOWERED_WALK_LIMITS = {
     "shoulder_pitch": (SHOULDER_PITCH_INDICES, 0.75),
@@ -157,11 +165,16 @@ class MeasuredArmWalkHoldSkill(Skill):
             [np.ndarray, np.ndarray, np.ndarray], tuple[bool, str]
         ]
         | None = None,
+        latch_check: str = "joint",
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
         if not math.isfinite(dwell_sec) or dwell_sec <= 0.0:
             raise ValueError("dwell_sec must be positive and finite")
+        if latch_check not in WALK_LATCH_CHECKS:
+            raise ValueError(f"latch_check must be one of {WALK_LATCH_CHECKS}, got {latch_check!r}")
+        # 下ろし終わった腕を歩行中の保持姿勢にする前の確かめ方 (`WALK_LATCH_CHECKS`)
+        self._latch_check = latch_check
         self._dwell_sec = float(dwell_sec)
         # 歩く前の腕が範囲の外にあったときに向かう姿勢 (Issue #152)。
         # None なら従来どおり「範囲の外なら止める」。
@@ -203,7 +216,18 @@ class MeasuredArmWalkHoldSkill(Skill):
         pass
 
     def _latch(self, measured: np.ndarray) -> np.ndarray:
-        self._hold = validate_lowered_walk_pose(measured)
+        violation = lowered_walk_pose_violation(measured)
+        if violation is not None and self._latch_check == "converged":
+            # 下ろす動きは (会場は手先で) 収束済み。関節の範囲だけわずかに外れている
+            # (運営 IK が同じ手先を別の関節角で作る) ので、記録して実測を保持する。
+            print(
+                f"[setup] WARNING: lowered arms are outside the walk envelope ({violation}); "
+                "holding them anyway because the lowering converged (latch_check=converged)",
+                file=sys.stderr,
+            )
+            self._hold = np.asarray(measured, dtype=np.float64).copy()
+        else:
+            self._hold = validate_lowered_walk_pose(measured)
         self._latched_at = self._time_fn()
         print(
             "[setup] measured lowered arm pose latched; walking will keep this pose",

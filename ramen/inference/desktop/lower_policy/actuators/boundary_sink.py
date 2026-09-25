@@ -112,9 +112,21 @@ ORGANIZER_IK_LIMIT_MARGIN_RAD = 0.02
 ORGANIZER_IK_ARM_LOWER_RAD = np.asarray(_ORGANIZER_ARM_LOWER) + ORGANIZER_IK_LIMIT_MARGIN_RAD
 ORGANIZER_IK_ARM_UPPER_RAD = np.asarray(_ORGANIZER_ARM_UPPER) - ORGANIZER_IK_LIMIT_MARGIN_RAD
 
+# 手首 roll の上書き (0.9) は運営 IK の a1af470 (interface package 609f61d) で無くなった
+# (姿勢の重みで寄せる形に変わり、上限は URDF の ±1.9722 だけ)。`clamp_wrist_roll=False`
+# (起動の `--wrist-roll-clamp off`) では手首 roll をこの URDF の範囲にだけ収める。
+# 古い運営 IK (0.9 が固い上限) の相手に外すと、0.9 を超えた目標で腕ごと止まる。
+WRIST_ROLL_INDICES = (4, 11)
+URDF_WRIST_ROLL_LIMIT_RAD = 1.972222054
 
-def clamp_arms_to_organizer_ik(arms14: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+
+def clamp_arms_to_organizer_ik(
+    arms14: Sequence[float], *, clamp_wrist_roll: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
     """腕 14-D を運営 IK の可動域 (余裕つき) に収める。
+
+    Args:
+        clamp_wrist_roll: False なら手首 roll は 0.9 ではなく URDF の範囲に収める。
 
     Returns:
         (収めた腕 14-D, 端に寄せた関節の bool mask)。
@@ -122,7 +134,13 @@ def clamp_arms_to_organizer_ik(arms14: Sequence[float]) -> tuple[np.ndarray, np.
     arms = np.asarray(arms14, dtype=np.float64).reshape(-1)
     if arms.shape != (14,):
         raise ValueError(f"arms14 must be (14,), got {arms.shape}")
-    clamped = np.clip(arms, ORGANIZER_IK_ARM_LOWER_RAD, ORGANIZER_IK_ARM_UPPER_RAD)
+    lower = ORGANIZER_IK_ARM_LOWER_RAD.copy()
+    upper = ORGANIZER_IK_ARM_UPPER_RAD.copy()
+    if not clamp_wrist_roll:
+        for index in WRIST_ROLL_INDICES:
+            lower[index] = -URDF_WRIST_ROLL_LIMIT_RAD + ORGANIZER_IK_LIMIT_MARGIN_RAD
+            upper[index] = URDF_WRIST_ROLL_LIMIT_RAD - ORGANIZER_IK_LIMIT_MARGIN_RAD
+    clamped = np.clip(arms, lower, upper)
     return clamped, clamped != arms
 
 
@@ -398,6 +416,8 @@ class BoundaryActionSink:
             同じ運動学 (`ORGANIZER_IK_URDF_PATH`) で作る。会場では省略すること
             (学習用の mode_15 URDF を渡すと手首が約 5 mm ずれる、Issue #164)。joint lane では使わない。
         lane: `"pose"` (既定、`DecoupledSink`) か `"joint"` (`JointSink`)。module の docstring。
+        clamp_wrist_roll: pose lane で手首 roll を運営 IK の古い上限 0.9 に寄せるか
+            (`clamp_arms_to_organizer_ik`)。joint lane は寄せない (運営 IK を通らない)。
         port / host: `DecoupledSink` にそのまま渡す。
         ee_frame_transform: root-link → 運営 IK が期待する frame の 4x4。未確定なので
             既定 `None` (変換なし)。
@@ -415,6 +435,7 @@ class BoundaryActionSink:
         fk: Any = None,
         *,
         lane: str = "pose",
+        clamp_wrist_roll: bool = True,
         port: int = 5556,
         host: str = "*",
         ee_frame_transform: Optional[np.ndarray] = None,
@@ -444,6 +465,7 @@ class BoundaryActionSink:
             from inference.desktop.boundary import JointSink as sink_class
 
         self._lane = lane
+        self._clamp_wrist_roll = bool(clamp_wrist_roll)
         self._fk = fk if lane == "pose" else None
         self._ee_frame_transform = ee_frame_transform
         self._log_fn = log_fn
@@ -459,6 +481,17 @@ class BoundaryActionSink:
             "(the organizer's adapter dials in to this)",
             file=sys.stderr,
         )
+        if lane == "pose":
+            # 接続テストで決める設定なので、どちらで動いているかを起動 log に残す
+            print(
+                "[boundary] wrist_roll clamp: "
+                + (
+                    "on (organizer IK 0.9 cap)"
+                    if self._clamp_wrist_roll
+                    else "off (URDF limit only; organizer IK a1af470+)"
+                ),
+                file=sys.stderr,
+            )
 
     @property
     def lane(self) -> str:
@@ -525,7 +558,9 @@ class BoundaryActionSink:
         """pose lane: (1,25) の手先の姿勢の chunk と、log に足す項目。"""
         action19 = self._stabilize_waist(action19)
         # 運営 IK が解ける範囲へ。外れた関節があると運営 adapter がその腕を丸ごと止める。
-        arms, clamped_mask = clamp_arms_to_organizer_ik(action19[ARMS_SLICE])
+        arms, clamped_mask = clamp_arms_to_organizer_ik(
+            action19[ARMS_SLICE], clamp_wrist_roll=self._clamp_wrist_roll
+        )
         action19[ARMS_SLICE] = arms
         if clamped_mask.any():
             self._clamped += 1

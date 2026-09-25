@@ -145,6 +145,12 @@ skills:
       L.elbow:          0.9
       R.shoulder_roll: -0.2
       R.elbow:          0.9
+    # 下ろし終わった腕を歩行中に保持する前の確かめ方 (collision_aware_pre_motion.WALK_LATCH_CHECKS)。
+    #   joint     = 関節ごとの歩行の範囲に入っていなければ歩かずに止める (既定)
+    #   converged = 下ろす動きが収束していれば、範囲をわずかに外れても記録して保持する
+    # 会場の pose lane は収束を手先で見るので、運営 IK の関節角しだいで joint が止まりうる。
+    # 接続テストで決め、決まったらここを書き換える (それまでは起動の --walk-lowering-check で上書き)。
+    latch_check: joint
 
   # MoveToTable: 組立台の前まで歩く Type A skill (Issue #64、Issue #81 Phase 2b で YAML 化)。
   #   - vx: 前進速度 [m/s]、default 0.185 は Issue #64 で実機確定した決め打ちルール。

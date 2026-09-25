@@ -445,6 +445,17 @@ def _walk_lowered_pose(skill_config: dict) -> "np.ndarray | None":
     return densify_pose(section.get("pose_rad"), context="walk_lowered_pose")
 
 
+def _walk_latch_check(skill_config: dict, override: Optional[str] = None) -> str:
+    """歩く前に下ろした腕を保持する前の確かめ方 (`skills.walk_lowered_pose.latch_check`)。
+
+    ``override`` (起動の ``--walk-lowering-check``) があればそちらを使う (接続テスト用)。
+    """
+    if override is not None:
+        return override
+    section = (skill_config.get("skills") or {}).get("walk_lowered_pose") or {}
+    return str(section.get("latch_check", "joint"))
+
+
 def _walk_lowering_settings(skill_config: dict) -> dict:
     """腕を下ろすときの速度・収束の値 (`arm_pre_motion` を流用する)。"""
     settings = dict(skill_config.get("arm_pre_motion") or {})
@@ -568,6 +579,14 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         and getattr(args, "action_sink", "sdk") != "boundary"
     ):
         raise ValueError("--boundary-lane joint requires --action-sink boundary")
+    if getattr(args, "wrist_roll_clamp", "on") != "on" and not _boundary_taskspace_arrival(
+        args
+    ):
+        # 効かない組み合わせを弾く (接続テストで「外したつもり」を作らない)
+        raise ValueError(
+            "--wrist-roll-clamp off applies only to --action-sink boundary on the pose lane "
+            "(the joint lane never goes through the organizer IK)"
+        )
     if getattr(args, "action_sink", "sdk") == "boundary":
         # boundary は腕・手を (T,25) で運営 WBC に渡す (腰は実測値のまま)。SDK 直の
         # 実 actuator を併用すると同じ関節を二重に動かす。
@@ -1348,6 +1367,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--walk-lowering-check",
+        choices=("joint", "converged"),
+        default=None,
+        help=(
+            "Stage 0 で下ろした腕を歩行中に保持する前の確かめ方 (既定は skill_config.yaml の"
+            " skills.walk_lowered_pose.latch_check = joint)。joint = 関節ごとの歩行の範囲を外れて"
+            " いれば歩かずに止める。converged = 下ろす動きが収束していれば記録して保持する。"
+            " 接続テストで決めるための上書き"
+        ),
+    )
+    p.add_argument(
+        "--wrist-roll-clamp",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "pose lane で手首 roll を運営 IK の古い上限 (±0.9) に寄せるか。on (既定) はどの版の"
+            " 運営 IK にも安全。off は URDF の範囲だけ (運営 IK の a1af470 = interface package"
+            " 609f61d 以降で上限が無くなった。学習データは 0.9 を超える手首 roll を使う)。"
+            " 接続テストで PC2 の版を見て決める"
+        ),
+    )
+    p.add_argument(
         "--boundary-port",
         type=int,
         default=5556,
@@ -1767,6 +1808,29 @@ BOUNDARY_JOINT_WAIST_NOTE = (
     "adapter holds the waist at its measured angle; arm joint angles are sent "
     "as commanded (no FK, no organizer IK)"
 )
+
+
+def _gate_arrival_check(target_arm, task_space_checker, tolerance_rad: float):
+    """policy 開始の gate が「開始姿勢に届いたか」を見る関数を作る。
+
+    ``task_space_checker`` は `_boundary_convergence_checker` の返り値 (pose lane は手先で比べる
+    関数、sdk・joint lane は None)。None なら関節角で比べる (準備動作の許容と同じ)。
+    """
+    import numpy as np
+
+    from inference.desktop.lower_policy.initial_pose import ARM_JOINT_ORDER
+    from inference.desktop.lower_policy.skills.operator_gate import joint_space_arrival
+
+    target = np.asarray(target_arm, dtype=np.float64).reshape(-1).copy()
+
+    def _check(measured_arm):
+        if task_space_checker is not None:
+            # 速さは gate では見ない (腕は保持中)。位置と向きだけ
+            ok, detail = task_space_checker(target, measured_arm, np.zeros(14))
+            return bool(ok), detail
+        return joint_space_arrival(measured_arm, target, tolerance_rad, ARM_JOINT_ORDER)
+
+    return _check
 
 
 def _boundary_taskspace_arrival(args: argparse.Namespace) -> bool:
@@ -2545,6 +2609,13 @@ def main() -> None:
                 measured_convergence_checker=_boundary_convergence_checker(
                     STAGE_HEAD_SKILL[0]
                 ),
+                latch_check=_walk_latch_check(skill_cfg_raw, args.walk_lowering_check),
+            )
+            print(
+                "[init] walk latch check = "
+                f"{_walk_latch_check(skill_cfg_raw, args.walk_lowering_check)} "
+                f"({'cli' if args.walk_lowering_check else 'skill_config.yaml'})",
+                file=sys.stderr,
             )
             skill_registry["post_walk_settle"] = PostWalkArmSettleSkill(
                 actuator,
@@ -2700,9 +2771,21 @@ def main() -> None:
                 _insert_policy_start_gate_transition(
                     phase_transitions, first_policy=first_policy
                 )
+            # 問いを出す時点で開始姿勢に届いたかを、準備動作と同じ判定で見る (pose lane は
+            # 手先、sdk・joint lane は関節角)。準備動作が時間切れで進んだときに「届いた」と
+            # 出さないため (GB10 の Stage 5 で見つけた、2026-09-25)。
             skill_registry[gate_name] = OperatorConfirmationHoldSkill(
                 name=gate_name,
                 next_skill_name=first_policy,
+                arrival_check=_gate_arrival_check(
+                    _effective_initial_pose(first_policy).arm_position_rad,
+                    _boundary_convergence_checker(first_policy),
+                    float(
+                        (skill_cfg_raw.get("arm_pre_motion") or {}).get(
+                            "measured_tolerance_rad", 0.10
+                        )
+                    ),
+                ),
             )
             print(
                 f"[init] Stage {policy_start_gate_stage} policy-start gate: "
@@ -2909,6 +2992,7 @@ def main() -> None:
             # FK は渡さない = 運営 IK と同じ運動学 (ORGANIZER_IK_URDF_PATH、Issue #164)。
             _boundary_sink = BoundaryActionSink(
                 lane=args.boundary_lane,
+                clamp_wrist_roll=args.wrist_roll_clamp == "on",
                 port=args.boundary_port,
                 host=args.boundary_host,
                 log_fn=_log_boundary_taskspace,

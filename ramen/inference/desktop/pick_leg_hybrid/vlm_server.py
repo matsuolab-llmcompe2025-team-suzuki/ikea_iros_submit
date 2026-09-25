@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -203,12 +204,21 @@ class VenueVlmServer:
         return "\n".join(lines[-_LOG_TAIL_LINES:])
 
 
-def warm_up_vlm(cfg: PickLegHybridConfig, images_b64: Sequence[str]) -> float:
+def warm_up_vlm(
+    cfg: PickLegHybridConfig,
+    images_b64: Sequence[str],
+    *,
+    progress_interval_s: float = 10.0,
+) -> float:
     """本番と同じ形の問い合わせを 1 回、時間制限なしで送る。答えは見ない。
+
+    待っている間は ``progress_interval_s`` ごとに経過を出す (時間制限が無いので、詰まったときに
+    操作者が「待つか止めるか」を決められるように。読み込みの待ちと同じ)。
 
     Args:
         cfg: hybrid の設定 (endpoint・model・出力の長さ・システム指示)。
         images_b64: 本番と同じ枚数の画像 (``build_vlm_self_check_images``)。
+        progress_interval_s: 経過を出す間隔 [s]。
 
     Returns:
         かかった秒数。
@@ -239,6 +249,19 @@ def warm_up_vlm(cfg: PickLegHybridConfig, images_b64: Sequence[str]) -> float:
         file=sys.stderr,
     )
     started = time.monotonic()
+    done = threading.Event()
+
+    def _report_progress() -> None:
+        while not done.wait(progress_interval_s):
+            print(
+                f"[vlm] warm-up still running... {time.monotonic() - started:.0f}s "
+                "(no time limit; Ctrl-C stops the run)",
+                file=sys.stderr,
+            )
+
+    threading.Thread(
+        target=_report_progress, name="vlm-warm-up-progress", daemon=True
+    ).start()
     try:
         with urllib.request.urlopen(request, timeout=None) as response:
             response.read()
@@ -249,6 +272,8 @@ def warm_up_vlm(cfg: PickLegHybridConfig, images_b64: Sequence[str]) -> float:
         raise RuntimeError(
             f"VLM warm-up request failed at {cfg.vlm.endpoint}: {exc} {detail}".rstrip()
         ) from exc
+    finally:
+        done.set()
     elapsed = time.monotonic() - started
     print(f"[vlm] warm-up done in {elapsed:.1f}s", file=sys.stderr)
     return elapsed
