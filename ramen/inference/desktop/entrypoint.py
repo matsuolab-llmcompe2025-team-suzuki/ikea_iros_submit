@@ -563,6 +563,11 @@ def resolve_production_pick_mode(args: argparse.Namespace) -> bool:
 def _validate_phase3_config(args: argparse.Namespace) -> None:
     """Reject unsafe or resource-wasting Phase 3 CLI combinations."""
 
+    if (
+        getattr(args, "boundary_lane", "pose") != "pose"
+        and getattr(args, "action_sink", "sdk") != "boundary"
+    ):
+        raise ValueError("--boundary-lane joint requires --action-sink boundary")
     if getattr(args, "action_sink", "sdk") == "boundary":
         # boundary は腕・手を (T,25) で運営 WBC に渡す (腰は実測値のまま)。SDK 直の
         # 実 actuator を併用すると同じ関節を二重に動かす。
@@ -1332,6 +1337,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--boundary-lane",
+        choices=("pose", "joint"),
+        default="pose",
+        help=(
+            "--action-sink boundary の送り方。pose (既定) = (T,25) の手先の姿勢 (運営 IK が"
+            " 関節角に戻す)。joint = (T,22) の腕の関節角をそのまま (運営が 2026-09-25 に追加した"
+            " joint lane、運営 IK を通らない。PC2 の adapter が joint lane 入りの版であること)。"
+            " joint のとき「腕が着いたか」は関節角で比べる"
+        ),
+    )
+    p.add_argument(
         "--boundary-port",
         type=int,
         default=5556,
@@ -1745,6 +1761,24 @@ BOUNDARY_WAIST_NOTE = (
     "IK holds the waist at the measured angle, so policy waist commands are not "
     "executed on this lane; EE targets are FK(measured waist, commanded arms)"
 )
+#: joint lane の腰の扱い (運営 CONTRACT "The joint lane": 胴の列は無い)。
+BOUNDARY_JOINT_WAIST_NOTE = (
+    "waist = measured: the joint lane has no torso column and the organizer's "
+    "adapter holds the waist at its measured angle; arm joint angles are sent "
+    "as commanded (no FK, no organizer IK)"
+)
+
+
+def _boundary_taskspace_arrival(args: argparse.Namespace) -> bool:
+    """会場で「腕が着いたか」を手先の姿勢で比べるか。
+
+    pose lane では運営 IK が 7 自由度の余りを選ぶので関節角は一致しない → 手先で比べる。
+    joint lane は送った関節角がそのまま目標なので、関節角で比べる (運営の到達の目安も関節角)。
+    """
+    return (
+        getattr(args, "action_sink", "sdk") == "boundary"
+        and getattr(args, "boundary_lane", "pose") == "pose"
+    )
 
 #: Dex1 を持つ Stage (Stage 0 は歩行と最初の pick 姿勢だけで手を持たない)。
 HAND_OWNING_STAGES = frozenset({1, 2, 3, 4, 5})
@@ -2116,7 +2150,8 @@ def main() -> None:
         """
 
         nonlocal _organizer_fk
-        if args.action_sink != "boundary":
+        if not _boundary_taskspace_arrival(args):
+            # sdk 経路と joint lane は関節角で比べる (既定の判定、許容は skill_config)
             return None
         if _organizer_fk is None:
             from inference.desktop.perception.g1_urdf_fk import (
@@ -2379,7 +2414,7 @@ def main() -> None:
                 "phase3_executor": args.pick_leg_phase3_executor,
                 "next_initial_arm_target": insert_initial.arm_position_rad,
                 "next_initial_hand_target": insert_initial.dex1_target_rad,
-                "boundary_taskspace_arrival": args.action_sink == "boundary",
+                "boundary_taskspace_arrival": _boundary_taskspace_arrival(args),
             }
             print(
                 "[hybrid] Stage 1-4 pick_table_leg replaced with "
@@ -2873,6 +2908,7 @@ def main() -> None:
 
             # FK は渡さない = 運営 IK と同じ運動学 (ORGANIZER_IK_URDF_PATH、Issue #164)。
             _boundary_sink = BoundaryActionSink(
+                lane=args.boundary_lane,
                 port=args.boundary_port,
                 host=args.boundary_host,
                 log_fn=_log_boundary_taskspace,
@@ -2890,7 +2926,15 @@ def main() -> None:
                 file=sys.stderr,
             )
             _boundary_hand = _build_hand_actuator()
-            print(f"[boundary] {BOUNDARY_WAIST_NOTE}", file=sys.stderr)
+            print(
+                "[boundary] "
+                + (
+                    BOUNDARY_JOINT_WAIST_NOTE
+                    if args.boundary_lane == "joint"
+                    else BOUNDARY_WAIST_NOTE
+                ),
+                file=sys.stderr,
+            )
 
             def _send_to_boundary(arms14) -> bool:
                 """1 row を publish する。publish したら True。"""

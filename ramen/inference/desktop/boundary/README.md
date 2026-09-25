@@ -11,11 +11,12 @@
 | | |
 |---|---|
 | upstream | `https://github.com/iacevaltest/iros_g1_orin_package`（運営公式 interface package） |
-| revision | `47f4e1b9e6abcd05226b6ae1a92774c4e0dd6880` |
-| vendor 日 | 2026-09-23 |
-| ファイル | `__init__.py` / `actions.py` / `cameras.py` / `states.py`（4 ファイル・643 行、bit 単位で一致） |
+| revision | `609f61d1224a1e952eb5f265664bf491b1b1f77b`（`boundary/` は joint lane を足した 27fd499 から不変） |
+| vendor 日 | 2026-09-25（前回 2026-09-23 の 47f4e1b からの差分は `JointSink` ほか joint lane の追加だけ） |
+| ファイル | `__init__.py` / `actions.py` / `cameras.py` / `states.py`（4 ファイル・888 行、bit 単位で一致） |
 
-提出リポジトリ側も同じものを upstream から vendor している（`VENDOR_NOTES.md` 参照）。
+提出リポジトリ（`ikea_iros_submit`）の `boundary/` も同じ upstream から `tools/update_organizer.sh` で
+取り込む（出所は `ORGANIZER_SOURCE.txt`）。`tools/sync_ramen.sh` は両者が一致しないとコピーを止める。
 **両経路が同一の契約実装を通る**ようにするため、こちらにも同じ形で置く。
 
 ## なぜ必要か
@@ -33,7 +34,8 @@
 
 | | 使うか | 理由 |
 |---|---|---|
-| **`ActionSink` / `DecoupledSink`** | ✅ **使う** | `(T,25)` の出口。これが目的 |
+| **`ActionSink` / `DecoupledSink`** | ✅ **使う** | `(T,25)` の出口（pose lane、会場の既定） |
+| `JointSink` | 追加（2026-09-25） | `(T,22)` 関節角の出口（joint lane。運営 IK を通らない）。使い方は本体の送り口で決める |
 | `CameraStream` | ❌ 使わない | JPEG を decode して **RGB に flip** する。我々は BGR のまま扱う必要があるため `perception/frame_source.py:ZmqFrameSource` を使う（同じ `:5555` を読むが、再 flip を避ける） |
 | `StateStream` | ✅ 会場で使う | 公式契約は `:5557` を唯一のstate入口とする。labのSDK経路だけ`rt/lowstate`を使う |
 

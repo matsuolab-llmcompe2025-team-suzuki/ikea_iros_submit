@@ -24,6 +24,14 @@ publish 側 (bind / 検証 / フレーミング) は **運営の実装をその�
 自前で持つのは **19-D → 38-D の組み立てだけ**で、そこから先の 38-D → (T,25) は
 既存の `taskspace_adapter.groot_chunk_to_taskspace()` を通す。
 
+# 2 つの lane (`lane`、起動の `--boundary-lane`)
+
+- `pose` (既定): (T,25) の手先の姿勢。腕の関節角を FK で手先にし、運営 IK が関節角に戻す。
+- `joint` (運営が 2026-09-25 に追加): (T,22) の腕の関節角をそのまま `JointSink` で送る。
+  運営 IK を通らない (運営 RUNBOOK: 関節角で学習した policy はこちらが忠実)。手と骨盤高さの列は
+  pose と同じ変換 (`dex1_model_to_taskspace` / `check_base_height`) で作る。胴の列は無い
+  (どちらの lane でも運営は腰を実測で保持する)。位置の範囲 (URDF) と速さの制限は運営 adapter が掛ける。
+
 # 注意
 
 - **`:5556` は client が bind する側。** 運営の adapter がこちらへ dial-in する
@@ -43,6 +51,10 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 
 from inference.desktop.lower_policy.policies.taskspace_adapter import (
+    DEFAULT_BASE_HEIGHT_M,
+    GROOT_ACTION_DIM,
+    check_base_height,
+    dex1_model_to_taskspace,
     groot_chunk_to_taskspace,
 )
 from inference.desktop.lower_policy.skills.vla_skill import (
@@ -56,6 +68,9 @@ from inference.desktop.lower_policy.skills.vla_skill import (
 # 上書きするが、脚は policy が出さないので **実測値をそのまま使う**。
 LEG_DOF = 12
 BODY_DOF = 29
+
+#: 会場の boundary で使える lane (`BoundaryActionSink(lane=...)` / `--boundary-lane`)
+BOUNDARY_LANES = ("pose", "joint")
 
 # EE の計算に使う腰角を更新する閾値 [rad] (Issue #164)。
 #
@@ -342,15 +357,47 @@ def assemble_action19(
     return np.concatenate([waist, arms, hand])
 
 
+def action38_to_joint_row(
+    action_38: Sequence[float],
+    *,
+    navigate_cmd: Sequence[float] = (0.0, 0.0, 0.0),
+    base_height_cmd: float = DEFAULT_BASE_HEIGHT_M,
+) -> np.ndarray:
+    """38-D action 1 row → joint lane の (22,) row (運営 `JointSink.make_rows` で並べる)。
+
+    腕は body[15:29] (左 7 + 右 7、Unitree 順 = :5557 の body_q と同じ) をそのまま。手と骨盤高さは
+    (T,25) と同じ変換を通すので、どちらの lane でも同じ値が届く。`make_rows` は高さを省くと 0 m
+    (骨盤を床へ) にするので、必ず渡す。
+    """
+    from inference.desktop.boundary import JointSink
+
+    a = np.asarray(action_38, dtype=np.float64).reshape(-1)
+    if a.shape != (GROOT_ACTION_DIM,):
+        raise ValueError(f"action must be ({GROOT_ACTION_DIM},), got {a.shape}")
+    body29 = a[7:36]
+    left_hand = dex1_model_to_taskspace(float(a[36]))
+    right_hand = dex1_model_to_taskspace(float(a[37]))
+    rows = JointSink.make_rows(
+        left_arm=body29[15:22],
+        right_arm=body29[22:29],
+        left_hand=[left_hand, left_hand],  # 2 指に同値 ((T,25) と同じ)
+        right_hand=[right_hand, right_hand],
+        navigate=np.asarray(navigate_cmd, dtype=np.float64).reshape(1, 3),
+        base_height=[check_base_height(base_height_cmd)],
+    )
+    return rows[0]
+
+
 class BoundaryActionSink:
-    """19-D action を (T,25) にして運営 boundary へ publish する。
+    """19-D action を (T,25) (pose lane) か (T,22) (joint lane) にして運営 boundary へ publish する。
 
     `rt/arm_sdk` 直の actuator と**同時には使わない**。両方が同じ関節を動かすため。
 
     Args:
         fk: `G1WristFK` 相当 (`compute_ee_transforms` を持つもの)。省略時は運営 IK と
             同じ運動学 (`ORGANIZER_IK_URDF_PATH`) で作る。会場では省略すること
-            (学習用の mode_15 URDF を渡すと手首が約 5 mm ずれる、Issue #164)。
+            (学習用の mode_15 URDF を渡すと手首が約 5 mm ずれる、Issue #164)。joint lane では使わない。
+        lane: `"pose"` (既定、`DecoupledSink`) か `"joint"` (`JointSink`)。module の docstring。
         port / host: `DecoupledSink` にそのまま渡す。
         ee_frame_transform: root-link → 運営 IK が期待する frame の 4x4。未確定なので
             既定 `None` (変換なし)。
@@ -367,43 +414,55 @@ class BoundaryActionSink:
         self,
         fk: Any = None,
         *,
+        lane: str = "pose",
         port: int = 5556,
         host: str = "*",
         ee_frame_transform: Optional[np.ndarray] = None,
         log_fn: Any = None,
         sender_clock_offset_fn: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
-        if fk is None:
-            from inference.desktop.perception.g1_urdf_fk import (
-                ORGANIZER_IK_URDF_PATH,
-                G1WristFK,
-            )
+        if lane not in BOUNDARY_LANES:
+            raise ValueError(f"lane must be one of {BOUNDARY_LANES}, got {lane!r}")
+        if lane == "pose":
+            if fk is None:
+                from inference.desktop.perception.g1_urdf_fk import (
+                    ORGANIZER_IK_URDF_PATH,
+                    G1WristFK,
+                )
 
-            fk = G1WristFK.from_urdf(ORGANIZER_IK_URDF_PATH)
-        if not callable(getattr(fk, "compute_ee_transforms", None)):
-            raise ValueError(
-                "official decoupled boundary requires the G1 URDF wrist FK; "
-                "refusing to publish zero/undefined end-effector poses"
-            )
+                fk = G1WristFK.from_urdf(ORGANIZER_IK_URDF_PATH)
+            if not callable(getattr(fk, "compute_ee_transforms", None)):
+                raise ValueError(
+                    "official decoupled boundary requires the G1 URDF wrist FK; "
+                    "refusing to publish zero/undefined end-effector poses"
+                )
         # boundary は zmq / cv2 / msgpack を引くので lazy import
-        # (default env から本 module を import しても壊さない)。
-        from inference.desktop.boundary import DecoupledSink
+        # (default env から本 module を import しても壊さない)。lane で使う方だけ。
+        if lane == "pose":
+            from inference.desktop.boundary import DecoupledSink as sink_class
+        else:
+            from inference.desktop.boundary import JointSink as sink_class
 
-        self._fk = fk
+        self._lane = lane
+        self._fk = fk if lane == "pose" else None
         self._ee_frame_transform = ee_frame_transform
         self._log_fn = log_fn
         self._sender_clock_offset_fn = sender_clock_offset_fn
-        self._sink = DecoupledSink(port=port, host=host)
+        self._sink = sink_class(port=port, host=host)
         self._sent = 0
         # EE の計算に使っている腰角 (EE_WAIST_REFRESH_RAD 以上動いたときだけ更新)。
         self._ee_waist: Optional[np.ndarray] = None
         # 運営 IK の可動域へ寄せた回数 (clamp_arms_to_organizer_ik)。
         self._clamped = 0
         print(
-            f"[boundary] DecoupledSink bound on {host}:{port} "
+            f"[boundary] {type(self._sink).__name__} ({lane} lane) bound on {host}:{port} "
             "(the organizer's adapter dials in to this)",
             file=sys.stderr,
         )
+
+    @property
+    def lane(self) -> str:
+        return self._lane
 
     @property
     def sent_count(self) -> int:
@@ -416,8 +475,54 @@ class BoundaryActionSink:
         *,
         navigate_cmd: Sequence[float] = (0.0, 0.0, 0.0),
     ) -> None:
-        """1 tick 分の 19-D action を (1,25) chunk として publish する。"""
+        """1 tick 分の 19-D action を (1,25) (pose) か (1,22) (joint) chunk として publish する。"""
 
+        navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
+        if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
+            raise ValueError("navigate_cmd must be finite 3-D")
+        if self._lane == "joint":
+            chunk, record = self._joint_chunk(action19, body_q29, navigation)
+        else:
+            chunk, record = self._pose_chunk(action19, body_q29, navigation)
+        # 送信時刻を運営 adapter の時計 (PC2) に揃える。推定がまだ無ければ
+        # sink の既定 (この host の time.time()) のまま。
+        offset = (
+            None
+            if self._sender_clock_offset_fn is None
+            else self._sender_clock_offset_fn()
+        )
+        issued_at = None if offset is None else time.time() + float(offset)
+        # 検証は sink.send_chunk が中でやる (不正なら ActionError)。
+        if issued_at is None:
+            self._sink.send_chunk(chunk)
+        else:
+            self._sink.send_chunk(chunk, issued_at=issued_at)
+        self._sent += 1
+        if self._log_fn is not None:
+            self._log_fn(
+                {
+                    "seq": self._sent,
+                    **record,
+                    # None = この host の時計で付けた (送信側の時計の差がまだ無い)。
+                    "issued_at": issued_at,
+                    "sender_clock_offset_s": offset,
+                    # 逆算用: この tick で読めた実測関節角。静止保持中の後半を使えば
+                    # 「指令した EE」と「到達した関節を自前 FK に通した EE」の差 =
+                    # 運営 IK が期待する frame とのオフセットが解ける (EE 原点が
+                    # どの資料にも無いため、実測から求めるしかない)。
+                    "measured_body_q29": np.asarray(
+                        body_q29, dtype=np.float64
+                    ).tolist(),
+                }
+            )
+
+    def _pose_chunk(
+        self,
+        action19: Sequence[float],
+        body_q29: Sequence[float],
+        navigation: np.ndarray,
+    ) -> tuple[np.ndarray, dict]:
+        """pose lane: (1,25) の手先の姿勢の chunk と、log に足す項目。"""
         action19 = self._stabilize_waist(action19)
         # 運営 IK が解ける範囲へ。外れた関節があると運営 adapter がその腕を丸ごと止める。
         arms, clamped_mask = clamp_arms_to_organizer_ik(action19[ARMS_SLICE])
@@ -428,9 +533,6 @@ class BoundaryActionSink:
         chunk = groot_chunk_to_taskspace(
             action38[None, :], self._fk, ee_frame_transform=self._ee_frame_transform
         )
-        navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
-        if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
-            raise ValueError("navigate_cmd must be finite 3-D")
         chunk[:, 18:21] = navigation
         # action19 stores the three serial G1 waist joints (yaw->roll->pitch),
         # while the organizer contract wants the resulting torso orientation
@@ -441,46 +543,40 @@ class BoundaryActionSink:
         # EE_WAIST_REFRESH_RAD of the measurement (_stabilize_waist).
         waist_yaw_roll_pitch = np.asarray(action19, dtype=np.float64)[:3]
         chunk[:, 22:25] = waist_joints_to_torso_rpy(waist_yaw_roll_pitch)
-        # 送信時刻を運営 adapter の時計 (PC2) に揃える。推定がまだ無ければ
-        # DecoupledSink の既定 (この host の time.time()) のまま。
-        offset = (
-            None
-            if self._sender_clock_offset_fn is None
-            else self._sender_clock_offset_fn()
+        row = np.asarray(chunk[0], dtype=np.float64)
+        return chunk, {
+            "event": "boundary_taskspace",
+            # hand 列は「掴んだか」の一次証拠。-1=open / +1=closed。
+            "left_hand": row[0:2].tolist(),
+            "right_hand": row[2:4].tolist(),
+            "left_ee_pos": row[4:7].tolist(),
+            "right_ee_pos": row[11:14].tolist(),
+            "taskspace_25": row.tolist(),
+            # 運営 IK の可動域へ寄せた腕の関節 (腕 14-D の index)。空なら無し。
+            "organizer_ik_clamped_joints": np.flatnonzero(clamped_mask).tolist(),
+        }
+
+    def _joint_chunk(
+        self,
+        action19: Sequence[float],
+        body_q29: Sequence[float],
+        navigation: np.ndarray,
+    ) -> tuple[np.ndarray, dict]:
+        """joint lane: (1,22) の腕の関節角の chunk と、log に足す項目。
+
+        FK・運営 IK 用の clamp・腰角の据え置きは要らない (どれも運営 IK のため)。
+        """
+        action38 = assemble_action38(
+            np.asarray(action19, dtype=np.float64).reshape(-1).copy(), body_q29
         )
-        issued_at = None if offset is None else time.time() + float(offset)
-        # 検証は DecoupledSink.send_chunk が中でやる (不正なら ActionError)。
-        if issued_at is None:
-            self._sink.send_chunk(chunk)
-        else:
-            self._sink.send_chunk(chunk, issued_at=issued_at)
-        self._sent += 1
-        if self._log_fn is not None:
-            row = np.asarray(chunk[0], dtype=np.float64)
-            self._log_fn(
-                {
-                    "event": "boundary_taskspace",
-                    "seq": self._sent,
-                    # hand 列は「掴んだか」の一次証拠。-1=open / +1=closed。
-                    "left_hand": row[0:2].tolist(),
-                    "right_hand": row[2:4].tolist(),
-                    "left_ee_pos": row[4:7].tolist(),
-                    "right_ee_pos": row[11:14].tolist(),
-                    "taskspace_25": row.tolist(),
-                    # None = この host の時計で付けた (送信側の時計の差がまだ無い)。
-                    "issued_at": issued_at,
-                    "sender_clock_offset_s": offset,
-                    # 運営 IK の可動域へ寄せた腕の関節 (腕 14-D の index)。空なら無し。
-                    "organizer_ik_clamped_joints": np.flatnonzero(clamped_mask).tolist(),
-                    # 逆算用: この tick で読めた実測関節角。静止保持中の後半を使えば
-                    # 「指令した EE」と「到達した関節を自前 FK に通した EE」の差 =
-                    # 運営 IK が期待する frame とのオフセットが解ける (EE 原点が
-                    # どの資料にも無いため、実測から求めるしかない)。
-                    "measured_body_q29": np.asarray(
-                        body_q29, dtype=np.float64
-                    ).tolist(),
-                }
-            )
+        row = action38_to_joint_row(action38, navigate_cmd=navigation)
+        return row[None, :], {
+            "event": "boundary_joint",
+            # hand 列は「掴んだか」の一次証拠。-1=open / +1=closed。
+            "left_hand": row[0:2].tolist(),
+            "right_hand": row[2:4].tolist(),
+            "joint_22": row.tolist(),
+        }
 
     def _stabilize_waist(self, action19: Sequence[float]) -> np.ndarray:
         """腰角 [0:3] を、`EE_WAIST_REFRESH_RAD` 以上動くまで前回の値に据え置く。
