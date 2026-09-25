@@ -46,14 +46,15 @@ flowchart LR
 これらを誰が起動するかは、運営の README（"You do not run any of this"）と
 RUNBOOK（"you run the whole pipeline yourself"）で食い違っている。
 
-### この repo の中（運営の template から取り込む。手で変更しない）
+### この repo の中（運営の repo から取り込む。手で変更しない）
 
-`tools/update_organizer.sh` で運営の template から上書きする。取り込んだ commit は
-`ORGANIZER_SOURCE.txt` に残る。
+`tools/update_organizer.sh` で運営の repo から上書きする。`boundary/` は interface package
+（運営が更新するのはこちら。本体の `inference/desktop/boundary` も同じ所から取る）、残りは template から。
+取り込んだ commit は `ORGANIZER_SOURCE.txt` に残る。
 
 | path | 役割 |
 |---|---|
-| `boundary/` | 3 socket（`:5555` / `:5557` / `:5556`）の契約の実装 |
+| `boundary/` | 3 socket（`:5555` / `:5557` / `:5556`）の契約の実装（`:5556` は pose lane と joint lane） |
 | `mocks/` | ロボット無しで試すための偽 PC2（`mock_orin.py`）と偽 WBC（`mock_wbc.py`） |
 | `conformance.py` | 提出前の配線確認（提出の条件）。`components/server.py` と `components/client.py` をこの名前で起動する |
 | `requirements.txt` | template の依存 |
@@ -61,5 +62,5 @@ RUNBOOK（"you run the whole pipeline yourself"）で食い違っている。
 ### 正本
 
 - template: https://github.com/iacevaltest/ikea_iros_submit （取り込んだ commit は `ORGANIZER_SOURCE.txt`）
-- interface package: https://github.com/iacevaltest/iros_g1_orin_package @ `47f4e1b`
+- interface package: https://github.com/iacevaltest/iros_g1_orin_package （取り込んだ commit は `ORGANIZER_SOURCE.txt`）
   （`docs/CONTRACT.md`。doc とコードが食い違ったらコードが正）
