@@ -171,6 +171,9 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 - Stage 1〜5: 開始姿勢に移って保持 → `Enter 2` で policy が始まる。stage の中の model の切り替えは
   自動（腕を次の開始姿勢へ → 保持 → 次の model）。次へ進むのは model の完了か時間切れだけ（YOLO では進まない）。
+- ⚠️ `Enter 2` の問いは、開始姿勢への準備動作が時間切れで先へ進んだときも「initial arm/hand pose is reached」と出る
+  （未修正、`VERIFY.md` §6）。**押す前に、腕が開始姿勢にあるかを目で確かめる**。直前の `[orch] … timed out short of
+  its target` の行が出ていたら、届いていない。
 - Stage 0（Enter 2 無し）: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
   （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。
 - 終わると手を開き、腕を下ろして（同じ姿勢）container が終わる。

@@ -160,7 +160,7 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
-## 6. 基準値（2026-09-25 午後、image `gb10-test-8c5f4f9` = `sha256:8ec61df2…` をそのまま起動 = 本番 `20260925-rebuild2`）
+## 6. 基準値（2026-09-25 夕、image `gb10-test-5631708` = `sha256:3064ee8b…` をそのまま起動 = 本番 `20260925-rebuild3`）
 
 既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。host はスペイン（offer 41941375）。
 
@@ -168,19 +168,26 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 |---|---|
 | 4 環境の GPU | runtime torch 2.12.1 / desktop 2.11.0 / vlm 2.13.0 / pick 2.11.0、全部 cu130、`cap (12, 1)`・integrated |
 | 重み | 既定・set の全部・`--variant` の DP で 約 85 GB。`--check` は all present |
-| Stage 1（strace 無し） | 全体 271 秒。VLM の起動 200 秒、`vlm_latency` 0.84 秒。その後 model 3 つ |
-| strace 下の各 stage（既定） | Stage 0: 26 秒 / Stage 1: 486 秒 / Stage 2: 442 秒 / Stage 5: 42 秒、すべて rc=0 |
-| 候補 `all6_400k` | Stage 2: 330 秒・GPU 30.6 GB（台を回す・insert・締め付けが all6）/ Stage 5: 20 秒（flip の RAMEN-Ori と YOLO） |
-| DP（`rotate_table_base_diffusion`） | Stage 2: 483 秒・GPU 43.4 GB |
+| Stage 1（strace 無し） | 全体 263 秒。VLM の起動 194 秒、`vlm_latency` 0.81 秒。その後 model 3 つ |
+| strace 下の各 stage（既定） | Stage 0: 22 秒 / Stage 1: 478 秒 / Stage 2: 440 秒 / Stage 5: 45 秒、すべて rc=0 |
+| 候補 `all6_400k` | Stage 2: 341 秒・GPU 31.2 GB（台を回す・insert・締め付けが all6）/ Stage 5: 24 秒（flip の RAMEN-Ori と YOLO） |
+| DP（`rotate_table_base_diffusion`） | Stage 2: 483 秒・GPU 43.3 GB |
+| joint lane（`--boundary-lane joint`） | Stage 2: 430 秒・GPU 42.7 GB。`[boundary] JointSink (joint lane)` |
 | GPU の使用量の最大（既定） | Stage 1: 41.7 GB / **Stage 2: 42.7 GB（VLM と 4 model）** / Stage 5: 7.1 GB |
-| MemAvailable の最小 | Stage 2 で 47.9 GB 残る（Thor の 128 GB でも余裕） |
-| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 6〜24 GB と出る。MemAvailable（53〜70 GB）で判断しているので読み込める |
+| MemAvailable の最小 | Stage 2 で 47.8 GB 残る（Thor の 128 GB でも余裕） |
+| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 6〜20 GB と出る。MemAvailable（53〜70 GB）で判断しているので読み込める |
 | 外向き connect | **strace を付けた全 run で 0 件**（VLM `:8000`・カメラ `:5555`・状態 `:5557`・FlashInfer の閉じた `:9` と Unix socket だけ） |
-| `--actuate`（4-6） | Stage 5: rc=0（103 秒）/ Stage 0: 設計どおりの停止（67 秒）。どちらもコードの誤り 0 件 |
+| `--actuate`（4-6） | pose・joint とも Stage 5: rc=0（103〜104 秒）/ Stage 0: 設計どおりの停止（67 秒）。コードの誤り 0 件。準備動作の判定は pose が手先（`ee_pos_error`）、joint が関節角（`joint_error`） |
 | conformance | PASS |
 
-起動秒は host の disk の速さで変わる。前回（ハンガリー、`gb10-test-5fac481`）は Stage 1 が strace 無しで 194 秒
-（VLM 151 秒）、strace 下で 258 秒。GPU の使用量は同じ。費用 $0.93（instance 1 台、約 1.3 時間）。
+起動秒は host の disk の速さで変わる。同じ host の前回（`gb10-test-8c5f4f9`、本番 `20260925-rebuild2`）とほぼ同じ
+（Stage 1 素 271 秒・VLM 200 秒）。別の host（ハンガリー、`gb10-test-5fac481`）は Stage 1 素 194 秒（VLM 151 秒）。
+GPU の使用量はどれも同じ。費用 $0.99（instance 1 台、約 1.1 時間）。
+
+**見つけたが未修正（次に焼き直すときに入れる）**: Stage 1〜5 の開始姿勢への準備動作が時間切れで先へ進んでも、Enter 2 の
+問いは「initial arm/hand pose is reached and actively held」と出る（模擬の PC2 の Stage 5 で、準備動作が 15 秒で
+時間切れ → 手の姿勢 → 保持 → この問い）。進む決まり（完了か時間切れで次へ）はそのままで、問いの文言を「届いていない
+（どの関節が何 rad）」にする。会場では、Enter 2 の前に腕が開始姿勢にあるかを目でも確かめる。
 
 この確認で見つけて直したもの（1 回目、image `gb10-test-d029549`。2 回目で直った image を確認）:
 
