@@ -238,3 +238,7 @@ python conformance.py --lane decoupled
     1 run 試す。go-live 後に腕が開始姿勢へ動くか、adapter の `[stats]` に joint の受信が数えられ、clamp の log が多すぎないか。
     よければ会場の既定にする。pose のままなら、手首 roll の clamp（±0.88、本体 #164）を外すかもここで決める
     （運営 IK の手首 roll の上限は `a1af470` で無くなった。古い IK なら外すと腕が止まる）
+12. Stage 0（pose lane）で、go-live の後に `[setup] measured lowered arm pose latched` が出て歩き出すか。腕を下ろす動きは
+    手先で「着いた」と判定するが、その後の関節の範囲の検査（肘 1.00 + 0.05 など）で止まる可能性がある（運営 IK が同じ手先を
+    別の関節角で作るため。PR #167 のレビュー）。`lowering the arms before the walk failed` や `not in the lowered walk
+    envelope` で止まったら、どの関節が範囲を出たかを記録する（次の焼き直しで直す）
