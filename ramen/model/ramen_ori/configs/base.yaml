@@ -290,7 +290,11 @@ val:
   test_ratio: 0.0
   seed: 42
   val_every: 1000
-  val_max_batches: 20        # walltime 節約 (batch 数 cap)
+  # walltime 節約 (batch 数 cap)。Issue #155 §2 から、val は skill ごとに同じ batch 数だけ引く
+  # (`skill_balanced_val_positions`)。**skill 数で割り切れる値にすること** — 割り切れない分は
+  # 捨てられる (例: 6 skill で 40 → 1 skill 6 batch = 36 batch しか回らない)。
+  # 実測 1 batch 0.41s (H100、batch 32)、val 1 回 = batch 数 × 0.41s。
+  val_max_batches: 20
   # 手首の誤差 (ee_error_exec_mm) を測る先頭の行数 = 推論の execution_steps。埋め草の行は除く (Issue #141)
   ee_error_rows: 8
   val_batch_size: null       # null → training.batch_size と同じ

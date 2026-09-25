@@ -53,6 +53,16 @@ DEFAULT_URDF_PATH: str = str(
     / "g1_29dof_mode_15_with_dex1_1.urdf"
 )
 
+# 運営の IK / WBC が解く運動学 (`g1_29dof_with_hand.urdf`)。**会場で (T,25) の EE を
+# 計算するときだけ**使う (`BoundaryActionSink`)。state 入力や hybrid pick の内部は上の
+# DEFAULT_URDF_PATH のまま。腕の鎖が 4 か所違い、DEFAULT で FK した EE を渡すと運営 IK が
+# 別の関節角で同じ手首位置を作る (手首で median 4.9 mm、Issue #164)。
+# 出所と md5 は assets/organizer_ik/README.md。この module と同じ directory 基準で解決する
+# (提出物へ inference を丸ごとコピーしても壊れないように repo root を経由しない)。
+ORGANIZER_IK_URDF_PATH: str = str(
+    Path(__file__).resolve().parent / "assets/organizer_ik/g1_29dof_with_hand.urdf"
+)
+
 # 参照: g1_hw_bridge/joint_mapping.py:G1_JOINT_NAMES と一致 (SDK motor index 順)
 G1_JOINT_NAMES: tuple[str, ...] = (
     "left_hip_pitch_joint",  # 0
@@ -430,7 +440,9 @@ class G1WristFK:
         違うので、offset を共通化しないこと。
 
         呼び出し元は publish 経路のみ (`taskspace_adapter` / `boundary_sink` /
-        `solve_boundary_ee_frame`)。回転は wrist-yaw link 姿勢そのまま
+        `solve_boundary_ee_frame`)。**会場へ publish する instance は
+        `ORGANIZER_IK_URDF_PATH` から作ること** (運営 IK と同じ運動学。DEFAULT の
+        mode_15 で作ると手首が約 5 mm ずれる)。回転は wrist-yaw link 姿勢そのまま
         (matrix→quat は adapter 側で実施、gimbal lock 縮退回避)。
 
         Args:

@@ -57,6 +57,59 @@ from inference.desktop.lower_policy.skills.vla_skill import (
 LEG_DOF = 12
 BODY_DOF = 29
 
+# EE の計算に使う腰角を更新する閾値 [rad] (Issue #164)。
+#
+# 運営 IK (`wbc_adapter/ik.py` の `PinkArmIK.solve`) は、目標が前回と完全に同じ
+# (`atol=1e-9`) なら解き直さずに前回の関節解を返す。解き直すと実測から seed し直すので、
+# 7 自由度の余り (肘の向き) が 1 回ごとに少しずつ流れる (運営自身が記録した drift)。
+# 実測の腰角は止まっていても tick ごとに 1e-5〜1.5e-4 rad 揺れる (運営機の実機 capture、
+# 180 s / 7012 sample)。それをそのまま FK に入れると腕の指令が一定でも目標が毎回変わり、
+# この cache が一度も効かない。模擬の閉ループでは、歩行中の保持で肘が 1.06 → 1.25 rad
+# 流れて歩行の範囲の検査で止まった。
+#
+# 腰は会場では指令しない (運営 WBC が保持) ので、動いたときだけ追従すれば足りる。
+# 0.01 rad の遅れで手首の目標は最大 約 3 mm (腰から手首 約 0.3 m) ずれる。実機の run では
+# 180 s で腰 yaw が 0.036 rad 動いたので、1 run に数回だけ更新される。
+EE_WAIST_REFRESH_RAD = 0.01
+
+# 運営 IK が解く腕の可動域 [rad] (Issue #164)。順は腕 14-D (左 7 + 右 7、
+# shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw)。
+#
+# URDF (`assets/organizer_ik/g1_29dof_with_hand.urdf`) の limit に、運営 `ik.py` の
+# `IKSettings` が solver 側で上書きする 2 つを重ねたもの:
+#     elbow_upper_limit_override = 1.4    (URDF は 2.0944)
+#     wrist_roll_limit_override  = 0.9    (URDF は ±1.9722)
+# この外の関節角を FK した EE は、運営 IK では残差 1 mm 以内に解けないことがあり、
+# そのとき運営 adapter は **その腕の 7 関節すべて**を直前の姿勢で止める。模擬の閉ループ
+# (Stage 2) では rotate_leg_to_tighten の左手首 roll が -0.9 に張り付き、左腕の IK が
+# 25% 失敗した (教師の左 wrist_roll は -0.99 まで使う)。
+# publish の前にこの範囲へ寄せれば、その関節だけが端で止まり、残りは policy どおり動く。
+_ORGANIZER_ARM_LOWER = (
+    -3.0892, -1.5882, -2.618, -1.0472, -0.9, -1.614429558, -1.614429558,
+    -3.0892, -2.2515, -2.618, -1.0472, -0.9, -1.614429558, -1.614429558,
+)
+_ORGANIZER_ARM_UPPER = (
+    2.6704, 2.2515, 2.618, 1.4, 0.9, 1.614429558, 1.614429558,
+    2.6704, 1.5882, 2.618, 1.4, 0.9, 1.614429558, 1.614429558,
+)
+# 端ちょうどは solver の制約に当たって収束が遅くなるので、少し内側を目標にする。
+ORGANIZER_IK_LIMIT_MARGIN_RAD = 0.02
+ORGANIZER_IK_ARM_LOWER_RAD = np.asarray(_ORGANIZER_ARM_LOWER) + ORGANIZER_IK_LIMIT_MARGIN_RAD
+ORGANIZER_IK_ARM_UPPER_RAD = np.asarray(_ORGANIZER_ARM_UPPER) - ORGANIZER_IK_LIMIT_MARGIN_RAD
+
+
+def clamp_arms_to_organizer_ik(arms14: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+    """腕 14-D を運営 IK の可動域 (余裕つき) に収める。
+
+    Returns:
+        (収めた腕 14-D, 端に寄せた関節の bool mask)。
+    """
+    arms = np.asarray(arms14, dtype=np.float64).reshape(-1)
+    if arms.shape != (14,):
+        raise ValueError(f"arms14 must be (14,), got {arms.shape}")
+    clamped = np.clip(arms, ORGANIZER_IK_ARM_LOWER_RAD, ORGANIZER_IK_ARM_UPPER_RAD)
+    return clamped, clamped != arms
+
 
 def waist_joints_to_torso_rpy(waist_yaw_roll_pitch: Sequence[float]) -> np.ndarray:
     """Convert the G1 yaw->roll->pitch serial chain to standard XYZ RPY.
@@ -295,7 +348,9 @@ class BoundaryActionSink:
     `rt/arm_sdk` 直の actuator と**同時には使わない**。両方が同じ関節を動かすため。
 
     Args:
-        fk: `G1WristFK` 相当 (`compute_ee_transforms` を持つもの)。
+        fk: `G1WristFK` 相当 (`compute_ee_transforms` を持つもの)。省略時は運営 IK と
+            同じ運動学 (`ORGANIZER_IK_URDF_PATH`) で作る。会場では省略すること
+            (学習用の mode_15 URDF を渡すと手首が約 5 mm ずれる、Issue #164)。
         port / host: `DecoupledSink` にそのまま渡す。
         ee_frame_transform: root-link → 運営 IK が期待する frame の 4x4。未確定なので
             既定 `None` (変換なし)。
@@ -310,7 +365,7 @@ class BoundaryActionSink:
 
     def __init__(
         self,
-        fk: Any,
+        fk: Any = None,
         *,
         port: int = 5556,
         host: str = "*",
@@ -318,7 +373,14 @@ class BoundaryActionSink:
         log_fn: Any = None,
         sender_clock_offset_fn: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
-        if fk is None or not callable(getattr(fk, "compute_ee_transforms", None)):
+        if fk is None:
+            from inference.desktop.perception.g1_urdf_fk import (
+                ORGANIZER_IK_URDF_PATH,
+                G1WristFK,
+            )
+
+            fk = G1WristFK.from_urdf(ORGANIZER_IK_URDF_PATH)
+        if not callable(getattr(fk, "compute_ee_transforms", None)):
             raise ValueError(
                 "official decoupled boundary requires the G1 URDF wrist FK; "
                 "refusing to publish zero/undefined end-effector poses"
@@ -333,6 +395,10 @@ class BoundaryActionSink:
         self._sender_clock_offset_fn = sender_clock_offset_fn
         self._sink = DecoupledSink(port=port, host=host)
         self._sent = 0
+        # EE の計算に使っている腰角 (EE_WAIST_REFRESH_RAD 以上動いたときだけ更新)。
+        self._ee_waist: Optional[np.ndarray] = None
+        # 運営 IK の可動域へ寄せた回数 (clamp_arms_to_organizer_ik)。
+        self._clamped = 0
         print(
             f"[boundary] DecoupledSink bound on {host}:{port} "
             "(the organizer's adapter dials in to this)",
@@ -352,6 +418,12 @@ class BoundaryActionSink:
     ) -> None:
         """1 tick 分の 19-D action を (1,25) chunk として publish する。"""
 
+        action19 = self._stabilize_waist(action19)
+        # 運営 IK が解ける範囲へ。外れた関節があると運営 adapter がその腕を丸ごと止める。
+        arms, clamped_mask = clamp_arms_to_organizer_ik(action19[ARMS_SLICE])
+        action19[ARMS_SLICE] = arms
+        if clamped_mask.any():
+            self._clamped += 1
         action38 = assemble_action38(action19, body_q29)
         chunk = groot_chunk_to_taskspace(
             action38[None, :], self._fk, ee_frame_transform=self._ee_frame_transform
@@ -365,7 +437,8 @@ class BoundaryActionSink:
         # as standard XYZ RPY.  A reorder is insufficient for compound motion.
         # The entrypoint fills the waist with the *measured* angle (the
         # organizer's adapter ignores [22:25] and holds the measured waist), so
-        # these columns report the actual torso orientation.
+        # these columns report the torso orientation, held within
+        # EE_WAIST_REFRESH_RAD of the measurement (_stabilize_waist).
         waist_yaw_roll_pitch = np.asarray(action19, dtype=np.float64)[:3]
         chunk[:, 22:25] = waist_joints_to_torso_rpy(waist_yaw_roll_pitch)
         # 送信時刻を運営 adapter の時計 (PC2) に揃える。推定がまだ無ければ
@@ -397,6 +470,8 @@ class BoundaryActionSink:
                     # None = この host の時計で付けた (送信側の時計の差がまだ無い)。
                     "issued_at": issued_at,
                     "sender_clock_offset_s": offset,
+                    # 運営 IK の可動域へ寄せた腕の関節 (腕 14-D の index)。空なら無し。
+                    "organizer_ik_clamped_joints": np.flatnonzero(clamped_mask).tolist(),
                     # 逆算用: この tick で読めた実測関節角。静止保持中の後半を使えば
                     # 「指令した EE」と「到達した関節を自前 FK に通した EE」の差 =
                     # 運営 IK が期待する frame とのオフセットが解ける (EE 原点が
@@ -406,6 +481,25 @@ class BoundaryActionSink:
                     ).tolist(),
                 }
             )
+
+    def _stabilize_waist(self, action19: Sequence[float]) -> np.ndarray:
+        """腰角 [0:3] を、`EE_WAIST_REFRESH_RAD` 以上動くまで前回の値に据え置く。
+
+        腕と手の指令が同じなら publish する行が bit 単位で同じになり、運営 IK の
+        「同じ目標は解き直さない」cache が効く (`EE_WAIST_REFRESH_RAD` の説明)。
+        """
+        action = np.asarray(action19, dtype=np.float64).reshape(-1).copy()
+        waist = action[WAIST_SLICE]
+        if not np.all(np.isfinite(waist)):
+            # 検証は assemble_action38 に任せる (ここで握りつぶさない)。
+            return action
+        if (
+            self._ee_waist is None
+            or float(np.max(np.abs(waist - self._ee_waist))) > EE_WAIST_REFRESH_RAD
+        ):
+            self._ee_waist = waist.copy()
+        action[WAIST_SLICE] = self._ee_waist
+        return action
 
     def close(self) -> None:
         """冪等。"""

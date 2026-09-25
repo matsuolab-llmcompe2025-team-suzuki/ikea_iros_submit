@@ -400,6 +400,48 @@ def _cleanup_orphan_shm() -> tuple[int, int]:
     return unlinked, freed_bytes
 
 
+def skill_balanced_val_positions(
+    val_skills: np.ndarray, batch_size: int, max_batches: int
+) -> np.ndarray:
+    """val view の中から、skill ごとに同じ batch 数だけ取る位置を返す (Issue #155 §2)。
+
+    `RamenOriMultiSplitView` は sub を順に並べるだけなので、`shuffle=False` の val loader を
+    先頭 `max_batches` だけ回すと **最初の sub しか読まない** (6 skill の統合 cache では
+    rotate_table_base が 640 sample の 100% を占め、2 番目の skill は 459 batch 目から)。
+    それだと skill ごとの val が見えず、ckpt を選べない。
+
+    ここでは skill ごとに等間隔で位置を抜き、**1 batch が 1 skill で揃うように**並べる。
+    こうすると `_run_val_loop` が `batch["skill_id"]` を見るだけで skill 別の値を出せる
+    (per-sample の loss を model に足す必要がない)。位置は毎回同じなので、eval ごとに
+    引く sample が変わって val 曲線がぶれることもない。
+
+    Args:
+        val_skills: val view の各位置の skill_id (shape=(len(val_view),))。
+        batch_size: val の batch size。
+        max_batches: 全体の batch 数の上限。skill 数で割り切って 1 skill あたりの batch 数にする
+            (割り切れない分は捨てる。skill 数で割り切れる値を config に置くこと)。
+            skill 数より小さいと ValueError。
+
+    Returns:
+        val view の位置 (int64)。長さ = 1 skill あたりの batch 数 × batch_size × skill 数。
+    """
+    skills = np.unique(val_skills)
+    if int(max_batches) < len(skills):
+        # 1 skill 1 batch にも足りない。作っても _run_val_loop が max_batches で打ち切り、
+        # 後ろの skill が val から黙って抜ける
+        raise ValueError(
+            f"val_max_batches={max_batches} is smaller than the number of skills ({len(skills)})"
+        )
+    per_skill = int(max_batches) // len(skills) * int(batch_size)
+    chunks = []
+    for s in skills:
+        pos = np.flatnonzero(val_skills == s)
+        # 等間隔に間引く。val が per_skill より少ない skill は端数を繰り返さず持てる分だけ取る
+        take = min(per_skill, len(pos))
+        chunks.append(pos[np.linspace(0, len(pos) - 1, take).astype(np.int64)])
+    return np.concatenate(chunks).astype(np.int64)
+
+
 @torch.no_grad()
 def _run_val_loop(
     model: torch.nn.Module,
@@ -429,6 +471,7 @@ def _run_val_loop(
             - "motion/pred_dq_L/R/LR_dq/ptp_L/R/LR_asym" (V2、pred action から)
             - "motion/teacher_dq_L/R/LR_dq/ptp_L/R/LR_asym" (V2、teacher action から)
     """
+    from model.ramen_ori.skill_mapping import skill_id_name
     from model.ramen_ori.state_derive import STATE71_ARMS_SLICE
     from model.ramen_ori.val_metrics import compute_ee_error_mm, compute_motion_energy
 
@@ -448,6 +491,20 @@ def _run_val_loop(
             extra_sums[key] = extra_sums.get(key, 0.0) + float(v)
             extra_counts[key] = extra_counts.get(key, 0) + 1
 
+    def _batch_skill_name(batch: dict) -> str | None:
+        """batch が 1 skill で揃っていればその名前。混ざっていれば None (per-skill を出さない)。
+
+        `skill_balanced_val_positions` が batch を skill 単位で揃えるので、通常は名前が返る。
+        単一 skill の dataset や、揃え方を変えた場合に混ざっても壊れないようにしてある。
+        """
+        sid = batch.get("skill_id")
+        if sid is None:
+            return None
+        uniq = torch.unique(sid)
+        if uniq.numel() != 1:
+            return None
+        return skill_id_name(int(uniq.item()))
+
     for b, batch in enumerate(val_loader):
         if b >= max_batches:
             break
@@ -460,6 +517,15 @@ def _run_val_loop(
         total_loss += float(parts["loss"].item())
         n_batches += 1
         _accumulate("", {k: v.item() for k, v in parts.items() if k != "loss"})
+
+        # Issue #155 §2: skill 別の val。batch が 1 skill で揃っている前提で、その batch の値を
+        # その skill に足す。どの skill が崩れているかが見えないと ckpt を選べない。
+        skill_name = _batch_skill_name(batch)
+        if skill_name is not None:
+            _accumulate(f"per_skill/{skill_name}", {
+                "loss": float(parts["loss"].item()),
+                "bc": float(parts["bc"].item()),
+            })
 
         # V2: motion energy (teacher は必ず計算、pred も predict_action で計算)
         _accumulate("motion/teacher", compute_motion_energy(batch["action"]))
@@ -481,6 +547,8 @@ def _run_val_loop(
             n_rows=ee_error_rows,
         )
         _accumulate("ee_error_exec_mm", ee)
+        if skill_name is not None:
+            _accumulate(f"per_skill/{skill_name}", {"ee_error_mm": ee["avg_mm"]})
 
     if was_training:
         model.train()
@@ -706,9 +774,29 @@ def main(cfg: DictConfig) -> None:
             f"[data] split enabled: train={len(train_view)} / val={len(val_view)} / "
             f"test={len(test_view)} (episode 単位、{split_source_msg})"
         )
+        from model.ramen_ori.skill_mapping import skill_id_name
+
         val_batch_size = val_cfg.get("val_batch_size") or cfg.training.batch_size
+        # Issue #155 §2: skill ごとに同じ batch 数だけ取った固定の部分集合を val に使う。
+        # そのまま `shuffle=False` で先頭 max_batches を回すと最初の sub しか読まない。
+        val_skills = dataset.sample_skill_ids()[np.asarray(val_view.indices, dtype=np.int64)]
+        val_positions = skill_balanced_val_positions(
+            val_skills, val_batch_size, val_cfg.get("val_max_batches", 20)
+        )
+        val_source: torch.utils.data.Dataset = torch.utils.data.Subset(
+            val_view, val_positions.tolist()
+        )
+        picked = val_skills[val_positions]
+        print(
+            "[data] val subset: "
+            + ", ".join(
+                f"{skill_id_name(int(s))}={int((picked == s).sum())}"
+                for s in np.unique(picked)
+            )
+            + f" (計 {len(val_positions)} sample / batch {val_batch_size})"
+        )
         val_loader = DataLoader(
-            val_view,
+            val_source,
             batch_size=val_batch_size,
             shuffle=False,
             num_workers=cfg.training.num_workers,

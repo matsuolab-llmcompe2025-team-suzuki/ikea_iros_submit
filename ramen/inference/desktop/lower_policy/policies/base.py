@@ -246,6 +246,8 @@ class PolicyConfig:
         ckpt_filename: HF repo の中で読む ckpt のファイル名 (例 "ckpt_step_100000.pt")。
             None なら policy 実装が決める (RAMEN-Ori は最新の step)。**会場の実行時は
             ネットに繋がない**ので、使う slot は固定する (Issue #159 B3d-03)。
+            1 つの repo の途中の ckpt を slot ごとに選ぶのにも使う (Issue #155)。
+            ckpt_ref が local dir のときはその直下の file 名。
         checkpoint_subdir: HF snapshot/local directory内のmodel directory。
             Trainerが複数stepを一つのrepoへ保存した場合だけ指定する。絶対pathと
             `..` traversalは禁止し、HF downloadもこのsubdirだけに限定する。

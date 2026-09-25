@@ -67,21 +67,31 @@ default_variant_by_skill:
   # step 20k pin (checkpoints/020000)。
   flip_table: groot_flip_table_n17_2_baseline
 
-# model の組み合わせを名前で切り替える (Issue #159)。会場で焼き直さずに
-#   大会経路  -e RAMEN_VARIANT_SET=<名前>
-#   自前経路  --policy-variant-set <名前>
+# model の組み合わせを名前で切り替える (Issue #159)。会場で焼き直さずに、起動の引数
+#   ramen-venue --stage <N> --policy-variant-set <名前>     (自前経路も同じ引数)
 # で使う。書いた skill だけ default_variant_by_skill を差し替え、書いていない skill は
-# 既定のまま。skill ごとの上書き (RAMEN_VARIANT_<SKILL> / --policy-variant-<slot>) が
-# これより優先する。値は policies: の key。
+# 既定のまま。skill ごとの上書き (--policy-variant-<slot>) がこれより優先する。
+# 値は policies: の key。
 #
 # ⚠️ 切り替え先は **image に焼いた policies: の slot** に限られる。新しい ckpt
-#    (#155 の 6 skill 統合など) を使うには slot を足して焼き直すこと。
+#    を使うには slot を足して焼き直すこと。
+# ⚠️ 会場は実行時オフライン。提出物の事前取得 (tools/prefetch_weights.py) は既定と
+#    **ここにある set 全部**の重みを取る。set に無い slot へ切り替えると、重みが cache に
+#    無くて起動時に止まる。会場で使うかもしれない組み合わせはここに書いておく。
 variant_sets:
   # RAMEN-Ori が slot を持つ skill を全部 RAMEN-Ori にする。
   # insert は #144 の実機評価用 slot (c32_state_dropout、腰は出さない = 実測を保つ)。
   ramen_ori:
     rotate_table_base: rotate_table_base_ramen_ori_141_c32_state_dropout
     insert_table_leg: insert_table_leg_ramen_ori_141_c32_state_dropout
+  # 会場の候補 (Issue #161): pick 以外を #155 の 6 skill 統合 RAMEN-Ori にする。step は
+  # 仮に 400k (insert が頭打ちに達した点)。4 skill で同じ ckpt 1 本 (3.5 GB) を使う。
+  # 1 skill だけ替えるなら --policy-variant-<slot> <skill>_ramen_ori_all6_400k。
+  all6_400k:
+    rotate_table_base: rotate_table_base_ramen_ori_all6_400k
+    insert_table_leg: insert_table_leg_ramen_ori_all6_400k
+    rotate_leg_to_tighten: rotate_leg_to_tighten_ramen_ori_all6_400k
+    flip_table: flip_table_ramen_ori_all6_400k
 
 policies:
   # Issue #137: execution_steps は chunk_len (GR00T 16) より小さくすること。
@@ -690,6 +700,319 @@ policies:
     skill_id: 0                          # insert_table_leg (skill_mapping.py)
     replan_family: ramen_ori_flow_v1
     execution_steps: 8                   # GR00T の insert baseline と同値 (比較のため)
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  # ---- RAMEN-Ori 6 skill 統合学習 (Issue #155) の実機評価 slot ---- #
+  # 1 つの ckpt (c32 + state group dropout を unified_all6 で 600k まで) の途中 3 点 × 6 skill。
+  # repo には 10k ごとの ckpt が並ぶので ckpt_filename で step を選ぶ (無いと最大 step = 600k を読む)。
+  # 150k = flip / move が最良、300k = 6 skill のバランスが最良圏、400k = insert が頭打ちに達した最初の点
+  # (推論と同じ 6 step 生成の val 評価、model/ramen_ori/scripts/eval_ckpt_val.py)。
+  # 16D の ckpt (腰を出さない)。dispatch_waist: true の skill では policy が outputs_waist: False と申告して
+  # VlaSkill が腰を捨てる (Issue #144)。手順は docs/handoff/realmachine_all6_ckpt_eval.md
+  insert_table_leg_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 0                          # insert_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_leg_to_tighten_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 2                          # rotate_leg_to_tighten (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  pick_table_leg_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 3                          # pick_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_table_base_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 4                          # rotate_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  move_table_base_ramen_ori_all6_150k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_150000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 5                          # move_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  insert_table_leg_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 0                          # insert_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_leg_to_tighten_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 2                          # rotate_leg_to_tighten (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  pick_table_leg_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 3                          # pick_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_table_base_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 4                          # rotate_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  move_table_base_ramen_ori_all6_300k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_300000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 5                          # move_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  insert_table_leg_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 0                          # insert_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_leg_to_tighten_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 2                          # rotate_leg_to_tighten (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  pick_table_leg_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 3                          # pick_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  rotate_table_base_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 4                          # rotate_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  move_table_base_ramen_ori_all6_400k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546
+    ckpt_filename: ckpt_step_400000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 5                          # move_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
     temporal_lambda: -0.1
     rtc:
       enabled: false

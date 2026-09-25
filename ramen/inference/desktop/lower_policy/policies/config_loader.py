@@ -116,7 +116,7 @@ def load_default_variant_by_skill(
 
     `variant_set` を渡すと、`variant_sets.<名前>` に書いた skill だけを差し替える
     (Issue #159)。会場で model の組み合わせを 1 つの名前でまとめて切り替えるため
-    (大会経路 `RAMEN_VARIANT_SET` / 自前経路 `--policy-variant-set`)。skill ごとの
+    (会場・自前経路とも `--policy-variant-set`)。skill ごとの
     上書きはこの後に呼出側で掛かるので、そちらが優先する。未知の名前・skill・
     variant は起動時に落とす (会場で「黙って既定のまま」を避ける)。
 
@@ -344,6 +344,13 @@ def load_policy_variant(
                 f"variant {variant_name!r}: cams contains unknown CameraKey — "
                 f"{exc}"
             ) from exc
+
+    # Issue #155: ckpt_filename を読むのは RAMEN-Ori だけ。他の policy に書くと黙って無視されるので止める
+    if entry.get("ckpt_filename") is not None and policy_type != "ramen_ori":
+        raise ValueError(
+            f"variant {variant_name!r}: ckpt_filename is only read by policy_type=ramen_ori "
+            f"(got {policy_type!r}); use checkpoint_subdir for GR00T / ACT / DP"
+        )
 
     # Phase 2/4 optional fields (指定無しは PolicyConfig の default 継承)
     ctor_kwargs: dict = dict(

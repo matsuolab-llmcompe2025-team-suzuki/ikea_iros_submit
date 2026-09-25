@@ -133,6 +133,7 @@ def _resolve_checkpoint_root(ckpt_ref: str, checkpoint_subdir: str | None) -> Pa
         snapshot_root = local_root
     else:
         # lazy: env-isolated dependencies (huggingface_hub は推論 env にのみある)
+        from huggingface_hub import constants as hf_constants
         from huggingface_hub import snapshot_download
 
         repo_id, separator, revision = ckpt_ref.partition("@")
@@ -146,6 +147,11 @@ def _resolve_checkpoint_root(ckpt_ref: str, checkpoint_subdir: str | None) -> Pa
             if checkpoint_subdir is not None
             else {"ignore_patterns": ["checkpoints/**"]}
         )
+        if hf_constants.HF_HUB_OFFLINE:
+            # 会場は実行時オフライン。worker の desktop env (huggingface_hub 1.28) は commit hash
+            # 指定でも file 一覧の記録 (trees/<commit>.json) が無いとネットへ取りに行く。事前取得は
+            # runtime env (1.20.1) で行うので記録は無い。cache の snapshot だけを見る (GR00T と同じ)。
+            patterns["local_files_only"] = True
         snapshot_root = Path(
             snapshot_download(repo_id=repo_id, revision=revision or None, **patterns)
         )
@@ -219,6 +225,10 @@ class ActDiffusionModel:
         config = PreTrainedConfig.from_pretrained(checkpoint_root)
         _validate_checkpoint_config(config)
         config.device = device
+        # 学習時の設定 (ResNet18_Weights.IMAGENET1K_V1) のままだと、model を作る時点で torchvision が
+        # ImageNet の重みをネットから取りに行く (会場は実行時オフライン)。backbone も ckpt の
+        # state dict に全部入っていて strict=True で上書きされるので、初期値は使われない。
+        config.pretrained_backbone_weights = None
         if config.type == "diffusion":
             # 標準の generate_actions は現在 tick から n_action_steps (学習 8) 行しか
             # 返さない。execution_steps 8 と同じ長さでは temporal ensemble の重なりが
@@ -325,7 +335,9 @@ class _ActDiffusionWorkerClient:
             f"/tmp/iros_2026_ramen_act_diffusion_{os.getpid()}_{uuid.uuid4().hex}.sock"
         )
         command = [
-            pixi, "run", "--manifest-path", str(manifest),
+            # --as-is: 実行時に環境の install も lock の更新もしない (会場は実行時オフライン。
+            # image の build で --frozen で入れた環境をそのまま使う。GR00T の worker と同じ)
+            pixi, "run", "--as-is", "--manifest-path", str(manifest),
             "python", "-m", "inference.desktop.lower_policy.policies.act_diffusion_worker",
             "--socket", str(self._socket_path),
             "--ckpt-ref", str(cfg.ckpt_ref),

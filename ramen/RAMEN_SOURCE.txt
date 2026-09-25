@@ -1,4 +1,4 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 5fac481ed6d127c29b6b305e7ae617996ddc1d2a
-subject: #161 fix:load_groot_checkpoints_from_the_cache_when_offline
+commit: 8c5f4f9d1df51deead0ba72ecb1eb6804376be23
+subject: #161 add:all6_400k_variant_set_as_a_venue_candidate

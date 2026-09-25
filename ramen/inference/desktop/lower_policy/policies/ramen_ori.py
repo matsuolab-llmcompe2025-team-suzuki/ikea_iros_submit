@@ -1417,8 +1417,15 @@ class RamenOriPolicy:
         # rel action の場合は state_dict の buffer `_relative_arms_mean/std` を
         # 抽出して _NnModule init に渡す必要 = ckpt を model 生成前に load する。
         ckpt_ref = cfg.ckpt_ref
+        # Issue #155: slot の ckpt_filename で repo 内の途中の ckpt を選ぶ (引数が優先)
+        if ckpt_filename is None:
+            ckpt_filename = cfg.ckpt_filename
         if os.path.isfile(ckpt_ref):
             ckpt_path = ckpt_ref
+        elif os.path.isdir(ckpt_ref) and ckpt_filename is not None:
+            ckpt_path = str(Path(ckpt_ref) / ckpt_filename)
+            if not os.path.isfile(ckpt_path):
+                raise FileNotFoundError(f"{ckpt_filename} not in {ckpt_ref}")
         elif os.path.isdir(ckpt_ref):
             # local dir 内で最新 step の ckpt を picking
             step_files = sorted(
@@ -1442,9 +1449,7 @@ class RamenOriPolicy:
                     )
             else:
                 repo_id, revision = ckpt_ref, None
-            ckpt_path = resolve_hf_ckpt(
-                repo_id, revision, ckpt_filename or cfg.ckpt_filename
-            )
+            ckpt_path = resolve_hf_ckpt(repo_id, revision, ckpt_filename)
 
         import sys as _sys
 

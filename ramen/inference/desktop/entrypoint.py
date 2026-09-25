@@ -1864,6 +1864,10 @@ def main() -> None:
         args.use_real_hand = True
 
     # ---- lazy import (runtime env 以外では ImportError にせず --help を通す) ----
+    # main() の中の会場用 closure (_send_to_boundary / _measured_boundary_arms /
+    # 到達判定) が np を使う。module の先頭では import していないので、無いと
+    # `--action-sink boundary --actuate` が最初の関節読み取りで NameError になる (Issue #164)。
+    import numpy as np
     from inference.desktop.lower_policy.actuators.dex1_dds import Dex1DdsGripper
     from inference.desktop.lower_policy.actuators.g1_arm_sdk import G1ArmActuator
     from inference.desktop.lower_policy.actuators.g1_sdk import G1SDKWalkActuator
@@ -2100,15 +2104,28 @@ def main() -> None:
     # 評価経路 (evaluate/model_evaluation/runners/run_skill.py) と同じ関数を通す。
     # 手首 FK は offset ごとに 1 個だけ作って使い回す (URDF parse ~100 ms/offset、INF-9)。
     fk_factory = assembly.FkFactory()
+    # 会場の到達判定は、運営 IK が作った姿勢を運営 IK と同じ運動学で見る (Issue #164)。
+    # publish (BoundaryActionSink の既定) と同じ URDF。関節角は運営 IK が選ぶので、
+    # 学習用の mode_15 で比べると同じ手首位置でも約 5 mm の差が出る。
+    _organizer_fk: Optional[Any] = None
 
     def _boundary_convergence_checker(skill_name: str):
-        """Verify organizer IK execution in task space, not one arbitrary IK q."""
+        """Verify organizer IK execution in task space, not one arbitrary IK q.
 
+        wrist_yaw_link 原点 (tool offset なし) で比べるので ``skill_name`` に依らない。
+        """
+
+        nonlocal _organizer_fk
         if args.action_sink != "boundary":
             return None
-        fk = fk_factory.for_skill(skill_cfg_raw, skill_name)
-        if fk is None:
-            raise ValueError("boundary task-space convergence requires the G1 URDF")
+        if _organizer_fk is None:
+            from inference.desktop.perception.g1_urdf_fk import (
+                ORGANIZER_IK_URDF_PATH,
+                G1WristFK,
+            )
+
+            _organizer_fk = G1WristFK.from_urdf(ORGANIZER_IK_URDF_PATH)
+        fk = _organizer_fk
 
         def _check(goal, _measured, measured_velocity):
             if joint_state_source is None:
@@ -2854,8 +2871,8 @@ def main() -> None:
                 assemble_action19,
             )
 
+            # FK は渡さない = 運営 IK と同じ運動学 (ORGANIZER_IK_URDF_PATH、Issue #164)。
             _boundary_sink = BoundaryActionSink(
-                fk_factory.for_skill(skill_cfg_raw, initial_skill),
                 port=args.boundary_port,
                 host=args.boundary_host,
                 log_fn=_log_boundary_taskspace,

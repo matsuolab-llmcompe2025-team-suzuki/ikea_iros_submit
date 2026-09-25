@@ -1,0 +1,38 @@
+# @package _global_
+# Issue #155: 6 skill 統合学習。#144 で確定した学習手法 (c32 + state group dropout) を
+# そのまま 6 skill (unified_all6) へ広げる。
+# 起動: pixi run train --config-name=retrain/all6_state_dropout
+#
+# `c32_state_dropout` を継承するので、dropout の率・chunk 32・FK aux loss・AdamW・
+# vision freeze・memory なし・task_uniform・batch 32 は**何も書かなくても同じ**。
+# ここで変えるのは data と step 数と val の取り方だけ。
+#
+# max_steps 150,000 の根拠 (#155 本文):
+#   #141 の 7 変種はどれも val が 37k〜51k で底を打ち、100k までに bc が +64〜+122% 悪化していた
+#   (LR は cosine で 1e-5 まで落ちきっているので純粋な過学習)。過学習は step 数ではなく
+#   1 frame あたりの周回数で決まると見て換算すると、task_uniform の下で all6 @100k は
+#   β @47k (val の底) とほぼ同じ (+6%)。state_dropout で厳密に換算すると bc の底 = 102k 相当 /
+#   EE の底 = 120k 相当なので、100k では EE の底に届かない。150k 回して**走行後に val 曲線を見て
+#   ckpt を選ぶ** (ckpt は 5k ごと、HF push は 10k ごと)。足りなければ training.resume_from で
+#   延長できる (cosine は max_steps で形が決まるので、その場合 LR を指定し直すこと)。
+defaults:
+  - /retrain/c32_state_dropout
+  - override /data: unified_all6
+  - _self_
+
+training:
+  max_steps: 150000
+  ckpt_dir: /nvme/train_outputs/ramen_ori_all6_state_dropout
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout
+
+val:
+  # 6 skill で割り切れる値にすること (Issue #155 §2)。42 → 1 skill 7 batch = 224 sample。
+  # β では 640 sample 全部が rotate_table_base に当たっていたので、skill 別に見えていなかった。
+  val_max_batches: 42
+  # 1 eval のコストが 2 倍になるぶん頻度を半分にして、合計の walltime を据え置く
+  # (42 batch × 0.41s = 17.2s × 75 回 = 0.36h)。ckpt は 5k ごとなので 1 ckpt あたり 2〜3 点取れる。
+  val_every: 2000
+
+wandb:
+  run_name: ramen_ori_all6_state_dropout
