@@ -141,6 +141,21 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   `variant_sets` に書いた組み合わせは事前取得に入っている）。一覧に無い slot を指定すると、起動時に重みが無くて止まる。
 - 新しい model（学習中の insert の DP など）は、本体で slot と set を足して image を焼き直してから使う。
 
+#### 指令の送り方を切り替えるとき（joint lane、焼き直さない）
+
+`--stage N --actuate` の後ろに `--boundary-lane joint` を足すと、その run だけ腕の関節角をそのまま送る
+（運営が 2026-09-25 に足した joint lane。運営 IK を通らない）。既定は `pose`（手先の姿勢を送り、運営 IK が関節角に戻す）。
+
+| | pose（既定） | joint |
+|---|---|---|
+| 送るもの | 手先の位置と向き (T,25) | 腕の関節角 (T,22)。手・歩行・骨盤高さの列は pose と同じ値 |
+| 「腕が着いたか」 | 手先で比べる | 関節角で比べる（0.10 rad） |
+| 前提 | — | PC2 の運営 package が `609f61d` 以降（`wbc_driver.py` の `--joint-lane on` が既定）。古いと指令が無視され、go-live 待ちのまま動かない |
+
+- 起動 log の `[boundary] JointSink (joint lane) bound on …` で joint になったことが分かる（pose なら `DecoupledSink (pose lane)`）。
+- 運営はまだ実機で試していない（「組み込んでよいが、本番で頼るのはまだ」）。09-27 に試し（6 の項目 11）、使うと決めたら
+  Step 4 の `docker run` の行に `--boundary-lane joint` を入れて、それを会場の既定にする。
+
 ### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
 
 ```bash
@@ -216,3 +231,7 @@ python conformance.py --lane decoupled
 10. PC2 の `md5sum ~/g1_bridge/robot/assets/g1_urdf/g1_29dof_with_hand.urdf` が `093c36ba3284c6cce5f2b62041626b79` か
     （PC2 を読むので運営に断ってから）。publish する手先の位置は、運営 IK と同じこの URDF の運動学で計算している
     （image に同梱、本体 #164）。違えば運営 IK の運動学が変わっているので、動かす前に運営に確かめる
+11. joint lane（Step 4 の「指令の送り方を切り替えるとき」）: PC2 の package が `609f61d` 以降なら、`--boundary-lane joint` で
+    1 run 試す。go-live 後に腕が開始姿勢へ動くか、adapter の `[stats]` に joint の受信が数えられ、clamp の log が多すぎないか。
+    よければ会場の既定にする。pose のままなら、手首 roll の clamp（±0.88、本体 #164）を外すかもここで決める
+    （運営 IK の手首 roll の上限は `a1af470` で無くなった。古い IK なら外すと腕が止まる）

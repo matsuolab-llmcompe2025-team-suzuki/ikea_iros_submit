@@ -109,7 +109,8 @@ $SSH -n 'setsid nohup bash -c "for s in 0 1 2 5; do /root/run_stage.sh \$s stage
   NOSTRACE=1 /root/run_stage.sh 1 stage1_plain; \
   /root/run_stage.sh 2 stage2_all6 --policy-variant-set all6_400k; \
   /root/run_stage.sh 5 stage5_all6 --policy-variant-set all6_400k; \
-  /root/run_stage.sh 2 stage2_dp --policy-variant-rotate-table-base rotate_table_base_diffusion" \
+  /root/run_stage.sh 2 stage2_dp --policy-variant-rotate-table-base rotate_table_base_diffusion; \
+  /root/run_stage.sh 2 stage2_joint --boundary-lane joint" \
   > /dev/null 2>&1 < /dev/null &'
 $SSH 'python3 /root/summarize.py /root/runs/stage*'     # 終わったら。exit 0 = 合格
 $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/conformance.py --lane decoupled'
@@ -117,6 +118,7 @@ $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/conformance.py --
 
 strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は `stage1_plain`（strace 無し）で見る。
 起動 log の `[init] policy variants: … (set:all6_400k)` で、候補に切り替わったことを確かめる。
+joint lane（`stage2_joint`）は `[boundary] JointSink (joint lane) bound on …` が出ること。
 
 ### 4-6 `--actuate` の経路
 
@@ -131,7 +133,8 @@ strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は 
   `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
 
 ```bash
-$SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; done" \
+$SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; \
+  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\${s}_joint --boundary-lane joint; done" \
   > /dev/null 2>&1 < /dev/null &'
 $SSH 'python3 /root/summarize.py /root/runs/actuate*'   # 終わったら。exit 0 = 合格
 ```
