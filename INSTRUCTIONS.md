@@ -89,9 +89,11 @@ python <運営 package の tools>/run_wbc_with_dex1.py \
 - `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある。運営 RUNBOOK
   （2026-09-25 版）の例は `~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0`。`--interface` は `real` でも
   インターフェース名でもよい）。
-- **WBC は起動した瞬間に腕を動かす**（adapter も私たちのコードもつながる前に、肩 roll ±0.2・他 0 の姿勢へ
-  2 秒でフル剛性のまま）。**腕が台や物に届かない所で起動し**、動きが止まってから stage の位置に置く
-  （運営の連絡 2026-09-25。運営は実測から始めて保持する形に直す予定）。
+- **WBC の起動時の腕**: 運営 package が `f31952c`（2026-09-25）より古い wrapper だと、起動した瞬間に
+  （adapter も私たちのコードもつながる前に）腕を肩 roll ±0.2・他 0 の姿勢へ 2 秒・フル剛性で動かす。新しい
+  wrapper は実測の関節から始めて保持する（`--seed-from-measured` が既定。取れないと `[seed] WARNING: falling back
+  to STOCK start-up` と出て古い動きになる）。どちらでも、**腕が台や物に届かない所で起動し**、止まってから stage の
+  位置に置く。
 - 安定した保持状態になってから次へ（`ros2 topic hz /G1Env/env_state_act`）。
 
 ### Step 3 [PC2] adapter の試運転（まだ `--live` を付けない）
@@ -200,14 +202,14 @@ python conformance.py --lane decoupled
 
 1. 運営 README（「You do not run any of this」）と RUNBOOK（「you run the whole pipeline yourself」）のどちらが正か。
    manifest に PC2 用の image が無くてよいか
-2. bridge の起動 log が `head camera live at 1280x480` か。`3840x1080` のままだと頭の画像が横 3/4 に潰れる
-   （片目 1920x1080 を 640x480 へ縮めている）。**こちらでは補正しない**。運営に `reference/orin_bridge/real_orin_cameras.py`
-   の `HEAD_WIDTH = 3840` → `1280`、`HEAD_HEIGHT = 1080` → `480` を入れてもらうか、直したコピーで起動する許可をもらう
-   （学習データと自前実機はこの 1280x480 モード）。直した後の log が `head camera live at 1280x480` になることを確かめる
+2. bridge の起動 log が `head camera live at 1280x480` か（学習データと自前実機はこの 1280x480 モード）。運営は
+   2026-09-25 に直した（`9e32910`: 1280x480 で開き、それ以外なら頭の画像を出さずに ERROR）。`HEAD_ALLOW_RESIZE_FALLBACK=1`
+   が付いていると古い潰れた画（片目 1920x1080 を 640x480 へ、横 3/4）に戻るので、付いていないこと。**こちらでは補正しない**
 3. `[groot] integrated GPU: …` の MemAvailable と cudaMemGetInfo の値
 4. model・VLM の読み込み秒、`vlm_latency`、定常の周期
 5. preflight の `--require-stereo` で落ちたら外してよい（単眼に落ちる）
-6. 運営 package の HEAD が `47f4e1b` のままか
+6. PC2 の運営 package が `609f61d`（2026-09-25）以降か。これより古いと、頭の画像が潰れる（2）・WBC の起動時に腕が
+   動く（Step 2）・joint lane が無い
 7. go-live 前の揺れ / go-live から pick 開始までの時間 / 関節の到達判定（0.10 rad）/ :5557 のレート / 開 4.5 の `gripper_q`
 8. `sender clock offset` と、adapter の `[stats]` で stale が 0 か
 9. 準備動作の診断行の `speed=`（止まっているのに 0.08 を超えるなら受信時刻のゆらぎ）
