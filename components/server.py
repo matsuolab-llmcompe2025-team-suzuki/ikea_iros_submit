@@ -74,7 +74,6 @@ def main() -> int:
         BoundaryJointStateSource,
     )
     from inference.desktop.perception.frame_source import ZmqFrameSource
-    from inference.desktop.perception.g1_urdf_fk import G1WristFK
 
     stopping = False
 
@@ -92,7 +91,9 @@ def main() -> int:
         image_key="ego_view",
     )
     state = BoundaryJointStateSource(host=args.orin, port=5557)
-    sink = BoundaryActionSink(G1WristFK.from_urdf(), port=5556, host=args.action_host)
+    # FK は渡さない = 本番と同じ運営 IK の URDF で手先を計算する (学習用の mode_15 ではない。
+    # BoundaryActionSink の既定、本体 #164。PR #11 のレビュー)
+    sink = BoundaryActionSink(port=5556, host=args.action_host)
     sent = 0
     try:
         # 本番と同じく、カメラと状態が届いてから送る
