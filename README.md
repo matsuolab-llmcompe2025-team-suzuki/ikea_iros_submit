@@ -12,6 +12,7 @@ commit と同じなのかも分からなくなる）。
 | image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
 | 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
 | 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
+| 接続テスト（09-27）で試して決めること | `CONNECTION_TEST.md`（試す option はここだけに書く。大会本番は option なし） |
 | conformance の受け口 | `components/` |
 
 更新の流れ:

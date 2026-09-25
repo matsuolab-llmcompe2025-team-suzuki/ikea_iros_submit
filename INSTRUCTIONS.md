@@ -118,43 +118,15 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 
 - `-it` 必須（Enter を押すため）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
 - 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
-  （`docker/venue_entry.sh`）が付ける。打つのは `--stage N --actuate` だけ。後ろに足した option は上書きになる
-  （例: `--gpu-models 2`）。
+  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate` だけ。大会本番では option を足さない。**
+  接続テストで試す option（model・送り方・手首 roll の clamp・Stage 0 の確かめ方）は `CONNECTION_TEST.md` にまとめてあり、
+  決めた値は既定にしてから本番に使う。
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。GPU は VLM 込みで最大 42 GB。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
 - 使う model は起動 log の `[init] policy variants: insert=… (config)` で分かる（`config` = 既定、`set:…` / `cli` = 切り替え）。
 - go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
-
-#### model を切り替えるとき（焼き直さない。既定は変わらない）
-
-既定の model は image の中の `policy_config.yaml`（`default_variant_by_skill`）。`--stage N --actuate` の後ろに
-足すだけで、その run だけ切り替わる。pick は hybrid（`groot_pick_legs_v1`）のまま。
-
-| 足す option | 切り替わるもの |
-|---|---|
-| `--policy-variant-set all6_400k` | pick 以外の全部（台を回す・insert・締め付け・flip）を 6 skill 統合 RAMEN-Ori（400k）に |
-| `--policy-variant-insert insert_table_leg_ramen_ori_all6_400k` | insert だけ。他は `--policy-variant-rotate-table-base` / `--policy-variant-rotate-leg` / `--policy-variant-flip` に `<skill>_ramen_ori_all6_400k` |
-
-- 切り替え先は **`WEIGHTS.md` の一覧にある重みを使う slot だけ**（会場はネット無し。`policy_config.yaml` の
-  `variant_sets` に書いた組み合わせは事前取得に入っている）。一覧に無い slot を指定すると、起動時に重みが無くて止まる。
-- 新しい model（学習中の insert の DP など）は、本体で slot と set を足して image を焼き直してから使う。
-
-#### 指令の送り方を切り替えるとき（joint lane、焼き直さない）
-
-`--stage N --actuate` の後ろに `--boundary-lane joint` を足すと、その run だけ腕の関節角をそのまま送る
-（運営が 2026-09-25 に足した joint lane。運営 IK を通らない）。既定は `pose`（手先の姿勢を送り、運営 IK が関節角に戻す）。
-
-| | pose（既定） | joint |
-|---|---|---|
-| 送るもの | 手先の位置と向き (T,25) | 腕の関節角 (T,22)。手・歩行・骨盤高さの列は pose と同じ値 |
-| 「腕が着いたか」 | 手先で比べる | 関節角で比べる（0.10 rad） |
-| 前提 | — | PC2 の運営 package が `609f61d` 以降（`wbc_driver.py` の `--joint-lane on` が既定）。古いと指令が無視され、go-live 待ちのまま動かない |
-
-- 起動 log の `[boundary] JointSink (joint lane) bound on …` で joint になったことが分かる（pose なら `DecoupledSink (pose lane)`）。
-- 運営はまだ実機で試していない（「組み込んでよいが、本番で頼るのはまだ」）。09-27 に試し（6 の項目 11）、使うと決めたら
-  Step 4 の `docker run` の行に `--boundary-lane joint` を入れて、それを会場の既定にする。
 
 ### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
 
@@ -171,9 +143,10 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 - Stage 1〜5: 開始姿勢に移って保持 → `Enter 2` で policy が始まる。stage の中の model の切り替えは
   自動（腕を次の開始姿勢へ → 保持 → 次の model）。次へ進むのは model の完了か時間切れだけ（YOLO では進まない）。
-- ⚠️ `Enter 2` の問いは、開始姿勢への準備動作が時間切れで先へ進んだときも「initial arm/hand pose is reached」と出る
-  （未修正、`VERIFY.md` §6）。**押す前に、腕が開始姿勢にあるかを目で確かめる**。直前の `[orch] … timed out short of
-  its target` の行が出ていたら、届いていない。
+- `Enter 2` の問い: 本体 `9849a17` 以降の image は、開始姿勢に届いていなければ `[gate] WARNING: … NOT reached (…)` と出す。
+  それより前の image（本番 `20260925-rebuild3` を含む）は、準備動作が時間切れで先へ進んだときも「initial arm/hand pose is
+  reached」と出る。**どちらでも、押す前に腕が開始姿勢にあるかを目で確かめる**。直前に `[orch] … timed out short of its
+  target` の行が出ていたら、届いていない。
 - Stage 0（Enter 2 無し）: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
   （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。
 - 終わると手を開き、腕を下ろして（同じ姿勢）container が終わる。
@@ -216,29 +189,6 @@ python conformance.py --lane decoupled
 `components/server.py` は conformance 専用（本番と同じ受け口・送り口で、実測の姿勢を保つ指令を送る）。
 会場の run はこの file を通らない。`components/client.py` は conformance が起動するための置き物。
 
-## 6. 09-27 の接続テストで確かめること
+## 6. 09-27 の接続テスト
 
-1. 運営 README（「You do not run any of this」）と RUNBOOK（「you run the whole pipeline yourself」）のどちらが正か。
-   manifest に PC2 用の image が無くてよいか
-2. bridge の起動 log が `head camera live at 1280x480` か（学習データと自前実機はこの 1280x480 モード）。運営は
-   2026-09-25 に直した（`9e32910`: 1280x480 で開き、それ以外なら頭の画像を出さずに ERROR）。`HEAD_ALLOW_RESIZE_FALLBACK=1`
-   が付いていると古い潰れた画（片目 1920x1080 を 640x480 へ、横 3/4）に戻るので、付いていないこと。**こちらでは補正しない**
-3. `[groot] integrated GPU: …` の MemAvailable と cudaMemGetInfo の値
-4. model・VLM の読み込み秒、`vlm_latency`、定常の周期
-5. preflight の `--require-stereo` で落ちたら外してよい（単眼に落ちる）
-6. PC2 の運営 package が `609f61d`（2026-09-25）以降か。これより古いと、頭の画像が潰れる（2）・WBC の起動時に腕が
-   動く（Step 2）・joint lane が無い
-7. go-live 前の揺れ / go-live から pick 開始までの時間 / 関節の到達判定（0.10 rad）/ :5557 のレート / 開 4.5 の `gripper_q`
-8. `sender clock offset` と、adapter の `[stats]` で stale が 0 か
-9. 準備動作の診断行の `speed=`（止まっているのに 0.08 を超えるなら受信時刻のゆらぎ）
-10. PC2 の `md5sum ~/g1_bridge/robot/assets/g1_urdf/g1_29dof_with_hand.urdf` が `093c36ba3284c6cce5f2b62041626b79` か
-    （PC2 を読むので運営に断ってから）。publish する手先の位置は、運営 IK と同じこの URDF の運動学で計算している
-    （image に同梱、本体 #164）。違えば運営 IK の運動学が変わっているので、動かす前に運営に確かめる
-11. joint lane（Step 4 の「指令の送り方を切り替えるとき」）: PC2 の package が `609f61d` 以降なら、`--boundary-lane joint` で
-    1 run 試す。go-live 後に腕が開始姿勢へ動くか、adapter の `[stats]` に joint の受信が数えられ、clamp の log が多すぎないか。
-    よければ会場の既定にする。pose のままなら、手首 roll の clamp（±0.88、本体 #164）を外すかもここで決める
-    （運営 IK の手首 roll の上限は `a1af470` で無くなった。古い IK なら外すと腕が止まる）
-12. Stage 0（pose lane）で、go-live の後に `[setup] measured lowered arm pose latched` が出て歩き出すか。腕を下ろす動きは
-    手先で「着いた」と判定するが、その後の関節の範囲の検査（肘 1.00 + 0.05 など）で止まる可能性がある（運営 IK が同じ手先を
-    別の関節角で作るため。PR #167 のレビュー）。`lowering the arms before the walk failed` や `not in the lowered walk
-    envelope` で止まったら、どの関節が範囲を出たかを記録する（次の焼き直しで直す）
+`CONNECTION_TEST.md`（運営に確かめること、起動の各段で見る所、試す run の順番、決め方、記録の表）。

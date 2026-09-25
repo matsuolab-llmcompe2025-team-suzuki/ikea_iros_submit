@@ -186,10 +186,10 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 （Stage 1 素 271 秒・VLM 200 秒）。別の host（ハンガリー、`gb10-test-5fac481`）は Stage 1 素 194 秒（VLM 151 秒）。
 GPU の使用量はどれも同じ。費用 $0.99（instance 1 台、約 1.1 時間）。
 
-**見つけたが未修正（次に焼き直すときに入れる）**: Stage 1〜5 の開始姿勢への準備動作が時間切れで先へ進んでも、Enter 2 の
-問いは「initial arm/hand pose is reached and actively held」と出る（模擬の PC2 の Stage 5 で、準備動作が 15 秒で
-時間切れ → 手の姿勢 → 保持 → この問い）。進む決まり（完了か時間切れで次へ）はそのままで、問いの文言を「届いていない
-（どの関節が何 rad）」にする。会場では、Enter 2 の前に腕が開始姿勢にあるかを目でも確かめる。
+**見つけて本体で直した（本番 `20260925-rebuild3` には未反映、本体 `9849a17` 以降の image に入る）**: Stage 1〜5 の
+開始姿勢への準備動作が時間切れで先へ進んでも、Enter 2 の問いは「initial arm/hand pose is reached and actively held」と
+出ていた（模擬の PC2 の Stage 5 で、準備動作が 15 秒で時間切れ → 手の姿勢 → 保持 → この問い）。進む決まり（完了か
+時間切れで次へ）はそのままで、届いていなければ `[gate] WARNING: … NOT reached (…)` と出す（本体 `ed28f38`）。
 
 この確認で見つけて直したもの（1 回目、image `gb10-test-d029549`。2 回目で直った image を確認）:
 
