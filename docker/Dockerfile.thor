@@ -49,11 +49,14 @@ ENV CUDA_HOME=/usr/local/cuda \
 
 # --- 2) CycloneDDS の C ライブラリ --------------------------------------------
 # python binding の cyclonedds 0.10.2 は linux/aarch64 の wheel が無く、pixi install が
-# CYCLONEDDS_HOME を見て sdist から build する。binding と同じ版を tag で固定する
-# (releases/0.10.x の先端は 0.10.5 で、binding とずれる)。
+# CYCLONEDDS_HOME を見て sdist から build する。binding と同じ版を tag で取り、commit も確かめる
+# (releases/0.10.x の先端は 0.10.5 で、binding とずれる。tag は付け替えられうるので、
+# 他の依存と同じく commit で固定する。PR #11 のレビュー)。
 ARG CYCLONEDDS_REF=0.10.2
+ARG CYCLONEDDS_COMMIT=9995905bce6c4cf9f740d6438bbf7fcfd1c83dfd
 RUN git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
       https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cyclonedds \
+    && test "$(git -C /tmp/cyclonedds rev-parse HEAD)" = "${CYCLONEDDS_COMMIT}" \
     && cmake -S /tmp/cyclonedds -B /tmp/cyclonedds/build \
          -DCMAKE_INSTALL_PREFIX=/usr/local \
          -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DBUILD_IDLC=ON \
