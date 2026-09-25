@@ -3,11 +3,12 @@
 会場は**実行時にネットに出ない**（`HF_HUB_OFFLINE=1`）。重みは Thor の host の HF cache を
 読み取り専用で mount して読む（`INSTRUCTIONS.md` の Step 4）。1 つでも無いと、その stage は起動時に止まる。
 
-- 一覧の正本は `tools/prefetch_weights.py`（`policy_config.yaml` の既定の model・YOLO と hybrid の VLM から
-  組み立てる。model を差し替えたら script は追従し、この表と `manifest.yaml` は test で食い違いを止める）。
+- 一覧の正本は `tools/prefetch_weights.py`（`policy_config.yaml` の既定の model・`variant_sets`（会場で起動の引数だけで
+  切り替える候補）・YOLO と hybrid の VLM から組み立てる。model を差し替えたら script は追従し、この表と
+  `manifest.yaml` は test で食い違いを止める）。同じ file を使う slot は 1 行にまとまる。
 - 取るときも確かめるときも、**image の中で** script を動かす（runtime と同じ huggingface_hub で、cache の形が実行時と一致する）。
 
-## 1. 一覧（2026-09-24、合計 約 86 GB）
+## 1. 一覧（2026-09-25、合計 約 90 GB）
 
 | # | 使う所 | repo | revision | 取る範囲 | 大きさ |
 |---|---|---|---|---|---|
@@ -21,8 +22,10 @@
 | 8 | GR00T の backbone（tokenizer・前処理） | `nvidia/Cosmos-Reason2-2B` | main | 全部。**gated** | 4.9 GB |
 | 9 | YOLO（overlay） | `Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy` | `8221d0a` | `runs/m_lowaug_v11b/weights/best_20260818.pt` | 0.04 GB |
 | 10 | VLM（hybrid pick の区間 1→2、Stage 1〜4） | `Qwen/Qwen3-VL-8B-Instruct` | main | 全部 | 17.5 GB |
+| 11 | **候補** `all6_400k`（切り替えたときだけ。台を回す・insert・締め付け・flip の 4 つで同じ 1 本） | `Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout` | `17b5658` | `ckpt_step_400000.pt` だけ | 3.5 GB |
 
 - Stage 0（歩く）は学習済み model を使わない。`ramen_ori_default` は `--phase1-11-arm-only` 専用なので入れない。
+- 11 は既定では使わない（切り替え方は `INSTRUCTIONS.md` の Step 4）。set `ramen_ori` の insert は 1 と同じ file なので行は増えない。
 - 7 の revision は 4〜6 の ckpt の `config.json` の `base_model_revision`（今は 3 つとも既定の `2fc962b`）。
 - main で取るもの（2・8・10）は、実行時も main を引く（ネット無しで引くために `refs/main` も一緒に入る）。
 
@@ -42,10 +45,11 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
 
 ## 3. USB に入れる物（チェックリスト）
 
-**exFAT**（4 GB を超える file があるので FAT32 は不可）。重み 約 86 GB + image（無圧縮）。
-2026-09-24 に 250 GB の USB へ重みと `SHA256SUMS` を入れ、USB の上で `--check` が `all present` になることを確かめた。
+**exFAT**（4 GB を超える file があるので FAT32 は不可）。重み 約 90 GB + image（無圧縮）。
+2026-09-24 に 250 GB の USB へ重み（1〜10）と `SHA256SUMS` を入れ、USB の上で `--check` が `all present` になることを確かめた。
+一覧に行が増えたら、下の取るコマンドをもう一度流す（既にある file は取り直さない）→ `SHA256SUMS` を作り直す → `--check`。
 
-- [ ] **重み**（約 86 GB）。USB の上に HF cache を**直接**作る（tar は要らない）
+- [ ] **重み**（約 90 GB）。USB の上に HF cache を**直接**作る（tar は要らない）
   ```bash
   HF_HOME=<USB>/hf_cache HF_HUB_OFFLINE=0 HF_HUB_DISABLE_SYMLINKS=1 HF_XET_CHUNK_CACHE_SIZE_BYTES=0 \
     python tools/prefetch_weights.py        # HF_TOKEN は 2 と同じく環境変数で。huggingface_hub は runtime と同じ 1.20.1

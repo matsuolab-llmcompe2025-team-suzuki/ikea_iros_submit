@@ -8,9 +8,13 @@
 私たちの model は、ramen/ (本体のコピー) の本物の解決関数をネットのある状態で呼ぶ:
   RAMEN-Ori  resolve_hf_ckpt                   GR00T 53D  _resolve_groot_checkpoint_root (+ base model)
   pick       _PickLegsWorkerClient._resolve_checkpoint                YOLO  resolve_yolo_ckpt_ref
-どの model を使うかの正本は policy_config.yaml (default_variant_by_skill と yolo) と hybrid の YAML
-(vlm.model) なので、model を差し替えてもこの一覧は自動で追従する。外部の package の中で読まれる物
-(lingbot・Cosmos・VLM) は、実行時と同じく main を丸ごと取る (ネット無しで main を引くには refs/main も要る)。
+  DP         act_diffusion._resolve_checkpoint_root
+どの model を使うかの正本は policy_config.yaml (default_variant_by_skill・variant_sets・yolo) と hybrid の
+YAML (vlm.model) なので、model を差し替えてもこの一覧は自動で追従する。取るのは既定の model と、
+**variant_sets の全部の組み合わせ** (会場で起動の引数 --policy-variant-set / --policy-variant-<slot> で
+切り替える候補。ネット無しなので、切り替え先の重みも前もって要る)。同じ file を指す slot は 1 つにまとめる。
+外部の package の中で読まれる物 (lingbot・Cosmos・VLM) は、実行時と同じく main を丸ごと取る
+(ネット無しで main を引くには refs/main も要る)。
 
 # 使い方 (image の中で。runtime と同じ huggingface_hub の版・cache の形になる)
 
@@ -20,6 +24,8 @@
   確かめる (ネット無し):
     docker run --rm -v <hf_cache>:/root/.cache/huggingface:ro <image> \\
       pixi run --as-is -e runtime python /app/tools/prefetch_weights.py --check
+  set に無い slot も足す (事前の確認用。例: GB10 で DP を試す):
+    ... prefetch_weights.py [--check] --variant rotate_table_base_diffusion
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 RAMEN_ROOT = Path(__file__).resolve().parents[1] / "ramen"
 POLICY_CONFIG = RAMEN_ROOT / "inference/desktop/lower_policy/configs/policy_config.yaml"
@@ -89,30 +95,54 @@ def _groot_base_item(revision: str) -> Item:
     )
 
 
-def build_items() -> list[Item]:
+def _selected_variants(extra_variants: Sequence[str]) -> list[tuple[str, str]]:
+    """(表示名, variant) の列。既定 → variant_sets (既定と違う slot だけ) → --variant の順。"""
+    import yaml
+
+    from inference.desktop.lower_policy.policies.config_loader import (
+        list_variants,
+        load_default_variant_by_skill,
+    )
+
+    defaults = load_default_variant_by_skill(POLICY_CONFIG)
+    selected = [(f"{skill} ({variant})", variant) for skill, variant in defaults.items()]
+    raw = yaml.safe_load(POLICY_CONFIG.read_text(encoding="utf-8")) or {}
+    for set_name in raw.get("variant_sets") or {}:
+        loaded = load_default_variant_by_skill(POLICY_CONFIG, variant_set=set_name)
+        for skill, variant in loaded.items():
+            if variant != defaults.get(skill):
+                selected.append((f"{skill} ({variant}, set {set_name})", variant))
+    known = set(list_variants(POLICY_CONFIG))
+    for variant in extra_variants:
+        if variant not in known:
+            raise ValueError(f"--variant {variant!r} は policy_config.yaml の policies に無い")
+        selected.append((f"{variant} (--variant)", variant))
+    return selected
+
+
+def build_items(extra_variants: Sequence[str] = ()) -> list[Item]:
     """今の設定から、会場の Stage 0〜5 が読む重みの一覧を作る (ネットには出ない)。
 
-    GR00T の base model は ckpt の config.json で revision が決まるので、ここには入れず
-    main() が ckpt を解決した後に足す。
+    既定の model・variant_sets の全部の組み合わせ・``extra_variants`` を対象にし、同じ file を
+    指すもの (同じ repo・revision・範囲) は 1 つにまとめる。GR00T の base model は ckpt の
+    config.json で revision が決まるので、ここには入れず main() が ckpt を解決した後に足す。
     """
     if str(RAMEN_ROOT) not in sys.path:
         sys.path.insert(0, str(RAMEN_ROOT))
     import yaml
 
     from inference.desktop.lower_policy.policies.config_loader import (
-        load_default_variant_by_skill,
         load_policy_variant,
         load_yolo_settings,
     )
 
     items: list[Item] = []
     types: set[str] = set()
-    for skill, variant in load_default_variant_by_skill(POLICY_CONFIG).items():
+    for label, variant in _selected_variants(extra_variants):
         entry = load_policy_variant(POLICY_CONFIG, variant)
         cfg = entry.policy_config
         repo_id, revision = _split_ref(str(cfg.ckpt_ref))
         types.add(entry.policy_type)
-        label = f"{skill} ({variant})"
         if entry.policy_type == "ramen_ori":
             from inference.desktop.lower_policy.policies.ramen_ori import (
                 resolve_hf_ckpt,
@@ -155,10 +185,35 @@ def build_items() -> list[Item]:
 
             scope = f"{cfg.checkpoint_subdir}/ の実行時の file ({len(RUNTIME_CHECKPOINT_FILES)} 種)"
             items.append(Item(label, repo_id, revision or "main", scope, fetch))
+        elif entry.policy_type == "act_diffusion":
+            from inference.desktop.lower_policy.policies.act_diffusion import (
+                _resolve_checkpoint_root,
+            )
+
+            def fetch(ref=str(cfg.ckpt_ref), sub=cfg.checkpoint_subdir) -> Path:
+                return _resolve_checkpoint_root(ref, sub)
+
+            scope = (
+                f"{cfg.checkpoint_subdir}/ だけ"
+                if cfg.checkpoint_subdir
+                else "checkpoints/ 以外 (最終 model)"
+            )
+            items.append(Item(label, repo_id, revision or "main", scope, fetch))
         else:
             raise ValueError(
-                f"{skill}: 事前取得の方法を知らない policy_type {entry.policy_type!r}"
+                f"{label}: 事前取得の方法を知らない policy_type {entry.policy_type!r}"
             )
+        # 同じ file を指す slot (6 skill 統合の 1 本を 4 skill で使う等) は 1 つにまとめる
+        latest = items[-1]
+        for earlier in items[:-1]:
+            if (earlier.repo_id, earlier.revision, earlier.scope) == (
+                latest.repo_id,
+                latest.revision,
+                latest.scope,
+            ):
+                earlier.label += f" / {latest.label}"
+                items.pop()
+                break
 
     yolo = load_yolo_settings(POLICY_CONFIG)
     from inference.desktop.perception.yolo_obb import resolve_yolo_ckpt_ref
@@ -259,13 +314,20 @@ def main() -> int:
     parser.add_argument(
         "--check", action="store_true", help="ネット無しで、cache に全部あるかだけ見る"
     )
+    parser.add_argument(
+        "--variant",
+        action="append",
+        default=[],
+        metavar="SLOT",
+        help="既定と variant_sets に無い slot も対象にする (繰り返し可。事前の確認用)",
+    )
     args = parser.parse_args()
 
     if args.check:
         os.environ["HF_HUB_OFFLINE"] = (
             "1"  # huggingface_hub の import より前に。確認では絶対に取りに行かない
         )
-    items = build_items()
+    items = build_items(args.variant)
     from huggingface_hub import constants
 
     if not args.check:
