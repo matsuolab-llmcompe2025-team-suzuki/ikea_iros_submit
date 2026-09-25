@@ -21,9 +21,12 @@
 | Stage 0〜5 の起動（VLM・YOLO・全 model の読み込み）が**ネット無しで**通るか | Thor の disk の速さ（重みの読み込み秒は変わる） |
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
 | `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
+| 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
+| `--actuate` の経路: Enter 1 → go-live 待ち（指令の publish・実測の関節の読み取り）→ Ctrl+C の後始末 | go-live の先（模擬の PC2 は指令に従わないので go-live は成立しない） |
 | conformance | |
 
-`--actuate` を付けないので、ロボットへの指令は 1 通も出ない（起動確認だけで終わる）。
+4-6 の run 以外は `--actuate` を付けないので、指令は 1 通も出ない（起動確認だけで終わる）。4-6 の run も、
+指令の宛先（Thor が bind する `:5556`）には誰もつながっていない。
 
 ## 3. 秘密の値
 
@@ -86,9 +89,11 @@ $SSH 'bash /root/check_envs.sh'
 
 ```bash
 $SSH 'umask 077; mkdir -p ~/.cache/huggingface && cat > ~/.cache/huggingface/token' <<< "$HF_TOKEN"
-$SSH 'cd /app/ramen && HF_HUB_OFFLINE=0 pixi run --as-is -e runtime python /app/tools/prefetch_weights.py'
+# 既定と variant_sets の全部に加えて、会場の候補には入れていない rotate の DP (DP が image の中で動くかを見る)
+DP=rotate_table_base_diffusion
+$SSH "cd /app/ramen && HF_HUB_OFFLINE=0 pixi run --as-is -e runtime python /app/tools/prefetch_weights.py --variant $DP"
 $SSH 'rm -f ~/.cache/huggingface/token ~/.cache/huggingface/stored_tokens'
-$SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/tools/prefetch_weights.py --check'
+$SSH "cd /app/ramen && pixi run --as-is -e runtime python /app/tools/prefetch_weights.py --check --variant $DP"
 ```
 
 ### 4-5 各 stage を起動する
@@ -96,16 +101,39 @@ $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/tools/prefetch_we
 container では `unshare`（ネットを断った空間）が許されないので、strace で全 process の `connect()` を記録して
 外向きが 0 件かを見る。1 本ずつ裏で流す（SSH は `-n` と `setsid nohup … < /dev/null &` で切り離す）。
 
+既定（Stage 0/1/2/5）に続けて、会場の候補（`all6_400k`）と DP でも起動する。候補の stage は、切り替わる
+model が載るもの（Stage 2 = 台を回す・insert・締め付け、Stage 5 = flip。flip は GR00T と違い overlay を使うので YOLO も要る）。
+
 ```bash
 $SSH -n 'setsid nohup bash -c "for s in 0 1 2 5; do /root/run_stage.sh \$s stage\$s; done; \
-  NOSTRACE=1 /root/run_stage.sh 1 stage1_plain" > /dev/null 2>&1 < /dev/null &'
+  NOSTRACE=1 /root/run_stage.sh 1 stage1_plain; \
+  /root/run_stage.sh 2 stage2_all6 --policy-variant-set all6_400k; \
+  /root/run_stage.sh 5 stage5_all6 --policy-variant-set all6_400k; \
+  /root/run_stage.sh 2 stage2_dp --policy-variant-rotate-table-base rotate_table_base_diffusion" \
+  > /dev/null 2>&1 < /dev/null &'
 $SSH 'python3 /root/summarize.py /root/runs/stage*'     # 終わったら。exit 0 = 合格
 $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/conformance.py --lane decoupled'
 ```
 
 strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は `stage1_plain`（strace 無し）で見る。
+起動 log の `[init] policy variants: … (set:all6_400k)` で、候補に切り替わったことを確かめる。
 
-### 4-6 片付け
+### 4-6 `--actuate` の経路
+
+`ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）を
+その秒数だけ続けてから、python に Ctrl+C（SIGINT）を送る。後始末（手を開いて腕を下ろす。模擬の PC2 は従わないので
+最大 60 秒待って諦める）まで通る。外向きの接続は 4-5 で見たので strace は付けない。
+
+```bash
+$SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; done" \
+  > /dev/null 2>&1 < /dev/null &'
+$SSH 'python3 /root/summarize.py /root/runs/actuate*'   # 終わったら。exit 0 = 合格
+```
+
+2026-09-25 の本番 image（`20260925-rebuild`）は、ここで落ちる不具合（`main()` の numpy の import 漏れ、
+本体 #164）を持っていた。4-5 は `--actuate` 無しなので通っていた。
+
+### 4-7 片付け
 
 ```bash
 curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/api/v0/instances/<instance id>/
@@ -115,7 +143,10 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 
 ## 5. 合格の基準
 
-- `summarize.py` が exit 0: 全 stage が `rc=0`（`[preflight] … validation passed; NO command sent`）、**外向き connect 0 件**
+- `summarize.py` が exit 0: 全 stage が `rc=0`（`[preflight] … validation passed; NO command sent`）、**外向き connect 0 件**。
+  候補（`stage*_all6`）と DP（`stage2_dp`）も同じ
+- `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、Ctrl+C で終わり（rc 0 か 130）、log に
+  コードの誤り（`NameError` など。後始末は例外を握って `[return] failed: …` と出す）が無い
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 

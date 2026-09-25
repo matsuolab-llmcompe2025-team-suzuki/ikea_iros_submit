@@ -8,6 +8,10 @@
 - GPU の使用量の最大 (gpu.log) と MemAvailable の最小 (mem.log)
 - 外向き接続: strace の connect のうち loopback / Unix socket 以外。どの process か
   (execve したコマンド) も出す。会場は実行時にネットに出ないので、0 件が合格
+- --actuate の run (result.txt に mode=actuate、run_stage.sh の ACTUATE_HOLD): Enter 1 の問いと
+  go-live 待ち (`[go-live]`) まで進み、log にコードの誤り (NameError 等) が無く、Ctrl+C で
+  終わった (rc 0 か 130) のが合格。後始末は例外を握って `[return] failed: <例外>` と出すので、
+  rc だけでは誤りが見えない (2026-09-25 の本番 image の numpy の import 漏れがそうだった)
 """
 
 from __future__ import annotations
@@ -19,7 +23,13 @@ from pathlib import Path
 
 KEY_LINES = re.compile(
     r"server ready|warm-up done|vlm_latency|integrated GPU|deferred expert ready|"
-    r"policy ready|passed; NO command|Error|Traceback"
+    r"policy ready|passed; NO command|policy variants|Enter starts|\[go-live\]|\[return\]|"
+    r"Error|Traceback"
+)
+#: 会場のコードの誤り。後始末や判定の中で握られても log には名前が残る
+CODE_ERRORS = re.compile(
+    r"Traceback|NameError|AttributeError|TypeError|UnboundLocalError|ImportError|"
+    r"ModuleNotFoundError"
 )
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0"}
 
@@ -75,11 +85,28 @@ def connect_summary(
     return counts, external
 
 
+def actuate_problems(result: str, log: str) -> list[str]:
+    """--actuate の run の不合格の理由 (空なら合格)。"""
+    problems = []
+    if not re.search(r"\brc=(0|130)\b", result):
+        problems.append("Ctrl+C で終わっていない (rc が 0 / 130 以外)")
+    if "Enter starts" not in log:
+        problems.append("Enter 1 の問いまで進んでいない")
+    if "[go-live]" not in log:
+        problems.append("go-live 待ちまで進んでいない")
+    errors = sorted({m.group(0) for m in CODE_ERRORS.finditer(log)})
+    if errors:
+        problems.append(f"コードの誤りが log にある: {', '.join(errors)}")
+    return problems
+
+
 def main() -> int:
     failed = False
     for run_dir in map(Path, sys.argv[1:]):
-        print(f"== {run_dir.name}: {(run_dir / 'result.txt').read_text().strip()}")
-        for line in (run_dir / "run.log").read_text(errors="replace").splitlines():
+        result = (run_dir / "result.txt").read_text()
+        log = (run_dir / "run.log").read_text(errors="replace")
+        print(f"== {run_dir.name}: {result.strip()}")
+        for line in log.splitlines():
             if KEY_LINES.search(line) and "help:" not in line:
                 print(f"   {line[:170]}")
         gpu = (
@@ -102,7 +129,13 @@ def main() -> int:
             for pid, destination, command in external[:12]:
                 print(f"     pid {pid} -> {destination}  cmd: {command}")
             failed |= bool(external)
-        failed |= "rc=0" not in (run_dir / "result.txt").read_text()
+        if "mode=actuate" in result:
+            problems = actuate_problems(result, log)
+            for problem in problems:
+                print(f"   ✗ {problem}")
+            failed |= bool(problems)
+        else:
+            failed |= not re.search(r"\brc=0\b", result)
     return 1 if failed else 0
 
 

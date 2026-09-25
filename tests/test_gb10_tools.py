@@ -6,6 +6,7 @@ summarize.py は「外向き接続 0 件」の合否を出す。strace の記録
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -71,6 +72,95 @@ def test_a_failed_run_fails(tmp_path) -> None:
     run = _run_dir(tmp_path, LOOPBACK_LINES)
     (run / "result.txt").write_text("rc=1 secs=442\n")
     assert _summarize(run).returncode == 1
+
+
+def _actuate_run(tmp_path: Path, log: str, result: str = "rc=0 secs=95 mode=actuate") -> Path:
+    run = _run_dir(tmp_path, LOOPBACK_LINES)
+    (run / "result.txt").write_text(result + "\n")
+    (run / "run.log").write_text(log)
+    return run
+
+
+ACTUATE_LOG = """\
+[init] policy variants: flip=groot_flip_table_n17_2_baseline (config)
+Harness / E-stop / workspace clearance confirmed. Enter starts Phase 3 stage 5 (...); Ctrl+C cancels:
+[go-live] wait_for_go_live_flip_table: waiting for the robot to follow
+[go-live] wait_for_go_live_flip_table: still waiting (followed 0.001 / 0.020 rad)
+[return] lowering the arms before release
+"""
+
+
+def test_an_actuate_run_that_reached_go_live_and_stopped_on_ctrl_c_passes(tmp_path) -> None:
+    result = _summarize(_actuate_run(tmp_path, ACTUATE_LOG))
+    assert result.returncode == 0, result.stdout
+    assert "[go-live]" in result.stdout
+
+
+def test_an_error_swallowed_by_the_return_path_fails(tmp_path) -> None:
+    """後始末は例外を握るので rc は 0 のまま。log の例外名で落とす (本番 image の np 漏れ)。"""
+    log = ACTUATE_LOG + "[return] failed: NameError(\"name 'np' is not defined\"); releasing\n"
+    result = _summarize(_actuate_run(tmp_path, log))
+    assert result.returncode == 1
+    assert "NameError" in result.stdout
+
+
+def test_an_actuate_run_that_never_reached_go_live_fails(tmp_path) -> None:
+    log = ACTUATE_LOG.replace("[go-live]", "[preflight]")
+    result = _summarize(_actuate_run(tmp_path, log))
+    assert result.returncode == 1
+    assert "go-live 待ちまで進んでいない" in result.stdout
+
+
+FAKE_ENTRYPOINT = """\
+import sys, time
+print("[init] policy variants: flip=x (config)", file=sys.stderr, flush=True)
+input("Harness / E-stop / workspace clearance confirmed. Enter starts Phase 3 stage 5; Ctrl+C cancels: ")
+try:
+    while True:
+        print("[go-live] wait_for_go_live_x: still waiting", file=sys.stderr, flush=True)
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    print("[return] lowering the arms before release", file=sys.stderr, flush=True)
+"""
+
+
+def test_run_stage_drives_enter_and_ctrl_c_in_actuate_mode(tmp_path) -> None:
+    """ACTUATE_HOLD: Enter 1 を送り、go-live 待ちの後に python へ Ctrl+C を送って後始末まで通す。"""
+    root = tmp_path / "ramen"
+    (root / "inference" / "desktop").mkdir(parents=True)
+    (root / "inference" / "__init__.py").write_text("")
+    (root / "inference" / "desktop" / "__init__.py").write_text("")
+    (root / "inference" / "desktop" / "entrypoint.py").write_text(FAKE_ENTRYPOINT)
+    venue = tmp_path / "ramen-venue"
+    venue.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} -m inference.desktop.entrypoint "$@"\n')
+    venue.chmod(0o755)
+    env = {
+        **os.environ,
+        "RAMEN_ROOT": str(root),
+        "RUNS_DIR": str(tmp_path / "runs"),
+        "VENUE_BIN": str(venue),
+        "NO_MOCK": "1",
+        "NOSTRACE": "1",
+        "ACTUATE_HOLD": "1",
+        "ACTUATE_EXIT_TIMEOUT": "20",
+    }
+    result = subprocess.run(
+        ["bash", str(GB10 / "run_stage.sh"), "5", "stage5_actuate"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    run = tmp_path / "runs" / "stage5_actuate"
+    assert result.returncode == 0, result.stderr
+    assert (run / "result.txt").read_text().startswith("rc=0 ")
+    assert "mode=actuate" in (run / "result.txt").read_text()
+    log = (run / "run.log").read_text()
+    assert "[go-live]" in log
+    assert "[return] lowering" in log, log[-2000:]  # SIGINT が python に届いた
+    steps = (run / "steps.log").read_text()
+    assert "sending Enter 1" in steps and "SIGTERM" not in steps
+    assert _summarize(run).returncode == 0
 
 
 def test_the_shell_tools_parse() -> None:
