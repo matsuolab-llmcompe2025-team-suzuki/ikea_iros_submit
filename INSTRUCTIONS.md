@@ -206,3 +206,6 @@ python conformance.py --lane decoupled
 7. go-live 前の揺れ / go-live から pick 開始までの時間 / 関節の到達判定（0.10 rad）/ :5557 のレート / 開 4.5 の `gripper_q`
 8. `sender clock offset` と、adapter の `[stats]` で stale が 0 か
 9. 準備動作の診断行の `speed=`（止まっているのに 0.08 を超えるなら受信時刻のゆらぎ）
+10. PC2 の `md5sum ~/g1_bridge/robot/assets/g1_urdf/g1_29dof_with_hand.urdf` が `093c36ba3284c6cce5f2b62041626b79` か
+    （PC2 を読むので運営に断ってから）。publish する手先の位置は、運営 IK と同じこの URDF の運動学で計算している
+    （image に同梱、本体 #164）。違えば運営 IK の運動学が変わっているので、動かす前に運営に確かめる
