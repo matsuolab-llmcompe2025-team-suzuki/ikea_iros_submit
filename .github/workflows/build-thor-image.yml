@@ -18,14 +18,14 @@
 name: build thor image
 
 on:
-  # ⚠️ workflow_dispatch は **default branch (main) に workflow が無いと呼べない**。
-  # main には .github/workflows 自体が無く、提出まわりが全部終わるまで PR も切らない
-  # 方針なので、それまではこの branch への push で起動する。
-  # ビルド条件 (tag / push / platform) は workflow_dispatch の inputs が使えない分、
-  # `.github/ci-build-request.env` に書いて push する。main に入ったらこの push
-  # trigger と env ファイルは落とし、workflow_dispatch だけにしてよい。
+  # 2 通りで起動する:
+  #   - issue/* の branch への push: ビルド条件 (tag / push / platform) は
+  #     `.github/ci-build-request.env` に書いて push する (VERIFY.md 4-1)。branch 名を
+  #     決め打ちにすると、次の作業 branch で起動しなくなる (PR #11 のレビュー)。
+  #   - workflow_dispatch: main にあるこの workflow から inputs で呼ぶ
+  #     (`gh workflow run build-thor-image.yml --ref <branch> -f tag=… -f push=true`)。
   push:
-    branches: [issue/10-rebuild-as-inference-copy]
+    branches: ["issue/**"]
     paths:
       - .github/workflows/build-thor-image.yml
       - .github/ci-build-request.env
@@ -132,16 +132,22 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # 秘密の値は env から読む (run の文字列に直接展開しない。PR #11 のレビュー)
       - name: nvcr.io にログイン
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
-          echo '${{ secrets.NGC_API_KEY }}' \
+          printf '%s' "$NGC_API_KEY" \
             | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: ghcr.io にログイン
         if: ${{ needs.params.outputs.push == 'true' }}
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          echo '${{ secrets.GHCR_PAT }}' \
-            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          printf '%s' "$GHCR_PAT" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
       - name: ビルド (+ push)
         id: build

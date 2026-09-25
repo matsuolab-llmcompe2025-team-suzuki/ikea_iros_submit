@@ -21,7 +21,7 @@ on:
   # main に無い workflow は workflow_dispatch で呼べないので、このブランチで
   # 対象のファイルを push したときに走らせる (build-thor-image.yml と同じ事情)。
   push:
-    branches: [issue/10-rebuild-as-inference-copy]
+    branches: ["issue/**"]
     paths:
       - .github/workflows/lock-thor-pixi.yml
       - ramen/pixi.toml

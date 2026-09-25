@@ -16,7 +16,7 @@ name: check-thor-vlm
 
 on:
   push:
-    branches: [issue/10-rebuild-as-inference-copy]
+    branches: ["issue/**"]
     paths: [.github/workflows/check-thor-vlm.yml]
 
 permissions:

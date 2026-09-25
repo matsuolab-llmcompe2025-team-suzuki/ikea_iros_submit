@@ -43,8 +43,10 @@ HF token を Vast の key だと思って Vast の API に送ってしまった�
 
 ### 4-1 image を GHCR に上げる（試験用 tag）
 
-`.github/ci-build-request.env` を `TAG=gb10-test-<本体の commit>`・`PUSH=true` にして push する（CI が
-arm64 で焼いて push、20〜30 分）。本番の tag とは分ける。確認が済んだら tag を消す。
+作業 branch（`issue/*`）で `.github/ci-build-request.env` を `TAG=gb10-test-<本体の commit>`・`PUSH=true` にして
+push する（CI が arm64 で焼いて push、12〜30 分）。または main の workflow を手で呼ぶ:
+`gh workflow run build-thor-image.yml --ref <branch> -f tag=gb10-test-<commit> -f push=true`。
+本番の tag とは分ける。合格したら、焼き直さずにその版へ本番の tag を足す（試験用 tag は同じ版なので残る）。
 
 ### 4-2 GB10 を借りる
 
