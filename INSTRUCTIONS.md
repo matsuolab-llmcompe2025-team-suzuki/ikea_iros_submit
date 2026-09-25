@@ -86,7 +86,12 @@ python <運営 package の tools>/run_wbc_with_dex1.py \
 - RUNBOOK の `run_g1_control_loop.py` **ではない**。それだとグリッパ（Dex1-1）を動かすものが居ない
   （`run_wbc_with_dex1.py` は同じ引数を受ける差し替えで、グリッパの指令を同じ `rt/lowcmd` に載せる）。
 - `--dex1-max-speed 4.2`: 学習データのグリッパの速さ（運営の既定は 2.0）。
-- `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある）。
+- `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある。運営 RUNBOOK
+  （2026-09-25 版）の例は `~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0`。`--interface` は `real` でも
+  インターフェース名でもよい）。
+- **WBC は起動した瞬間に腕を動かす**（adapter も私たちのコードもつながる前に、肩 roll ±0.2・他 0 の姿勢へ
+  2 秒でフル剛性のまま）。**腕が台や物に届かない所で起動し**、動きが止まってから stage の位置に置く
+  （運営の連絡 2026-09-25。運営は実測から始めて保持する形に直す予定）。
 - 安定した保持状態になってから次へ（`ros2 topic hz /G1Env/env_state_act`）。
 
 ### Step 3 [PC2] adapter の試運転（まだ `--live` を付けない）
