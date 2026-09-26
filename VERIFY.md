@@ -112,7 +112,7 @@ $SSH -n 'setsid nohup bash -c "for s in 0 1 2 5; do /root/run_stage.sh \$s stage
   /root/run_stage.sh 2 stage2_all6 --policy-variant-set all6_400k; \
   /root/run_stage.sh 5 stage5_all6 --policy-variant-set all6_400k; \
   /root/run_stage.sh 2 stage2_dp --policy-variant-rotate-table-base rotate_table_base_diffusion; \
-  /root/run_stage.sh 2 stage2_joint --boundary-lane joint" \
+  /root/run_stage.sh 2 stage2_pose --boundary-lane pose" \
   > /dev/null 2>&1 < /dev/null &'
 $SSH 'python3 /root/summarize.py /root/runs/stage*'     # 終わったら。exit 0 = 合格
 $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/conformance.py --lane decoupled'
@@ -120,7 +120,8 @@ $SSH 'cd /app/ramen && pixi run --as-is -e runtime python /app/conformance.py --
 
 strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は `stage1_plain`（strace 無し）で見る。
 起動 log の `[init] policy variants: … (set:all6_400k)` で、候補に切り替わったことを確かめる。
-joint lane（`stage2_joint`）は `[boundary] JointSink (joint lane) bound on …` が出ること。
+既定（本体 `9965c90` 以降）は joint lane で `[boundary] JointSink (joint lane) bound on …`。pose lane（`stage2_pose`）は
+`[boundary] DecoupledSink (pose lane) bound on …` と `[boundary] wrist_roll clamp: off …` が出ること。
 
 ### 4-6 `--actuate` の経路
 
@@ -129,14 +130,20 @@ joint lane（`stage2_joint`）は `[boundary] JointSink (joint lane) bound on �
 
 模擬の PC2 の関節は指令と関係なく sin 波で動くので、go-live 待ちは「ついてきた」と成立してしまい、その先の
 準備動作（腕を動かす）は指令に従わないので時間切れになる。見るのは、そこまでに指令の経路（実測の関節の読み取り・
-運営 IK と同じ URDF での手先の誤差・publish・後始末）がコードの誤り無しに動くこと。
-- Stage 5: 開始姿勢 → Enter 2 の問いで Ctrl+C → 後始末（腕を下ろせず諦める）→ rc=0
+到達の誤差（joint lane は関節角の `joint_error`、pose lane は運営 IK と同じ URDF での手先の `ee_pos_error`）・
+publish・後始末）がコードの誤り無しに動くこと。
+- Stage 5: 開始姿勢（時間切れ）→ Enter 2 の問いで Ctrl+C → 後始末（腕を下ろせず諦める）→ rc=0。
+  Enter 2 の問いが `[gate] WARNING: … initial arm pose is NOT reached (…)` であること（本体 `9849a17` 以降）
 - Stage 0: 腕を下ろす準備動作が時間切れ → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
   `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
+- `actuate5_pose_clamp`: `[boundary] wrist_roll clamp: on …`。`actuate0_converged`: `[init] walk latch check = converged (cli)`
+  （模擬の PC2 では下ろす動きが収束しないので、終わり方は Stage 0 と同じ設計どおりの停止）
 
 ```bash
 $SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; \
-  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\${s}_joint --boundary-lane joint; done" \
+  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\${s}_pose --boundary-lane pose; done; \
+  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh 5 actuate5_pose_clamp --boundary-lane pose --wrist-roll-clamp on; \
+  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh 0 actuate0_converged --walk-lowering-check converged" \
   > /dev/null 2>&1 < /dev/null &'
 $SSH 'python3 /root/summarize.py /root/runs/actuate*'   # 終わったら。exit 0 = 合格
 ```
