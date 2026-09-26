@@ -40,7 +40,7 @@ flowchart LR
 |---|---|
 | カメラ bridge | `:5555` に head と手首カメラの JPEG を publish する |
 | 状態 bridge | `:5557` に `body_q`・`base_quat` を 50 Hz で publish する（2026-09-21 以降の bridge は `gripper_q` も載せる。CONTRACT には無い項目） |
-| WBC adapter | 我々が bind した `:5556` に接続し、`(T,25)` を IK で関節の目標にして WBC に渡す。手の列は Dex1 へ relay する |
+| WBC adapter | 我々が bind した `:5556` に接続。既定は joint lane `(T,22)` の関節目標を WBC へ渡す。pose lane `(T,25)` の場合だけ IK を使う。手の列は Dex1 へ relay する。adapter 起動 option はどちらも `--lane decoupled` |
 | WBC 本体 | 全身の制御 |
 | e-stop | 我々のコードを通らずにモータを止める |
 

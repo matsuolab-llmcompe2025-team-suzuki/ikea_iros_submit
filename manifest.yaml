@@ -9,24 +9,22 @@
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# Before release this exact image (same digest) was started offline on an arm64 GB10 with
-# 128 GB unified memory: every stage's preflight passed (defaults and the all6_400k candidate
-# set), nothing connected outside loopback, and the --actuate command path ran to the go-live
-# wait and the return-before-release on both the joint and the pose lane (procedure and
-# numbers: VERIFY.md). The adapter lane is decoupled; on it our arms go by default on the joint
+# Historical GB10 measurements in VERIFY.md are for rebuild4, not this new image.
+# Rebuild5 requires a fresh GB10/Thor preflight and operator-controlled connection test.
+# The adapter mode is decoupled; on it our arms go by default on the joint
 # lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
 # sends (T,25) end-effector poses through the organizer IK instead.
 
 team: RAMEN
-lane: decoupled
+lane: joint
 platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260926-rebuild4"
-    digest: "sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260927-rebuild5"
+    digest: "sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f"
     # What the operator types per run; everything that never changes at the venue is added
-    # by the image entry (docker/venue_entry.sh). Needs -it for the two Enter prompts.
+    # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
     run: >-
       docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host
       -e IROS_ORIN_HOST=<PC2_IP>
@@ -53,8 +51,8 @@ runtime:
   network: >-
     none at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
     online check or analytics), the VLM runs with usage stats off and every outbound endpoint
-    pointed at a closed local port; weights are read from the mounted cache. Verified with strace
-    on an arm64 GB10: no connect() other than loopback and Unix sockets
+    pointed at a closed local port; weights are read from the mounted cache. Historical rebuild4
+    GB10 strace found no connect() other than loopback and Unix sockets; repeat for rebuild5
   # Mounted read-only as a Hugging Face cache (~90 GB). Prefetch and offline check:
   # tools/prefetch_weights.py (list derived from policy_config.yaml: defaults + variant_sets);
   # details in WEIGHTS.md.
@@ -73,7 +71,7 @@ runtime:
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546 (ckpt_step_400000.pt)"
   # GPU memory with every model of the heaviest stage resident (Stage 2: VLM + 4 models,
   # --gpu-models all from the image entry), measured on an arm64 GB10 with 128 GB unified
-  # memory; 45 GB stayed available. Re-measured on the Thor at the connection test.
+  # memory on rebuild4; 45 GB stayed available. Re-measure rebuild5 at the connection test.
   peak_memory_thor_gb: 43
 
 conformance: >-

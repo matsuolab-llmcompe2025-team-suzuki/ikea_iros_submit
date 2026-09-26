@@ -29,11 +29,11 @@ flowchart LR
 - VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 の run の中で container が自分で起動し、run の終わりに止める。
 - container は run ごとに作り直す。重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
 
-| Stage | 中身 | Enter |
+| Stage | 中身 | 操作（§2「操作キー」） |
 |---|---|---|
-| 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | 1 回（安全確認） |
-| 1〜4 | 脚 1 本ずつ: 台を回す → pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | 2 回（安全確認 / policy 開始） |
-| 5 | 台を裏返す（flip） | 2 回 |
+| 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | Enter 1（安全確認）だけ |
+| 1〜4 | 脚 1 本ずつ: 台を回す → pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
+| 5 | 台を裏返す（flip） | Enter 1 → 開始姿勢で Enter |
 
 ## 1. 事前準備（会場の前に Thor で 1 回）
 
@@ -42,8 +42,9 @@ flowchart LR
 export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag 20260926-rebuild4。digest は manifest.yaml の images.thor と同じ。GB10 で確認済み = VERIFY.md）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572
+# image（tag 20260927-rebuild5 = 本体 e3a4187。digest は manifest.yaml の images.thor と同じ。
+# GB10 での確認（VERIFY.md）はまだ。接続テストの前に通すこと）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
@@ -64,8 +65,8 @@ sequenceDiagram
   T->>T: Step 4 docker run … --stage N --actuate（model・VLM の読み込み）
   T->>T: Enter 1（安全確認）→ go-live 待ち（肩を少し動かし、実測がついてくるまで待つ）
   P->>T: Step 5 人が go-live（--live --engage-policy）
-  T->>T: 開始姿勢・保持 → Enter 2 → policy（Stage 0 は Enter 2 無し）
-  T->>T: 終わり: 手を開き、腕を下ろして container が終了
+  T->>T: 開始姿勢・保持 → Enter → policy → N → 次の開始姿勢 → Enter → …（Stage 0 は Enter 1 だけ）
+  T->>T: 終わり: Ctrl+C → 手を開き、腕を下ろして container が終了
 ```
 
 ### Step 0〜1 [PC2] 環境とカメラ・状態の配信
@@ -112,11 +113,13 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572 \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f \
   --stage N --actuate
 ```
 
-- `-it` 必須（Enter を押すため）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
+- `-it` 必須（Enter・N・R を押すため。対話端末でないと `--actuate` は
+  `N/R/Enter production controls require an interactive TTY` で起動しない）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
+- **操作する端末は半角英数にしておく**（日本語入力が ON だと N / R / Enter は何も表示されずに無視される）。
 - 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
   （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate` だけ。大会本番では option を足さない。**
   接続テストで試す option（model・送り方・手首 roll の clamp・Stage 0 の確かめ方）は `CONNECTION_TEST.md` にまとめてあり、
@@ -125,6 +128,10 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。GPU は VLM 込みで最大 42 GB。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
+- 腕の送り方（既定、本体 #172）: joint lane で、目標が変わったときだけ最短 0.1 s おきに同じ目標を 16 行送る
+  （`[boundary] publish: 16 row(s) per chunk, on change at most every 0.1s …`）。運営 WBC は腕を重力補償なしで
+  動かすので、送る腕に重力の垂れの分を足す（`[boundary] gravity sag offset: on (kp=[100, 100, 40, 40, 20, 20, 20] …)`）。
+  kp が会場の WBC と合っているかは接続テストで確かめる（`CONNECTION_TEST.md`）。
 - 使う model は起動 log の `[init] policy variants: insert=… (config)` で分かる（`config` = 既定、`set:…` / `cli` = 切り替え）。
 - go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
 
@@ -139,16 +146,26 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 - `--engage-policy` 必須（無いと WBC の下半身が学習済みの制御に入らないまま、他は全部正常に見える）。
 - E-stop 担当が付いてから。
 
-### その後
+### その後（操作キー）
 
-- Stage 1〜5: 開始姿勢に移って保持 → `Enter 2` で policy が始まる。stage の中の model の切り替えは
-  自動（腕を次の開始姿勢へ → 保持 → 次の model）。次へ進むのは model の完了か時間切れだけ（YOLO では進まない）。
-- `Enter 2` の問い: 開始姿勢に届いていなければ `[gate] WARNING: … NOT reached (…)` と、一番ずれた量が出る。
-  **届いていても、押す前に腕が開始姿勢にあるかを目で確かめる**。直前に `[orch] … timed out short of its target` の行が
-  出ていたら、届いていない。
-- Stage 0（Enter 2 無し）: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
-  （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。
-- 終わると手を開き、腕を下ろして（同じ姿勢）container が終わる。
+画面には `Stage`・`フェーズ`・今使える `操作` だけが出る。**policy の間の移り変わりは操作者のキーだけで進む**
+（policy の完了や時間切れでは次へ進まない。本体 858e107）。移動中に押したキーは予約されずに捨てられる。
+
+| キー | 動き |
+|---|---|
+| `Enter` | 開始姿勢に着いてから押すと policy が始まる。着いていない Enter は捨てられ、`[gate] initial pose not reached (worst=<関節> error=<rad>)` と一番ずれた関節が出る。insert・締め付けのやり直しでは、脚を置いた後の Enter で初期の握り幅へ、もう一度 Enter で開始 |
+| `N` | 今の policy を止めて、次の policy の開始姿勢へ移る（着いたら Enter を待つ）。stage の最後の policy では効かない |
+| `R` 1 回目 | 腕は最後の指令のまま、両手だけ全開にする |
+| `R` 2 回目 | 開き終わってから効く。同じ policy の開始姿勢へ戻る（Enter まで始まらない） |
+| `Ctrl+C` | 歩行を 0 にし、今の policy の開始姿勢 → 手を全開 → 起動時の道を逆にたどって腕を下ろし、終わる。**戻し動作の途中で 1 秒以上たってからもう一度押すと、その場で保持して終える**（運営 adapter の最後の指令保持を前提とする。実際の保持は WBC・電源・通信の状態に依存するため、E-stop 担当は離れない） |
+
+- **押す前に腕が開始姿勢にあるかを目で確かめる。**
+- Stage 0: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
+  （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
+- **安全停止**（カメラ・関節の状態が途切れた、準備の動きが開始姿勢に届かなかった、想定外の例外）: 歩行だけ 0 にし、
+  腕と Dex1 は最後の指令を保持して、`フェーズ：安全停止／保持中・判断待ち` で止まる（勝手に腕を動かさない）。
+  持っている脚と周りを確かめてから、`Enter` = 戻し動作（上の Ctrl+C と同じ）、`Ctrl+C` = 動かさずにその場で終える。
+  危ない動きは待たずに E-stop。
 
 ### なぜこの順番か
 
@@ -174,6 +191,11 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 | `[groot] waiting for the GR00T worker to load... Ns` | GR00T の model を読み込み中。待つ |
 | `[groot] integrated GPU: load headroom from MemAvailable=…` | 情報。GR00T を読む前の空きメモリ |
 | `sender clock offset ~ ±x.xxxs` | 情報。PC2 と Thor の時計の差（指令の送信時刻をこの分だけ直している） |
+| `[boundary] gravity sag offset: on (kp=… scale=1 …)` | 情報。運営 WBC の重力の垂れの分を腕に足している（joint lane の既定） |
+| `Official boundary configuration rejected: gravity sag offset could not be built` | 重力の垂れ補正を作れない。起動を中止し、image・URDF・設定を確認する。`--boundary-gravity-offset off` は検証用であり、自動回避に使わない |
+| `N/R/Enter production controls require an interactive TTY` | `docker run` に `-it` が無い |
+| `フェーズ：安全停止／保持中・判断待ち` | 安全停止。直前の `[safety-stop] …` が理由。確かめてから Enter（戻す）か Ctrl+C（その場で終える） |
+| `[gate] initial pose not reached (worst=… error=…); Enter ignored` | 開始姿勢に届いていないので Enter を捨てた。一番ずれた関節と量。腕を目で見て、届くのを待つ |
 | 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`WEIGHTS.md` の 4（`prefetch_weights.py --check`） |
 
 ## 5. conformance（運営の適合試験）

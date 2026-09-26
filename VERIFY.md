@@ -5,6 +5,14 @@
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
+**更新状況（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
+ARM64 [CI run 36264063035](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36264063035)
+が build/import・重力補償 probe を通過した（build commit `56c69c5`）。digest は `manifest.yaml` に固定。
+手元の提出用 test 33 件、本体の boundary・Stage・操作・重力補償などの回帰 test 311 件が成功。
+この PC の GHCR 読取権限が不足しているため再 pull は未確認。公開の根拠は上記 CI の push 成功と digest 出力。
+§6 の測定結果は旧 `rebuild4` のもの。新 image の GB10 全 stage 起動・Thor 接続試験は未実施であり、
+CI の build/import 検査と手元の mock test だけでは実機動作確認済みと扱わない。
+
 ## 1. なぜ GB10 か
 
 - 提出 image は **arm64**（Thor 用）。RunPod の GPU は全部 x86 なので、image が動かない（2026-09-24 に確認）。
@@ -22,7 +30,7 @@
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
 | `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
 | 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
-| `--actuate` の経路: Enter 1 → go-live 待ち（指令の publish・実測の関節の読み取り）→ Ctrl+C の後始末 | go-live の先（模擬の PC2 は指令に従わないので go-live は成立しない） |
+| `--actuate` の経路: Enter 1 → go-live 待ち → 安全停止の判断待ち / Ctrl+C → 後始末 | 実機が指令へ追従すること（mock の sin 波で go-live が誤成立する場合がある） |
 | conformance | |
 
 4-6 の run 以外は `--actuate` を付けないので、指令は 1 通も出ない（起動確認だけで終わる）。4-6 の run も、
@@ -126,15 +134,17 @@ strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は 
 ### 4-6 `--actuate` の経路
 
 `ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）が
-出てからその秒数だけ待って、python に Ctrl+C（SIGINT）を送る。外向きの接続は 4-5 で見たので strace は付けない。
+出てからその秒数だけ待つ。安全停止で「判断待ち」なら Enter で戻し動作を承認し、それ以外は
+自分の擬似端末へ Ctrl+C を送る。外向きの接続は 4-5 で見たので strace は付けない。
+**この自動承認は mock 専用。実機で run_stage.sh を使わない。**
 
 模擬の PC2 の関節は指令と関係なく sin 波で動くので、go-live 待ちは「ついてきた」と成立してしまい、その先の
 準備動作（腕を動かす）は指令に従わないので時間切れになる。見るのは、そこまでに指令の経路（実測の関節の読み取り・
 到達の誤差（joint lane は関節角の `joint_error`、pose lane は運営 IK と同じ URDF での手先の `ee_pos_error`）・
 publish・後始末）がコードの誤り無しに動くこと。
-- Stage 5: 開始姿勢（時間切れ）→ Enter 2 の問いで Ctrl+C → 後始末（腕を下ろせず諦める）→ rc=0。
-  Enter 2 の問いが `[gate] WARNING: … initial arm pose is NOT reached (…)` であること（本体 `9849a17` 以降）
-- Stage 0: 腕を下ろす準備動作が時間切れ → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
+- Stage 1〜5: 開始姿勢（時間切れ）→ 安全停止・判断待ち → Enter 承認 → 後始末 → rc=2。
+  `[safety-stop] operator transition … did not reach its target` と判断待ち・承認の両 log があること。
+- Stage 0: 腕を下ろす準備動作が時間切れ → 判断待ち → Enter 承認 → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
   `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
 - `actuate5_pose_clamp`: `[boundary] wrist_roll clamp: on …`。`actuate0_converged`: `[init] walk latch check = converged (cli)`
   （模擬の PC2 では下ろす動きが収束しないので、終わり方は Stage 0 と同じ設計どおりの停止）
@@ -165,7 +175,8 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
   候補（`stage*_all6`）と DP（`stage2_dp`）も同じ
 - `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、log にコードの誤り（`NameError` など。
   後始末は例外を握って `[return] failed: …` と出すので、名前で見る）が無い。終わり方は Ctrl+C（rc 0 か 130）か
-  4-6 の設計どおりの停止（`RuntimeError: … did not converge`、rc=1）。それ以外の例外は不合格
+  4-6 の設計どおりの停止（Stage 0 の rc=1、Stage 1〜5 の安全停止 rc=2）。
+  安全停止では判断待ちと操作者の応答が必須。それ以外の例外は不合格
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 

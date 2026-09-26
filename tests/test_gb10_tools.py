@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import signal
+import time
 from pathlib import Path
 
 SUBMIT_ROOT = Path(__file__).resolve().parents[1]
@@ -104,9 +106,18 @@ def test_an_error_swallowed_by_the_return_path_fails(tmp_path) -> None:
     assert "NameError" in result.stdout
 
 
+#: 故障の後は戻す前に操作者の判断を待ち、run_stage.sh が Enter を送る (本体 #172)
+DECISION = """\
+Stage 0
+フェーズ：安全停止／保持中・判断待ち
+操作：Enter 戻す（初期姿勢→ハンド全開→腕下ろし） ｜ Ctrl+C その場で終了
+[safety-stop] operator confirmed the return motion
+"""
+
 MOCK_STOP_TAIL = """\
 [setup] arms are 0.978 rad away from walk_lowered_pose; lowering before the walk
 [pre-motion 1/1] waiting: worst=left_elbow target=+0.900 measured=-0.138 error=1.038rad
+""" + DECISION + """\
 [return] lowering failed: pre-motion stage 'return_forward_outward_clearance' did not converge within 15s
 Traceback (most recent call last):
   File "/app/ramen/inference/desktop/entrypoint.py", line 3812, in _run_cli_and_exit
@@ -123,6 +134,30 @@ def test_the_designed_stop_when_the_mock_does_not_follow_passes(tmp_path) -> Non
     run = _actuate_run(tmp_path, ACTUATE_LOG + MOCK_STOP_TAIL, "rc=1 secs=67 mode=actuate")
     result = _summarize(run)
     assert result.returncode == 0, result.stdout
+
+
+SAFETY_STOP_TAIL = """\
+[safety-stop] operator transition 'arm_pre_motion_for_flip_table' did not reach its target: pre-motion stage 'policy_initial_pose' did not converge within 15s control
+[Phase 3 HOLD] Last safe arm and Dex1 targets remain active and walking is stopped.
+""" + DECISION + """\
+[return] returning to policy frame zero, opening Dex1, then lowering
+"""
+
+
+def test_the_designed_safety_stop_of_stages_1_to_5_passes(tmp_path) -> None:
+    """本体 858e107 以降、準備動作が届かないと安全停止 (rc=2)。判断待ちで Enter を受けて戻す。"""
+    run = _actuate_run(tmp_path, ACTUATE_LOG + SAFETY_STOP_TAIL, "rc=2 secs=95 mode=actuate")
+    result = _summarize(run)
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_designed_stop_without_the_operator_decision_fails(tmp_path) -> None:
+    """故障の後に判断を待たずに腕を動かしていたら不合格 (本体 #172 の退行)。"""
+    tail = SAFETY_STOP_TAIL.replace(DECISION, "")
+    run = _actuate_run(tmp_path, ACTUATE_LOG + tail, "rc=2 secs=95 mode=actuate")
+    result = _summarize(run)
+    assert result.returncode == 1
+    assert "判断を待っていない" in result.stdout
 
 
 def test_an_unexpected_exception_fails(tmp_path) -> None:
@@ -145,8 +180,19 @@ def test_an_actuate_run_that_never_reached_go_live_fails(tmp_path) -> None:
 
 FAKE_ENTRYPOINT = """\
 import sys, time
+if not sys.stdin.isatty():  # 本物の起動口も --actuate では対話端末を要る (本体 858e107)
+    sys.exit("N/R/Enter production controls require an interactive TTY")
 print("[init] policy variants: flip=x (config)", file=sys.stderr, flush=True)
 input("Harness / E-stop / workspace clearance confirmed. Enter starts Phase 3 stage 5; Ctrl+C cancels: ")
+if "--fault" in sys.argv:
+    print("[go-live] wait_for_go_live_x: robot followed", file=sys.stderr, flush=True)
+    print("[safety-stop] operator transition 'arm_pre_motion_for_x' did not reach its target: "
+          "did not converge", file=sys.stderr, flush=True)
+    print("フェーズ：安全停止／保持中・判断待ち", file=sys.stderr, flush=True)
+    sys.stdin.readline()
+    print("[safety-stop] operator confirmed the return motion", file=sys.stderr, flush=True)
+    print("[return] returning to policy frame zero", file=sys.stderr, flush=True)
+    sys.exit(2)
 try:
     while True:
         print("[go-live] wait_for_go_live_x: still waiting", file=sys.stderr, flush=True)
@@ -195,9 +241,87 @@ def test_run_stage_drives_enter_and_ctrl_c_in_actuate_mode(tmp_path) -> None:
     assert _summarize(run).returncode == 0
 
 
+def test_run_stage_answers_the_safety_stop_decision_on_a_terminal(tmp_path) -> None:
+    """安全停止で判断待ちになったら Enter を送る。起動口は擬似端末の上で動く (pty_run.py)。"""
+    root = tmp_path / "ramen"
+    (root / "inference" / "desktop").mkdir(parents=True)
+    (root / "inference" / "__init__.py").write_text("")
+    (root / "inference" / "desktop" / "__init__.py").write_text("")
+    (root / "inference" / "desktop" / "entrypoint.py").write_text(FAKE_ENTRYPOINT)
+    venue = tmp_path / "ramen-venue"
+    venue.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} -m inference.desktop.entrypoint "$@"\n')
+    venue.chmod(0o755)
+    env = {
+        **os.environ,
+        "RAMEN_ROOT": str(root),
+        "RUNS_DIR": str(tmp_path / "runs"),
+        "VENUE_BIN": str(venue),
+        "NO_MOCK": "1",
+        "NOSTRACE": "1",
+        "ACTUATE_HOLD": "1",
+        "ACTUATE_EXIT_TIMEOUT": "20",
+    }
+    result = subprocess.run(
+        ["bash", str(GB10 / "run_stage.sh"), "5", "stage5_fault", "--fault"],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    run = tmp_path / "runs" / "stage5_fault"
+    assert result.returncode == 0, result.stderr
+    assert (run / "result.txt").read_text().startswith("rc=2 "), (run / "run.log").read_text()
+    steps = (run / "steps.log").read_text()
+    assert "sending Enter 1" in steps and "sending Enter (return)" in steps
+    assert "operator confirmed the return motion" in (run / "run.log").read_text()
+
+
 def test_the_shell_tools_parse() -> None:
     for script in ("run_stage.sh", "check_envs.sh"):
         result = subprocess.run(
             ["bash", "-n", str(GB10 / script)], capture_output=True, text=True
         )
         assert result.returncode == 0, (script, result.stderr)
+
+
+def test_pty_preserves_exit_status() -> None:
+    result = subprocess.run(
+        [sys.executable, str(GB10 / "pty_run.py"), sys.executable, "-c",
+         "import sys; assert sys.stdin.isatty(); sys.exit(7)"],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+    )
+    assert result.returncode == 7, result.stderr
+
+
+def test_pty_termination_reaps_its_command(tmp_path) -> None:
+    marker = tmp_path / "ready"
+    command = (
+        "import os, signal, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, lambda *_: exit(0)); "
+        f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(GB10 / "pty_run.py"), sys.executable, "-c", command],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists()
+        child = int(marker.read_text())
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=10)
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("PTY command survived wrapper termination")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_stage_cleanup_does_not_signal_processes_by_name() -> None:
+    script = (GB10 / "run_stage.sh").read_text()
+    assert "pkill" not in script
+    assert "MOCK_PID=$!" in script
