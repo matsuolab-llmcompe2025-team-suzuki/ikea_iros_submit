@@ -232,3 +232,34 @@ GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後�
 重み 3 分・stage の起動 30〜40 分（4-5・4-6 の全部）で、合わせて 45 分〜1 時間。host によっては回線の従量料金が
 時間料金より大きい（2026-09-26 のハンガリーの host は約 45 分で $3.0。スペインの host は約 1.1 時間で $0.99）。
 借りる前に offer の `inet_down_cost`（1 GB あたり）を見る。2026-09-25 の初回は $0.90（不具合の調査を含む）。
+
+## 8. rebuild5 の拡張検証と merge gate
+
+以下は実施予定の検証表であり、合格記録ではない。GB10 への接続と private GHCR の読み取り権限を確保後に実施する。
+この検証が完了する前に Issue #12 を main へ merge しない。
+
+| 項目 | 必須証拠 | rebuild5 状態 |
+|---|---|---|
+| image 同一性 | manifest digest、image ID、RAMEN_SOURCE.txt、CPU/GPU/driver/空き容量 | 未実施 |
+| 4 Python 環境 | check_envs.sh の成功終了、CUDA bf16 演算の有限値、各環境の版 | 未実施 |
+| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | 未実施 |
+| 全 Stage | **0/1/2/3/4/5 を省略せず**既定の joint lane で起動。4 RGB・関節・Dex1 の入力記録 | 未実施 |
+| 実モデル forward | RAMEN-Ori、GR00T 53D、pick worker、DP、YOLO、VLM の実推論・有限出力・所要時間。validate_load_and_release だけでは合格にしない | 未実施 |
+| 代替経路 | all6_400k、pose lane、wrist clamp、walk-lowering option を個別記録 | 未実施 |
+| joint の送信契約 | 実 socket で chunk を受信し、shape、有限値、hand 範囲、base height、joint 順序、時刻・周期を検査 | 未実施 |
+| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | 未実施 |
+| 故障注入 | camera/state 途絶、worker 異常、未到達を区別し、停止時の nav=0、最後の arm/hand target 保持、判断待ちを記録 | 未実施 |
+| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 未実施 |
+
+### 検証データの扱い
+
+- 各 run に image/source の識別子、コマンド、開始・終了時刻、終了コード、全ログ、合否理由を保存する。
+- 合成画像や指令追従 mock は配線・実行系の検査に限る。タスク成功や本物の WBC の安定性の証拠にしない。
+- 関節を sin 波で動かす標準 mock の go-live 成立は追従確認の証拠ではない。model load、実推論、操作遷移を別々に判定する。
+- 外部ホストへロボット指令は送らない。自動 Enter/actuate は実機と隔離した検証用環境のみで行う。
+- 問題を修正して image 入力が変わった場合は再ビルドし、新 digest で必要試験を再実施する。
+- GB10 の sm_121 では Thor の sm_110、実カメラ、DDS、WBC、実機接触を保証できない。未確認事項を明記して接続試験へ渡す。
+
+手元の検証ツール回帰: `tests/test_gb10_envs.py` の 5 件が成功。
+従来の check_envs.sh は command substitution の失敗を echo が隠していたが、各環境の失敗を非ゼロ終了として返すよう修正済み。
+これは **GB10 での GPU 実測ではない**。
