@@ -329,6 +329,37 @@ RUN pixi run --as-is -e runtime python -c \
     && bash -n inference/desktop/pick_leg_hybrid/run_venue_vlm_server.sh \
     && echo "[build] ramen code OK (entrypoint / VLM server / GR00T 53D worker / pick worker)"
 
+# 会場の既定 (joint lane + 重力の垂れ補正、本体 #172) が image の中で作れるか: pinocchio・
+# 重力 model の URDF (sync_ramen.sh がコピーする 1 file)・skill_config.yaml の kp。作れないと
+# 会場の起動が「Official boundary configuration rejected」で止まるので、ここで止める。
+RUN cat > /tmp/probe_gravity_offset.py <<'PY'
+import sys
+
+import numpy as np
+import yaml
+
+from inference.desktop import entrypoint
+
+sys.argv = ["entrypoint", "--stage", "2", "--action-sink", "boundary", "--synthetic-hand-state"]
+args = entrypoint.parse_args()
+assert args.boundary_lane == "joint" and args.boundary_gravity_offset == "on", args
+entrypoint.validate_boundary_publish_args(args)
+with open("inference/desktop/lower_policy/configs/skill_config.yaml", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+offset = entrypoint.build_boundary_gravity_offset(args, config)
+assert offset is not None
+from inference.desktop.lower_policy.initial_pose import initial_pose_from_config
+
+worst = 0.0
+for skill in ("rotate_table_base", "pick_table_leg", "insert_table_leg",
+              "rotate_leg_to_tighten", "flip_table"):
+    _, added = offset.apply(initial_pose_from_config(config, skill).arm_position_rad)
+    worst = max(worst, float(np.max(np.abs(added))))
+assert 0.03 <= worst <= 0.12, worst
+print(f"[build] gravity sag offset OK ({offset.describe()}; start poses up to {worst:.3f} rad)")
+PY
+RUN pixi run --as-is -e runtime python /tmp/probe_gravity_offset.py && rm /tmp/probe_gravity_offset.py
+
 # --- 8) 起動口 ------------------------------------------------------------------
 # 会場: docker run … <image> --stage N --actuate。`-` で始まらない引数はそのまま実行する。
 ENTRYPOINT ["/usr/local/bin/ramen-venue"]
