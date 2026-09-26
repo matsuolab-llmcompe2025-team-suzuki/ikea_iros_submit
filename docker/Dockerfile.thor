@@ -333,7 +333,11 @@ RUN pixi run --as-is -e runtime python -c \
 # 重力 model の URDF (sync_ramen.sh がコピーする 1 file)・skill_config.yaml の kp。作れないと
 # 会場の起動が「Official boundary configuration rejected」で止まるので、ここで止める。
 RUN cat > /tmp/probe_gravity_offset.py <<'PY'
+import os
 import sys
+
+# `python /tmp/…py` は sys.path に /tmp を入れる。会場の `python -m` と同じく作業場所 (/app/ramen) から読む
+sys.path.insert(0, os.getcwd())
 
 import numpy as np
 import yaml
