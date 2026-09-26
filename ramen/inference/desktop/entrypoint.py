@@ -196,8 +196,8 @@ def _require_real_waist_and_hand(
     という運用に倒す。その場合 hand actuator は mock 固定 = グリッパには
     一切指令を出さないので、安全側に外れる。
 
-    `--action-sink boundary` はこの要求ごと外れる。腕・手を `(T,25)` で運営 WBC に
-    渡すので SDK 直の実 actuator は要らない (併用は `_validate_phase3_config` が
+    `--action-sink boundary` はこの要求ごと外れる。腕・手を選択中のboundary laneで
+    運営 WBC に渡すので SDK 直の実 actuator は要らない (併用は `_validate_phase3_config` が
     禁止している)。**腰は policy の指令を使わず常に実測値**: 運営 adapter は
     torso 列 `[22:25]` を読まず、IK は腰を実測値に固定する (`BOUNDARY_WAIST_NOTE`)。
     **会場でグリッパを動かせるのはこの経路だけ**なので、ここを塞ぐと
@@ -210,7 +210,7 @@ def _require_real_waist_and_hand(
     """
 
     if getattr(args, "action_sink", "sdk") == "boundary":
-        # hand 指令は共有 mock actuator の `.latest` 経由で (T,25) の手の列に載る。
+        # hand 指令は共有 mock actuator の `.latest` 経由でboundary rowの手の列に載る。
         # `--synthetic-hand-state` が無いと `_build_hand_actuator` が skill ごとに
         # **別 instance** を返すため、`.latest` が boundary sink に届かず
         # **グリッパ指令が黙って落ちる** (エラーは出ない)。ここで要求しておく。
@@ -221,7 +221,7 @@ def _require_real_waist_and_hand(
             raise ValueError(
                 f"{label} with --action-sink boundary requires"
                 " --synthetic-hand-state (otherwise each skill gets its own mock"
-                " hand actuator and the (T,25) hand columns never see the"
+                " hand actuator and the boundary hand columns never see the"
                 " policy's gripper commands)"
             )
         return
@@ -574,26 +574,19 @@ def resolve_production_pick_mode(args: argparse.Namespace) -> bool:
 def _validate_phase3_config(args: argparse.Namespace) -> None:
     """Reject unsafe or resource-wasting Phase 3 CLI combinations."""
 
-    if (
-        getattr(args, "boundary_lane", "pose") != "pose"
-        and getattr(args, "action_sink", "sdk") != "boundary"
-    ):
-        raise ValueError("--boundary-lane joint requires --action-sink boundary")
-    if getattr(args, "wrist_roll_clamp", "on") != "on" and not _boundary_taskspace_arrival(
-        args
-    ):
-        # 効かない組み合わせを弾く (接続テストで「外したつもり」を作らない)
-        raise ValueError(
-            "--wrist-roll-clamp off applies only to --action-sink boundary on the pose lane "
-            "(the joint lane never goes through the organizer IK)"
-        )
+    # boundary_lane is ignored by the SDK path. Keeping the production joint
+    # default harmless there avoids forcing lab-only SDK commands to carry an
+    # unrelated venue flag.
+    # wrist-roll clamp is a compatibility option for the pose lane. It is
+    # deliberately harmless on the joint/SDK paths so their production
+    # defaults do not need an unrelated override.
     if getattr(args, "action_sink", "sdk") == "boundary":
-        # boundary は腕・手を (T,25) で運営 WBC に渡す (腰は実測値のまま)。SDK 直の
+        # boundary は腕・手を選択中のlaneで運営WBCへ渡す (腰は実測値のまま)。SDK直の
         # 実 actuator を併用すると同じ関節を二重に動かす。
         if args.use_real_hand:
             raise ValueError(
                 "--action-sink boundary and --use-real-hand are mutually exclusive"
-                " (the gripper is driven through the (T,25) hand columns instead)"
+                " (the gripper is driven through the boundary hand columns instead)"
             )
         if args.use_real_waist:
             raise ValueError(
@@ -774,7 +767,7 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
             "--use-real-waist is forbidden"
         )
     if getattr(args, "action_sink", "sdk") == "boundary":
-        # boundary は手も `(T,25)` の hand 列で運営 WBC に渡すので SDK 直の実 hand は
+        # boundaryは手も選択中laneのhand列で運営WBCへ渡すのでSDK直の実handは
         # 使わない (併用は上の `_validate_phase3_config` が禁止している)。
         # stage 1-4 と同じ理由で `--synthetic-hand-state` を要求する: 無いと
         # `_build_hand_actuator` が skill ごとに別 instance を返し、`.latest` が
@@ -789,7 +782,7 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
             raise ValueError(
                 "Phase 3 stage 5 with --action-sink boundary requires"
                 " --synthetic-hand-state (otherwise each skill gets its own mock"
-                " hand actuator and the (T,25) hand columns never see the"
+                " hand actuator and the boundary hand columns never see the"
                 " policy's gripper commands)"
             )
     elif not args.use_real_hand:
@@ -1349,7 +1342,8 @@ def parse_args() -> argparse.Namespace:
         default="sdk",
         help=(
             "action の出口。sdk (既定) = rt/arm_sdk へ直接 publish (lab の既存経路)。"
-            " boundary = (T,25) を :5556 に publish して運営 wbc_adapter に流す"
+            " boundary = --boundary-laneに応じた(T,22) jointまたは(T,25) poseを"
+            " :5556 にpublishして運営wbc_adapterに流す"
             " (会場でグリッパを動かせる唯一の経路)。boundary のとき rt/arm_sdk の"
             " publisher、Unitree SDK、DDS actuator は立てず、歩行も action の"
             " navigation 3D として同じ公式境界へ送る"
@@ -1358,11 +1352,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--boundary-lane",
         choices=("pose", "joint"),
-        default="pose",
+        default="joint",
         help=(
-            "--action-sink boundary の送り方。pose (既定) = (T,25) の手先の姿勢 (運営 IK が"
-            " 関節角に戻す)。joint = (T,22) の腕の関節角をそのまま (運営が 2026-09-25 に追加した"
-            " joint lane、運営 IK を通らない。PC2 の adapter が joint lane 入りの版であること)。"
+            "--action-sink boundary の送り方。joint (既定) = (T,22) の腕の関節角をそのまま"
+            "送る (運営 IK を通らず、robot_q_desired 系 policy の契約を保つ)。pose = (T,25) の"
+            "手先姿勢を送り、運営 IK が関節角へ戻す互換経路。"
             " joint のとき「腕が着いたか」は関節角で比べる"
         ),
     )
@@ -1380,12 +1374,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--wrist-roll-clamp",
         choices=("on", "off"),
-        default="on",
+        default="off",
         help=(
-            "pose lane で手首 roll を運営 IK の古い上限 (±0.9) に寄せるか。on (既定) はどの版の"
-            " 運営 IK にも安全。off は URDF の範囲だけ (運営 IK の a1af470 = interface package"
-            " 609f61d 以降で上限が無くなった。学習データは 0.9 を超える手首 roll を使う)。"
-            " 接続テストで PC2 の版を見て決める"
+            "pose lane でだけ、手首 roll を旧運営 IK の上限 (±0.9) に寄せる互換スイッチ。"
+            "最新 package では上限が撤廃されたため off が既定。joint lane と SDK 経路では無視する"
         ),
     )
     p.add_argument(
@@ -2970,8 +2962,8 @@ def main() -> None:
             # skill 共有 mock を繋いで、以降は policy の hand 指令をそのまま state に返す。
             sensors.dex1.bind_command_source(_build_hand_actuator())
 
-        def _log_boundary_taskspace(record: dict) -> None:
-            """publish した raw (T,25) を JSONL で残す。
+        def _log_boundary_action(record: dict) -> None:
+            """publishしたraw boundary rowをJSONLで残す。
 
             WBC_RUNBOOK §5: "a gripper that never closes during a pick stage is
             visible straight from your own published data, no video needed"。
@@ -2995,7 +2987,7 @@ def main() -> None:
                 clamp_wrist_roll=args.wrist_roll_clamp == "on",
                 port=args.boundary_port,
                 host=args.boundary_host,
-                log_fn=_log_boundary_taskspace,
+                log_fn=_log_boundary_action,
                 # 送信時刻を運営 adapter の時計 (PC2) に揃える (Issue #161、C2-01)。
                 # 差は PC2 のカメラ配信に入っている送信時刻から推定する。
                 sender_clock_offset_fn=getattr(

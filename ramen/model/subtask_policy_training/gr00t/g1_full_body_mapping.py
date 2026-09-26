@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .dex1_hand_synergy import dex1_to_hand
+    from .dex1_hand_synergy import dex1_to_hand, hand_to_dex1
 except ImportError:  # Loaded directly by data-materialization utilities.
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
-    from gr00t.dex1_hand_synergy import dex1_to_hand
+    from gr00t.dex1_hand_synergy import dex1_to_hand, hand_to_dex1
 
 
 REAL_G1_RELATIVE_EEF_STATE_DIM = 49
@@ -32,6 +32,48 @@ STANDARD_POLICY_VIDEO_KEYS = (
     "observation.images.left_wrist",
     "observation.images.right_wrist",
 )
+
+# Unitree SDK ``G1JointIndex`` order.  The source dataset stores these 29
+# values after its seven-value floating-root pose, so SDK motor id ``i`` maps
+# to ``robot_q_current[7 + i]`` and ``robot_q_desired[7 + i]``.
+G1_SDK_JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+G1_SDK_MOTOR_COUNT = len(G1_SDK_JOINT_NAMES)
+DATASET_ROBOT_Q_INDEX_BY_SDK_ID = tuple(
+    SOURCE_ROOT_POSE_DIM + sdk_id for sdk_id in range(G1_SDK_MOTOR_COUNT)
+)
+G1_SDK_JOINT_ID_BY_NAME = {
+    joint_name: sdk_id for sdk_id, joint_name in enumerate(G1_SDK_JOINT_NAMES)
+}
 
 G1_FULL_BODY_JOINT_NAMES = [
     "left_hip_pitch_joint",
@@ -96,6 +138,15 @@ SOURCE_JOINT_SLICES = {
     "left_arm": (15, 22),
     "right_arm": (22, 29),
 }
+
+_EXPANDED_BODY_NAMES_IN_SDK_ORDER = tuple(
+    G1_FULL_BODY_JOINT_NAMES[: G1_FULL_BODY_STATE_SLICES["left_hand"][0]]
+    + G1_FULL_BODY_JOINT_NAMES[slice(*G1_FULL_BODY_STATE_SLICES["right_arm"])]
+)
+if _EXPANDED_BODY_NAMES_IN_SDK_ORDER != G1_SDK_JOINT_NAMES:
+    raise ValueError("GR00T G1 joint names do not match the Unitree SDK motor order")
+if DATASET_ROBOT_Q_INDEX_BY_SDK_ID != tuple(range(7, 36)):
+    raise ValueError("BitRobot robot_q must map dataset indices 7..35 to SDK ids 0..28")
 
 # This is the exact flattened group order in the GR00T N1.7 base checkpoint's
 # real_g1_relative_eef_relative_joints processor_config.json.
@@ -177,6 +228,18 @@ REAL_G1_RELATIVE_EEF_ACTION_CONFIGS = {
         "state_key": "navigate_command",
     },
 }
+
+# Dex1-1 is expanded to all seven hand joints by ``dex1_to_hand``. Only the
+# base/navigation slots lack labels on this non-walking platform and must be
+# zeroed in the diffusion loss mask.
+REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES = (
+    *range(49, 53),
+)
+REAL_G1_DEX1_ACTION_LOSS_VALID_INDICES = tuple(
+    index
+    for index in range(REAL_G1_RELATIVE_EEF_ACTION_DIM)
+    if index not in REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES
+)
 
 UPPER_BODY_SOURCE_INDEX_MAP = (
     list(
@@ -276,7 +339,9 @@ def map_source_state_to_real_g1_relative_eef(
             REAL_G1_RELATIVE_EEF_STATE_SLICES[f"{side}_wrist_eef_9d"],
             source_euler_xyz_pose_to_xyz_rot6d(ee_state[source_slice]),
         )
-    current_joints = robot_q_current[SOURCE_ROOT_POSE_DIM:]
+    current_joints = map_dataset_robot_q_to_sdk_order(
+        robot_q_current, name="robot_q_current"
+    )
     for group in ("left_arm", "right_arm", "waist"):
         source_slice = slice(*SOURCE_JOINT_SLICES[group])
         _copy_into(
@@ -291,6 +356,25 @@ def map_source_state_to_real_g1_relative_eef(
             dex1_to_hand(hand_state[index], side=side, kind="state"),
         )
     return state
+
+
+def dataset_robot_q_index_from_sdk_id(sdk_id: int) -> int:
+    """Return the 36-D BitRobot ``robot_q`` index for a G1 SDK motor id."""
+    if isinstance(sdk_id, bool) or not isinstance(sdk_id, int):
+        raise TypeError(f"sdk_id must be an integer, got {type(sdk_id).__name__}")
+    if not 0 <= sdk_id < G1_SDK_MOTOR_COUNT:
+        raise ValueError(
+            f"sdk_id must be in [0, {G1_SDK_MOTOR_COUNT - 1}], got {sdk_id}"
+        )
+    return DATASET_ROBOT_Q_INDEX_BY_SDK_ID[sdk_id]
+
+
+def map_dataset_robot_q_to_sdk_order(
+    robot_q: list[Any], *, name: str = "robot_q"
+) -> list[float]:
+    """Drop the root pose and return body joints indexed by SDK motor id 0..28."""
+    _require_dim(name, robot_q, SOURCE_ROBOT_Q_DIM)
+    return [float(robot_q[index]) for index in DATASET_ROBOT_Q_INDEX_BY_SDK_ID]
 
 
 def source_euler_xyz_pose_to_xyz_rot6d(pose: list[Any]) -> list[float]:
@@ -343,6 +427,18 @@ def build_real_g1_relative_eef_modality_json(video_keys: list[str]) -> dict[str,
             "action_configs": REAL_G1_RELATIVE_EEF_ACTION_CONFIGS,
             "selected_video_keys": selected_video_keys,
             "dex1_hand_mapping": "fixed official G1 seven-joint synergy with least-squares inverse",
+            "action_loss_excluded_indices": list(
+                REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES
+            ),
+            "action_loss_valid_indices": list(REAL_G1_DEX1_ACTION_LOSS_VALID_INDICES),
+            "source_robot_q_sdk_mapping": [
+                {
+                    "sdk_id": sdk_id,
+                    "dataset_index": dataset_robot_q_index_from_sdk_id(sdk_id),
+                    "joint_name": joint_name,
+                }
+                for sdk_id, joint_name in enumerate(G1_SDK_JOINT_NAMES)
+            ],
         },
     }
 

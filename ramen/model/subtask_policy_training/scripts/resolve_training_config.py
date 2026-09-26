@@ -596,7 +596,7 @@ def resolve(config: dict[str, Any]) -> dict[str, str]:
                     str(
                         defaults.get(
                             "processor_overlay_root",
-                            "outputs/groot_base_overlays/real_g1_relative_eef_3cam",
+                            "outputs/groot_base_overlays/real_g1_relative_eef_3cam_dex1_v2",
                         )
                     ),
                 ),

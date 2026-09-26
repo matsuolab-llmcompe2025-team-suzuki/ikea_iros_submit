@@ -95,7 +95,7 @@ def prepare_overlay(
     validate_real_g1_contract(model_config, processor_config, statistics, embodiment_ids)
     source_processor_sha256 = sha256_file(processor_path)
     marker = {
-        "schema_version": "team_ramen_groot_n17_overlay_v1",
+        "schema_version": "team_ramen_groot_n17_overlay_v2",
         "source_model_path": model_path,
         "requested_revision": revision,
         "resolved_source_root": source_root.as_posix(),
@@ -107,6 +107,9 @@ def prepare_overlay(
         "state_dim": _mapping.REAL_G1_RELATIVE_EEF_STATE_DIM,
         "action_dim": _mapping.REAL_G1_RELATIVE_EEF_ACTION_DIM,
         "action_configs": _mapping.REAL_G1_RELATIVE_EEF_ACTION_CONFIGS,
+        "action_loss_excluded_indices": list(
+            _mapping.REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES
+        ),
     }
 
     marker_path = output_root / MARKER_NAME
@@ -134,6 +137,9 @@ def prepare_overlay(
             "delta_indices": [0],
             "modality_keys": POLICY_VIDEO_KEYS,
         }
+        modality["action"]["loss_excluded_indices"] = list(
+            _mapping.REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES
+        )
         write_json(temporary / "processor_config.json", overlay_config)
         write_json(temporary / MARKER_NAME, marker)
 

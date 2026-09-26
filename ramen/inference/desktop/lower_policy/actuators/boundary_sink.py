@@ -415,13 +415,15 @@ class BoundaryActionSink:
         fk: `G1WristFK` 相当 (`compute_ee_transforms` を持つもの)。省略時は運営 IK と
             同じ運動学 (`ORGANIZER_IK_URDF_PATH`) で作る。会場では省略すること
             (学習用の mode_15 URDF を渡すと手首が約 5 mm ずれる、Issue #164)。joint lane では使わない。
-        lane: `"pose"` (既定、`DecoupledSink`) か `"joint"` (`JointSink`)。module の docstring。
-        clamp_wrist_roll: pose lane で手首 roll を運営 IK の古い上限 0.9 に寄せるか
-            (`clamp_arms_to_organizer_ik`)。joint lane は寄せない (運営 IK を通らない)。
-        port / host: `DecoupledSink` にそのまま渡す。
+        lane: `"pose"` (class APIの後方互換既定、`DecoupledSink`) か`"joint"`
+            (`JointSink`)。production entrypointは常に明示し、CLI既定は`joint`。
+        clamp_wrist_roll: pose lane で手首 roll を運営 IK の古い上限 0.9 に寄せる
+            互換スイッチ (`clamp_arms_to_organizer_ik`)。最新 package では False。
+            joint lane は常に寄せない (運営 IK を通らない)。
+        port / host: 選択したboundary sinkへそのまま渡す。
         ee_frame_transform: root-link → 運営 IK が期待する frame の 4x4。未確定なので
             既定 `None` (変換なし)。
-        log_fn: `dict` を 1 件受け取る callable。publish した raw (T,25) を残す
+        log_fn: `dict` を1件受け取るcallable。publishしたraw (T,25)/(T,22) rowを残す
             (`WBC_RUNBOOK` §5:「グリッパが閉じたかは自分の publish 値で分かる」)。
         sender_clock_offset_fn: 運営 bridge (PC2) の壁時計 − この host の壁時計 [s] を
             返す callable (`ZmqFrameSource.sender_clock_offset_s`)。運営 adapter は
@@ -435,7 +437,7 @@ class BoundaryActionSink:
         fk: Any = None,
         *,
         lane: str = "pose",
-        clamp_wrist_roll: bool = True,
+        clamp_wrist_roll: bool = False,
         port: int = 5556,
         host: str = "*",
         ee_frame_transform: Optional[np.ndarray] = None,

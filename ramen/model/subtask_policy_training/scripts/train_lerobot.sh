@@ -27,6 +27,17 @@ if ! python -c "import lerobot" >/dev/null 2>&1; then
   exit 2
 fi
 
+NUM_GPUS="${NUM_GPUS:-1}"
+if [[ ! "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NUM_GPUS must be a positive integer, got: $NUM_GPUS" >&2
+  exit 2
+fi
+ACCELERATE_DISTRIBUTED_STRATEGY="${ACCELERATE_DISTRIBUTED_STRATEGY:-ddp}"
+if [[ ! "$ACCELERATE_DISTRIBUTED_STRATEGY" =~ ^(ddp|fsdp)$ ]]; then
+  echo "ACCELERATE_DISTRIBUTED_STRATEGY must be ddp or fsdp, got: $ACCELERATE_DISTRIBUTED_STRATEGY" >&2
+  exit 2
+fi
+
 TRAIN_CONFIG="${TRAIN_CONFIG:-configs/subtask_training.json}"
 TOLERANCE_S="${TOLERANCE_S:-0.001}"
 eval "$(python scripts/resolve_training_config.py --config "$TRAIN_CONFIG" --format shell)"
@@ -54,6 +65,7 @@ echo "wandb_project: $WANDB_PROJECT"
 echo "tolerance_s: $TOLERANCE_S"
 echo "upload_after_train: $UPLOAD_AFTER_TRAIN"
 echo "venv: $VENV_DIR"
+echo "num_gpus: $NUM_GPUS"
 
 # Issue #122 D-4: OBB overlay (C-11) hook を GR00T / lerobot-train 経由の policy に
 # 効かせるための env 状態表示 + fail-fast validation。
@@ -100,6 +112,11 @@ if [[ "$POLICY_TYPE" == "groot" ]]; then
     --output-root "$GROOT_PROCESSOR_OVERLAY_ROOT"
   )
   if [[ "${DRY_RUN:-false}" != "true" ]]; then
+    GROOT_LEROBOT_SOURCE_OVERLAY_ROOT="${GROOT_LEROBOT_SOURCE_OVERLAY_ROOT:-outputs/lerobot_source_overlays/groot_relative_eef_v3}"
+    python scripts/patch_lerobot_groot_relative_eef.py \
+      --overlay-root "$GROOT_LEROBOT_SOURCE_OVERLAY_ROOT"
+    GROOT_LEROBOT_SOURCE_OVERLAY_ROOT="$(realpath "$GROOT_LEROBOT_SOURCE_OVERLAY_ROOT")"
+    export PYTHONPATH="$GROOT_LEROBOT_SOURCE_OVERLAY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     python scripts/patch_lerobot_groot_relative_eef.py --check
     GROOT_RUNTIME_BASE_MODEL_PATH="$("${prepare_groot_base_cmd[@]}")"
   fi
@@ -107,6 +124,7 @@ if [[ "$POLICY_TYPE" == "groot" ]]; then
   echo "groot_runtime_overlay: $GROOT_RUNTIME_BASE_MODEL_PATH"
   echo "groot_embodiment_tag: $GROOT_EMBODIMENT_TAG"
   echo "groot_relative_eef_processor: $GROOT_REQUIRE_NATIVE_RELATIVE_EEF_PROCESSOR"
+  echo "groot_lerobot_source_overlay: ${GROOT_LEROBOT_SOURCE_OVERLAY_ROOT:-not prepared in dry-run}"
   echo "groot_dataset_source: shared LeRobot v3 DATASET_REPO_ID"
   policy_args+=(
     --dataset.image_transforms.enable="$GROOT_IMAGE_TRANSFORMS_ENABLE"
@@ -117,6 +135,7 @@ if [[ "$POLICY_TYPE" == "groot" ]]; then
     --policy.use_relative_actions="$GROOT_USE_RELATIVE_ACTIONS"
     --policy.relative_exclude_joints="$GROOT_RELATIVE_EXCLUDE_JOINTS"
     --policy.use_bf16="$GROOT_USE_BF16"
+    --policy.max_steps="$GROOT_STEPS"
     --batch_size="$GROOT_BATCH_SIZE"
     --steps="$GROOT_STEPS"
     --save_freq="$GROOT_SAVE_FREQ"
@@ -242,19 +261,80 @@ fi
 # LEROBOT_FRAME_CACHE_ENABLE=true が未 export なら wrapper は元 decode に full fallback
 # = 挙動不変。default true (無効化したいなら LEROBOT_FRAME_CACHE_ENABLE=false で override)。
 export LEROBOT_FRAME_CACHE_ENABLE="${LEROBOT_FRAME_CACHE_ENABLE:-true}"
-# Issue #122: `python -m model.subtask_policy_training....` は cwd=$ROOT_DIR から起動され
-# sys.path[0]=$ROOT_DIR となるが、$ROOT_DIR には model/ package が無いため ModuleNotFoundError。
-# REPO_ROOT を PYTHONPATH prefix に足して import 解決 (既 PYTHONPATH は保持)。
+# cwd=$ROOT_DIR から module 起動できるよう repo root を追加し、GR00T processor
+# overlay など既存の PYTHONPATH は保持する。
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+train_module="model.subtask_policy_training.scripts.lerobot_train_with_frame_cache"
+train_launcher=(python -m "$train_module")
+if (( NUM_GPUS > 1 )); then
+  if [[ "$DEVICE" != cuda* ]]; then
+    echo "multi-GPU training requires DEVICE=cuda, got: $DEVICE" >&2
+    exit 2
+  fi
+  if ! command -v accelerate >/dev/null 2>&1; then
+    echo "accelerate is required for NUM_GPUS=$NUM_GPUS" >&2
+    exit 2
+  fi
+  if [[ "$POLICY_TYPE" == "groot" ]]; then
+    default_mixed_precision="bf16"
+  else
+    default_mixed_precision="no"
+  fi
+  ACCELERATE_MIXED_PRECISION="${ACCELERATE_MIXED_PRECISION:-$default_mixed_precision}"
+  if [[ ! "$ACCELERATE_MIXED_PRECISION" =~ ^(no|fp16|bf16|fp8)$ ]]; then
+    echo "invalid ACCELERATE_MIXED_PRECISION: $ACCELERATE_MIXED_PRECISION" >&2
+    exit 2
+  fi
+  train_launcher=(accelerate launch)
+  if [[ "$ACCELERATE_DISTRIBUTED_STRATEGY" == "fsdp" ]]; then
+    train_launcher+=(
+      --use_fsdp
+      --fsdp_version=1
+      --fsdp_sharding_strategy=FULL_SHARD
+      --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP
+      --fsdp_transformer_layer_cls_to_wrap=Qwen3VLTextDecoderLayer,Qwen3VLVisionBlock,BasicTransformerBlock
+      --fsdp_use_orig_params=true
+      --fsdp_offload_params=false
+      --fsdp_backward_prefetch=NO_PREFETCH
+      --fsdp_forward_prefetch=false
+    )
+  else
+    train_launcher+=(--multi_gpu)
+  fi
+  train_launcher+=(
+    --num_processes="$NUM_GPUS"
+    --num_machines=1
+    --mixed_precision="$ACCELERATE_MIXED_PRECISION"
+  )
+  if [[ -n "${ACCELERATE_MAIN_PROCESS_PORT:-}" ]]; then
+    if [[ ! "$ACCELERATE_MAIN_PROCESS_PORT" =~ ^[0-9]+$ ]] \
+      || (( ACCELERATE_MAIN_PROCESS_PORT < 1024 || ACCELERATE_MAIN_PROCESS_PORT > 65535 )); then
+      echo "ACCELERATE_MAIN_PROCESS_PORT must be in [1024, 65535]" >&2
+      exit 2
+    fi
+    train_launcher+=(--main_process_port="$ACCELERATE_MAIN_PROCESS_PORT")
+  fi
+  train_launcher+=(--module "$train_module")
+  echo "accelerate_distributed_strategy: $ACCELERATE_DISTRIBUTED_STRATEGY"
+  echo "accelerate_mixed_precision: $ACCELERATE_MIXED_PRECISION"
+fi
+
+wandb_args=(
+  --wandb.enable="$WANDB_ENABLE"
+  --wandb.project="$WANDB_PROJECT"
+)
+if [[ -n "${WANDB_MODE:-}" ]]; then
+  wandb_args+=(--wandb.mode="$WANDB_MODE")
+fi
+
 cmd=(
-  python -m model.subtask_policy_training.scripts.lerobot_train_with_frame_cache
+  "${train_launcher[@]}"
   "${dataset_args[@]}"
   --policy.type="$POLICY_TYPE"
   --output_dir="$OUTPUT_DIR"
   --job_name="$JOB_NAME"
   --policy.device="$DEVICE"
-  --wandb.enable="$WANDB_ENABLE"
-  --wandb.project="$WANDB_PROJECT"
+  "${wandb_args[@]}"
   --policy.repo_id="$POLICY_REPO_ID"
   --policy.push_to_hub="$PUSH_TO_HUB"
   --policy.private="$PRIVATE"

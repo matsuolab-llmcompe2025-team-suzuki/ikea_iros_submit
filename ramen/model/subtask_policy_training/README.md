@@ -119,7 +119,8 @@ complete action chunk, the GR00T processor applies the checkpoint contract:
 - Arms: `q_target - q_current` for every future target.
 - Hands and waist: absolute targets.
 - Base-height and navigation: zero because this non-walking dataset has no such
-  commands. No leg or root-pose slots are exposed to the policy.
+  commands, and excluded from the loss. No leg or root-pose slots are exposed
+  to the policy.
 
 The Dex1-1 open/close scalar is expanded into the fixed official 7-D G1 hand
 synergy for each side. The real-robot inference adapter projects the predicted
@@ -243,6 +244,116 @@ SUBTASK=pick_leg \
 ./scripts/train_groot_n17.sh
 ```
 
+For the pinned `coarse_insert` dataset on one Slurm node with two GPUs:
+
+```bash
+sbatch deployment/slurm/train_groot_n17_coarse_insert_2gpu.sbatch
+```
+
+The batch resolves the checkout from Slurm's `SLURM_SUBMIT_DIR`, because Slurm
+copies batch scripts into its spool directory before execution. Submit from the
+repository root or this `model/subtask_policy_training` directory. When passing
+W&B settings, keep the rest of the submission environment (including tokens)
+with `ALL`:
+
+```bash
+sbatch \
+  --export=ALL,WANDB_ENABLE=true,WANDB_PROJECT=iros2026-ramen-coarse-insert \
+  deployment/slurm/train_groot_n17_coarse_insert_2gpu.sbatch
+```
+
+If `WANDB_ENABLE=true` is exported without `WANDB_API_KEY` and the submitting
+user has no W&B entry in `~/.netrc`, the batch records an offline W&B run rather
+than aborting. After logging in on a machine with network access, upload it with
+`wandb sync <offline-run-directory>`. Use `--export=ALL,...` to pass an existing
+`WANDB_API_KEY` and log online immediately.
+The batch forwards the key through `SINGULARITYENV_WANDB_API_KEY` without
+placing its value in the Singularity command line.
+
+The batch requests two GPUs and 16 CPU cores on the `debug` partition. It uses
+LeRobot's Accelerate integration with two processes and BF16. The default
+per-process batch is 4, giving a global batch of 8. This conservative setting
+targets three 480x640 camera streams on A100 40GB; larger per-GPU batches may
+reach the memory limit. The job executes inside
+the repository-root `gr00t-lerobot.sif`; it does not create or use a host
+`.venv`. The repository is bind-mounted read/write at
+`/workspace/iros_2026_ramen`, so training views and checkpoints persist on the
+host. The host home directory remains available for Hugging Face caches and
+credentials.
+
+Because the SIF is read-only, the job copies the small LeRobot Python package
+into `outputs/lerobot_source_overlays/groot_relative_eef_v3`, applies the
+checked relative-EEF training patch there, and prepends that directory to
+`PYTHONPATH`. The container installation and the SIF itself remain unchanged.
+The separately gated Cosmos-Reason2 processor assets are read from its public
+Qwen3-VL-2B-Instruct base; all tokenizer, chat-template, and image/video
+processor files have identical Hugging Face Git blob IDs in the two repos.
+
+Multi-GPU training uses FSDP `FULL_SHARD` with transformer-block wrapping: each
+GPU processes a disjoint batch of 4, while parameters, gradients, and FP32 Adam
+states are sharded across both GPUs. This gives a global batch of 8 and avoids
+duplicating the optimizer memory, but does not combine two 40 GB GPUs into a
+generic 80 GB memory pool. An A100 40GB may be
+reported by CUDA as roughly 39.4 GiB; it is still a 40 GB-class GPU and is
+accepted by the batch. GPUs below the recommended 40 GB class produce a warning
+instead of being rejected.
+
+Cluster-specific resource flags and runtime overrides can be supplied at
+submission time:
+
+```bash
+sbatch \
+  --partition=<gpu-partition> \
+  --account=<project> \
+  --gres=gpu:a100:2 \
+  --export=ALL,GROOT_BATCH_SIZE=4,WANDB_ENABLE=true \
+  deployment/slurm/train_groot_n17_coarse_insert_2gpu.sbatch
+```
+
+Use `CONTAINER_IMAGE` if the SIF is staged outside the repository, and
+`SINGULARITY_BIN` if the cluster requires a particular Singularity/Apptainer
+binary:
+
+```bash
+sbatch \
+  --export=ALL,CONTAINER_IMAGE=/shared/containers/gr00t-lerobot.sif \
+  deployment/slurm/train_groot_n17_coarse_insert_2gpu.sbatch
+```
+
+The job requires access to the private Team RAMEN dataset and the gated NVIDIA
+backbone through the submitting user's existing Hugging Face authentication. It
+does not upload the resulting policy by default; set
+`--export=ALL,UPLOAD_AFTER_TRAIN=true` when the final checkpoint should be
+published.
+
+Before downloading or training, the batch runs:
+
+```bash
+python scripts/verify_g1_sdk_joint_mapping.py
+```
+
+This compares the training mapping with the runtime bridge's complete
+`G1_JOINT_NAMES` table. The source vectors use
+`dataset_robot_q_index = 7 + sdk_motor_id`: root pose occupies indices `0..6`,
+and SDK motor IDs `0..28` occupy dataset indices `7..35`. The materializer then
+selects SDK IDs `12..14` (waist), `15..21` (left arm), and `22..28` (right arm)
+for the GR00T REAL_G1 slots. Legs remain available in the verified source
+mapping but are intentionally excluded from this non-walking manipulation
+policy. Dex1 open/close values come from the separate two-value hand fields.
+
+The general training wrapper also accepts `NUM_GPUS`. To invoke it manually in
+the same container:
+
+```bash
+cd /home/naoki.takada/workspace/iros_2026_ramen
+SUBTASK=coarse_insert NUM_GPUS=2 GROOT_BATCH_SIZE=4 \
+singularity exec --nv \
+  --bind "$PWD:/workspace/iros_2026_ramen" \
+  --pwd /workspace/iros_2026_ramen/model/subtask_policy_training \
+  gr00t-lerobot.sif \
+  bash -lc 'VENV_DIR=/opt/lerobot/.venv ./scripts/train_groot_n17.sh'
+```
+
 This uses the shared LeRobot v3 dataset (`DATASET_REPO_ID`) and materializes the
 local REAL_G1 relative-EEF view before launching `lerobot-train`. The first run
 downloads the pinned base model and builds a local sidecar overlay. The overlay
@@ -345,7 +456,8 @@ The source HF dataset is not rewritten. The materializer downloads only
   original recording. Test recordings are excluded from training; LeRobot's
   offline evaluator receives only the held-out validation recordings.
 - For GR00T, `meta/modality.json` with the checked 49-D/53-D group order,
-  source EEF convention, and per-group relative/absolute action semantics.
+  source EEF convention, per-group relative/absolute action semantics, and the
+  complete source `robot_q` index to Unitree SDK motor ID table.
 
 The materializer validates LeRobot v3, 30 Hz, the exact three 640x480 RGB
 cameras, all source vector dimensions, and finite mapped values. It fingerprints
@@ -430,3 +542,29 @@ handled locally by the training view materializer.
 metadata for diagnostics. New and existing training runs must use
 `scripts/train_lerobot.sh`; the obsolete 43-D/47-D standalone GR00T
 materializer has been removed to prevent accidental use.
+
+## Coarse-insert inference
+
+The coarse-insert runtime is
+`inference/coarse_insert.py`; it has no dependency on the flip-table simulator.
+`build_coarse_insert_state()` accepts two root-frame wrist poses, the 29 body
+joints in Unitree SDK ID order, and two physical Dex1 values. The runtime
+decodes only SDK motor IDs 12–28 and the two Dex1 commands. Dex1 outputs are
+projected from each predicted 7-D hand group onto the fixed official G1 hand
+synergy using its least-squares inverse; base-height and navigation outputs are
+never sent to the robot. By default the runtime loads the checked G1 29-DoF +
+Dex1-1 deployment URDF and clamps every SDK target; pass limits loaded by
+`load_sdk_position_limits()` to use a custom URDF.
+
+For held-out dataset inference and URDF motion rendering, use:
+
+```bash
+singularity exec --nv \
+  --bind /home/naoki.takada/workspace/iros_2026_ramen:/workspace/iros_2026_ramen \
+  /home/naoki.takada/workspace/iros_2026_ramen/gr00t-lerobot.sif \
+  bash -lc 'cd /workspace/iros_2026_ramen/model/subtask_policy_training && \
+    PYTHONPATH=outputs/lerobot_source_overlays/groot_relative_eef_v3:$PWD \
+    /opt/lerobot/.venv/bin/python scripts/evaluate_groot_joint_motion.py \
+      --checkpoint outputs/train/CHOSEN_RUN/checkpoints/020000/pretrained_model \
+      --device cuda:0'
+```

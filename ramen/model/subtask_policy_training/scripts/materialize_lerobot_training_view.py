@@ -152,12 +152,15 @@ def materialize_training_view(
         raise ValueError("source-root and output-root must be separate, non-nested directories")
     validate_source_contract(source_root, config)
     source_fingerprint = source_dataset_fingerprint(source_root)
+    task_index_map, task_names = load_dense_task_index_mapping(source_root)
     expected_marker = build_marker(
         repo_id=repo_id,
         source_root=source_root,
         config=config,
         policy_type=policy_type,
         source_fingerprint=source_fingerprint,
+        task_index_map=task_index_map,
+        task_names=task_names,
     )
     if output_root.exists():
         marker_path = output_root / MARKER_PATH
@@ -194,9 +197,10 @@ def materialize_training_view(
         (temporary_root / "videos").mkdir()
 
         copy_optional_file(source_root / "README.md", temporary_root / "README.md")
-        copy_required_file(
-            source_root / "meta" / "tasks.parquet",
+        write_dense_tasks_metadata(
             temporary_root / "meta" / "tasks.parquet",
+            task_index_map=task_index_map,
+            task_names=task_names,
         )
         mapped_vector_stats = rewrite_data_parquets(
             source_root,
@@ -204,6 +208,7 @@ def materialize_training_view(
             config=config,
             policy_type=policy_type,
             stats_episode_indices=training_episode_indices,
+            task_index_map=task_index_map,
             pa=pa,
             pq=pq,
         )
@@ -279,6 +284,7 @@ def rewrite_data_parquets(
     config: dict[str, Any],
     policy_type: str,
     stats_episode_indices: set[int] | None = None,
+    task_index_map: dict[int, int] | None = None,
     pa: Any,
     pq: Any,
 ) -> dict[str, dict[str, Any]] | None:
@@ -320,7 +326,22 @@ def rewrite_data_parquets(
         for key in PRESERVED_DATA_KEYS:
             if key not in table.schema.names:
                 raise KeyError(f"{source_path} is missing required key {key!r}")
-            arrays.append(table[key])
+            if key == "task_index" and task_index_map is not None:
+                source_task_indices = [int(value) for value in table[key].to_pylist()]
+                unknown_task_indices = sorted(set(source_task_indices) - set(task_index_map))
+                if unknown_task_indices:
+                    raise ValueError(
+                        f"{source_path} contains task indices absent from meta/tasks.parquet: "
+                        f"{unknown_task_indices}"
+                    )
+                arrays.append(
+                    pa.array(
+                        [task_index_map[value] for value in source_task_indices],
+                        type=table.schema.field(key).type,
+                    )
+                )
+            else:
+                arrays.append(table[key])
             names.append(key)
         pq.write_table(pa.Table.from_arrays(arrays, names=names), output_path, compression="snappy")
     if stats_episode_indices is not None and seen_stats_episodes != stats_episode_indices:
@@ -838,10 +859,12 @@ def build_marker(
     config: dict[str, Any],
     policy_type: str,
     source_fingerprint: str | None = None,
+    task_index_map: dict[int, int] | None = None,
+    task_names: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     video_map = training_video_map(config)
     return {
-        "schema_version": "team_ramen_training_view_v4",
+        "schema_version": "team_ramen_training_view_v7",
         "source_repo_id": repo_id,
         "source_root": source_root.as_posix(),
         "source_fingerprint_sha256": source_fingerprint or source_dataset_fingerprint(source_root),
@@ -858,10 +881,95 @@ def build_marker(
         "action_semantics": action_semantics_for_policy(config, policy_type),
         "episode_split": config.get("validation", {}),
         "state_action_statistics": "training_episodes_only",
+        "task_index_mapping": [
+            {
+                "source_task_index": source_task_index,
+                "training_task_index": training_task_index,
+                "task": (task_names or {}).get(source_task_index),
+            }
+            for source_task_index, training_task_index in sorted(
+                (task_index_map or {}).items(), key=lambda item: item[1]
+            )
+        ],
         "groot_embodiment_tag": (
             _mapping.REAL_G1_RELATIVE_EEF_EMBODIMENT_TAG if policy_type == "groot" else None
         ),
+        "groot_dex1_hand_encoding": (
+            {
+                "source_range": [0.0, 4.5],
+                "encoding": "fixed official G1 seven-joint synergy",
+                "inverse": "least-squares projection",
+            }
+            if policy_type == "groot"
+            else None
+        ),
+        "groot_action_loss_excluded_indices": (
+            list(_mapping.REAL_G1_DEX1_ACTION_LOSS_EXCLUDED_INDICES)
+            if policy_type == "groot"
+            else None
+        ),
+        "source_robot_q_sdk_mapping": [
+            {
+                "sdk_id": sdk_id,
+                "dataset_index": _mapping.dataset_robot_q_index_from_sdk_id(sdk_id),
+                "joint_name": joint_name,
+            }
+            for sdk_id, joint_name in enumerate(_mapping.G1_SDK_JOINT_NAMES)
+        ],
     }
+
+
+def load_dense_task_index_mapping(source_root: Path) -> tuple[dict[int, int], dict[int, str]]:
+    """Map source task IDs to the dense positional IDs required by LeRobot.
+
+    Curated single-task datasets intentionally preserve the curation task ID
+    (for example task 3) even though tasks.parquet contains only one row.
+    LeRobot resolves task text with ``tasks.iloc[task_index]``, so a training
+    view must use IDs 0..N-1 while retaining the source IDs in its marker.
+    """
+    import pandas as pd
+
+    path = source_root / "meta" / "tasks.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    tasks = pd.read_parquet(path)
+    if "task_index" not in tasks.columns or tasks.empty:
+        raise ValueError(f"{path} must contain at least one task_index row")
+    if "__index_level_0__" in tasks.columns:
+        labels = [str(value) for value in tasks["__index_level_0__"].tolist()]
+    elif "task" in tasks.columns:
+        labels = [str(value) for value in tasks["task"].tolist()]
+    else:
+        labels = [str(value) for value in tasks.index.tolist()]
+    source_indices = [int(value) for value in tasks["task_index"].tolist()]
+    if len(set(source_indices)) != len(source_indices):
+        raise ValueError(f"{path} contains duplicate task_index values")
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"{path} contains duplicate task labels")
+    ordered = sorted(zip(source_indices, labels, strict=True))
+    return (
+        {source_index: dense_index for dense_index, (source_index, _) in enumerate(ordered)},
+        {source_index: label for source_index, label in ordered},
+    )
+
+
+def write_dense_tasks_metadata(
+    output_path: Path,
+    *,
+    task_index_map: dict[int, int],
+    task_names: dict[int, str],
+) -> None:
+    import pandas as pd
+
+    ordered = sorted(task_index_map.items(), key=lambda item: item[1])
+    labels = [task_names[source_index] for source_index, _ in ordered]
+    dense_indices = [dense_index for _, dense_index in ordered]
+    tasks = pd.DataFrame(
+        {"task_index": dense_indices},
+        index=pd.Index(labels, name="task"),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tasks.to_parquet(output_path)
 
 
 def action_semantics_for_policy(config: dict[str, Any], policy_type: str) -> str:
@@ -984,19 +1092,40 @@ def build_grouped_episode_split(
     # Issue #129: 単一 repo (rotate_table_base_merged_v1 等) は source_episode_name column
     # を持たず source_episode_index (int) だけ持つ場合がある。schema-tolerant に fallback。
     # model/ramen_ori/data_lerobot.py の _extract_source_episode_name と同 pattern。
-    sample_cols = pq.read_schema(episode_files[0]).names
-    group_col = (
-        "source_episode_name" if "source_episode_name" in sample_cols
-        else "source_episode_index"
-    )
-    read_cols = ["episode_index", "tasks", group_col]
+    episode_schema_names = set(pq.read_schema(episode_files[0]).names)
+    if "source_episode_name" in episode_schema_names:
+        source_group_column = "source_episode_name"
+    elif "source_episode_index" in episode_schema_names:
+        source_group_column = "source_episode_index"
+    else:
+        raise ValueError(
+            "episode metadata requires source_episode_name or source_episode_index "
+            "for leakage-safe splitting"
+        )
     for path in episode_files:
-        table = pq.read_table(path, columns=read_cols)
+        schema_names = set(pq.read_schema(path).names)
+        if source_group_column not in schema_names:
+            raise ValueError(
+                f"episode metadata group column {source_group_column!r} is missing from {path}"
+        )
+        table = pq.read_table(path, columns=["episode_index", "tasks", source_group_column])
         for row in table.to_pylist():
-            source_key = str(row.get(group_col, "")).strip()
-            if not source_key:
-                raise ValueError(f"{group_col} is required for leakage-safe splitting")
-            groups.setdefault(source_key, []).append(int(row["episode_index"]))
+            source_value = row.get(source_group_column)
+            if source_group_column == "source_episode_name":
+                source_name = "" if source_value is None else str(source_value).strip()
+            else:
+                if isinstance(source_value, bool) or not isinstance(source_value, int):
+                    raise ValueError(
+                        f"source_episode_index must be an integer, got {source_value!r}"
+                    )
+                if source_value < 0:
+                    raise ValueError(
+                        f"source_episode_index must be non-negative, got {source_value}"
+                    )
+                source_name = f"source_episode_index:{source_value}"
+            if not source_name:
+                raise ValueError(f"{source_group_column} is required for leakage-safe splitting")
+            groups.setdefault(source_name, []).append(int(row["episode_index"]))
             all_episode_indices.append(int(row["episode_index"]))
             task_value = row.get("tasks")
             tasks.add(tuple(str(value) for value in (task_value if isinstance(task_value, list) else [task_value])))
@@ -1030,7 +1159,7 @@ def build_grouped_episode_split(
     payload = {
         "schema_version": "team_ramen_grouped_episode_split_v1",
         "seed": seed,
-        "group_key": group_col,  # source_episode_name or source_episode_index (Issue #129 fallback)
+        "group_key": source_group_column,
         "num_tasks": len(tasks),  # Issue #122: multi-task combined の追跡用
         "fractions": {
             "train": 1.0 - validation_fraction - test_fraction,

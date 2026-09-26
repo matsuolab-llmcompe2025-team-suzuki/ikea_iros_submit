@@ -11,8 +11,9 @@
 | | |
 |---|---|
 | upstream | `https://github.com/iacevaltest/iros_g1_orin_package`（運営公式 interface package） |
-| revision | `609f61d1224a1e952eb5f265664bf491b1b1f77b`（`boundary/` は joint lane を足した 27fd499 から不変） |
-| vendor 日 | 2026-09-25（前回 2026-09-23 の 47f4e1b からの差分は `JointSink` ほか joint lane の追加だけ） |
+| package revision | `497f3ab93e5baa706311daebd31c7a9798258450`（2026-09-25、head calibration YAML対応） |
+| boundary revision | `609f61d1224a1e952eb5f265664bf491b1b1f77b`（package内の`boundary/`はここから不変） |
+| vendor 日 | 2026-09-26（4 Pythonファイルをpackage最新版とSHA-256比較済み） |
 | ファイル | `__init__.py` / `actions.py` / `cameras.py` / `states.py`（4 ファイル・888 行、bit 単位で一致） |
 
 提出リポジトリ（`ikea_iros_submit`）の `boundary/` も同じ upstream から `tools/update_organizer.sh` で

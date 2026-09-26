@@ -24,6 +24,9 @@
     "tighten": {
       "task": "rotate leg to tighten"
     },
+    "insert_and_tighten": {
+      "task": "insert table leg to table base and rotate leg to tighten"
+    },
     "rotate_table_base": {
       "task": "rotate table base",
       "dataset_repos": [
@@ -220,7 +223,7 @@
         "navigate"
       ],
       "require_native_relative_eef_processor": true,
-      "processor_overlay_root": "outputs/groot_base_overlays/real_g1_relative_eef_3cam",
+      "processor_overlay_root": "outputs/groot_base_overlays/real_g1_relative_eef_3cam_dex1_v2",
       "use_bf16": true,
       "image_transforms_enable": true,
       "batch_size": 64,

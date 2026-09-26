@@ -159,12 +159,12 @@ EMBODIMENT_ID: int = 25
 #   - base 4D (base_height_command 1 + navigate_command 3):
 #     下半身 / 歩行制御用、Regular Mode arm-only では非対応。drop。
 #
-# 【Hand encoding の verify 結果】(2026-08-30、user 指示で HF 実測):
-# 全 4 GR00T ckpt (hara_task_5_7 / takada_insert / takada_rotate / suzuki_flip)
-# の policy_postprocessor.json:raw_stats.action.{left,right}_hand は 7 dim 全て
-# active (range 0.7〜1.5、mean nonzero) = **全 variant で synergy encoding**。
-# 単純に position [18] / [25] を取ると 7D 情報の 1/7 しか使わず精度劣化するため
-# hand_to_dex1() で必ず逆射影する (variant 分岐なし)。詳細は
+# 【Hand encoding の契約】:
+# 本 adapter は固定 7 関節 synergy で学習したモデル専用。
+# raw_stats はベースモデル由来の場合もあり、7D の統計だけでは学習時の
+# encoding を判定できない。旧 scalar-first Dex1 モデルはそのまま利用せず、
+# 新変換で training view / processor を再生成して学習し直すこと。
+# hand_to_dex1() で逆射影する (variant 分岐なし)。詳細は
 # model/subtask_policy_training/gr00t/dex1_hand_synergy.py と
 # assets/dex1_g1_synergy.json (Dex1 open=4.5 / closed=0.0 rad の calibration)。
 #

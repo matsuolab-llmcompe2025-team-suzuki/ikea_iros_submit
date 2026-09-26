@@ -1,4 +1,4 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 9849a17bcb9cdf3dd57b3f7f4059aa66581cb612
-subject: #161 add:connection_test_switches_for_the_wrist_roll_clamp_and_the_walk_latch
+commit: 9965c90bdf53763121a0e383f5c442e4b0f1e2dd
+subject: Merge issue #170: review latest organizer interface contract
