@@ -10,8 +10,13 @@
   (execve したコマンド) も出す。会場は実行時にネットに出ないので、0 件が合格
 - --actuate の run (result.txt に mode=actuate、run_stage.sh の ACTUATE_HOLD): Enter 1 の問いと
   go-live 待ち (`[go-live]`) まで進み、log にコードの誤り (NameError 等) が無いのが合格。終わり方は
-  Ctrl+C (rc 0 か 130) か、模擬の PC2 が指令に従わないための設計どおりの停止 (準備動作の時間切れ。
-  Stage 0 は腕を下ろせないと歩かずに RuntimeError で止まる) のどちらか。それ以外の例外は不合格。
+  Ctrl+C (rc 0 か 130) か、模擬の PC2 が指令に従わないための設計どおりの停止のどちらか:
+  - Stage 0: 腕を下ろせないと歩かずに RuntimeError で止まる (rc=1)
+  - Stage 1〜5 (本体 858e107 以降): 準備動作が開始姿勢に届かず安全停止 (rc=2、`[safety-stop]
+    operator transition … did not reach its target`)
+  どちらも本体 #172 以降は、戻す前に「安全停止／保持中・判断待ち」で操作者の判断を待ち、
+  run_stage.sh が Enter を送る。判断の行 (`[safety-stop] operator confirmed …` など) が無ければ不合格。
+  それ以外の例外は不合格。
   後始末は例外を握って `[return] failed: <例外>` と出すので、rc だけでは誤りが見えない
   (2026-09-25 の本番 image の numpy の import 漏れがそうだった)
 """
@@ -37,6 +42,14 @@ EXCEPTION_LINE = re.compile(r"^\w+(?:Error|Exception|Interrupt)\b.*$", re.M)
 #: 模擬の PC2 は指令に従わない (関節は勝手に sin 波で動く) ので、腕を動かす準備動作は時間切れになる。
 #: 会場ではそこで止めるのが設計 (Stage 0 は腕を下ろせないまま歩かない)
 MOCK_STOP = re.compile(r"^RuntimeError: .*did not converge")
+#: Stage 1〜5 の設計どおりの停止 (本体 858e107): 準備動作が届かないと次の policy へ進まず安全停止
+MOCK_SAFETY_STOP = re.compile(r"\[safety-stop\] operator transition .* did not reach its target")
+#: 安全停止・想定外の終了の後に、戻す前に操作者の判断を待った印 (本体 #172)
+DECISION_PROMPT = "判断待ち"
+DECISION_MADE = re.compile(
+    r"\[safety-stop\] (operator confirmed the return motion|operator chose to end|"
+    r".*no operator terminal|operator terminal closed)"
+)
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0"}
 
 
@@ -100,10 +113,17 @@ def actuate_problems(result: str, log: str) -> list[str]:
         lines = EXCEPTION_LINE.findall(tail)
         final = lines[-1] if lines else "(例外の行が無い)"
     stopped_by_mock = bool(re.search(r"\brc=1\b", result) and MOCK_STOP.match(final))
+    safety_stop = bool(
+        not final and re.search(r"\brc=2\b", result) and MOCK_SAFETY_STOP.search(log)
+    )
     if final and not stopped_by_mock:
         problems.append(f"想定外の例外で止まった: {final[:120]}")
-    elif not stopped_by_mock and not re.search(r"\brc=(0|130)\b", result):
+    elif not (stopped_by_mock or safety_stop) and not re.search(r"\brc=(0|130)\b", result):
         problems.append("Ctrl+C でも設計どおりの停止でもない終わり方 (rc)")
+    if stopped_by_mock or safety_stop:
+        # 故障の後は、戻す前に操作者の判断を待つ (本体 #172)。待たずに腕を動かしていたら不合格
+        if DECISION_PROMPT not in log or not DECISION_MADE.search(log):
+            problems.append("安全停止の後に操作者の判断を待っていない (判断待ち / 判断の行が無い)")
     if "Enter starts" not in log:
         problems.append("Enter 1 の問いまで進んでいない")
     if "[go-live]" not in log:
@@ -143,6 +163,8 @@ def main() -> int:
             for pid, destination, command in external[:12]:
                 print(f"     pid {pid} -> {destination}  cmd: {command}")
             failed |= bool(external)
+        else:
+            print("   外向き通信: 未検査 (connect.log がない)")
         if "mode=actuate" in result:
             problems = actuate_problems(result, log)
             for problem in problems:
@@ -150,6 +172,9 @@ def main() -> int:
             failed |= bool(problems)
         else:
             failed |= not re.search(r"\brc=0\b", result)
+            if not re.search(r"\[preflight\].*validation passed; NO command sent", log):
+                print("   preflight 完了の記録がない")
+                failed = True
     return 1 if failed else 0
 
 

@@ -68,10 +68,22 @@ class RuntimeConfig:
     """Production-orchestrator limits for the complete hybrid skill."""
 
     hard_timeout_sec: float
+    phase1_timeout_sec: float
+    phase2_timeout_sec: float
 
     def __post_init__(self) -> None:
         if self.hard_timeout_sec <= 0:
             raise ValueError("runtime.hard_timeout_sec must be > 0")
+        if min(
+            self.phase1_timeout_sec,
+            self.phase2_timeout_sec,
+        ) <= 0:
+            raise ValueError("runtime phase timeouts must be > 0")
+        if self.hard_timeout_sec <= self.phase1_timeout_sec + self.phase2_timeout_sec:
+            raise ValueError(
+                "runtime.hard_timeout_sec must leave time for phase 3 after "
+                "the phase 1 and phase 2 deadlines"
+            )
 
 
 @dataclass(frozen=True)
@@ -122,6 +134,8 @@ class PickLegHybridConfig:
             ),
             runtime=RuntimeConfig(
                 hard_timeout_sec=float(runtime["hard_timeout_sec"]),
+                phase1_timeout_sec=float(runtime["phase1_timeout_sec"]),
+                phase2_timeout_sec=float(runtime["phase2_timeout_sec"]),
             ),
             phase2=Phase2Config(
                 goal_left=_pose(_require(p2, "goal_left"), "phase2.goal_left"),

@@ -225,6 +225,11 @@ class Phase2Motion:
         s = (float(t) - self._t0) / self.cfg.duration_sec
         return float(min(1.0, max(0.0, s)))
 
+    def elapsed(self, t: float) -> float:
+        if self._t0 is None:
+            raise RuntimeError("Phase2Motion.start() must be called first")
+        return max(0.0, float(t) - self._t0)
+
     def pose_at(self, t: float) -> tuple[EePose, EePose]:
         """時刻 t での左右の目標手先姿勢。"""
         if self._t0 is None or self._start_left is None or self._start_right is None:

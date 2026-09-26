@@ -116,8 +116,8 @@ def stage_enter_check() -> dict[str, Callable[[list[OBBDetection], SkillState], 
 
     上位 policy (YOLO の ``enter_*``) は、pick の途中など skill が終わる前に次の
     skill へ進めることがあったので外す (2026-09-24 ユーザー決定)。stage の run は
-    skill の完了 (``is_complete``) と時間切れ (``timeout_reason`` /
-    ``max_seconds_hard``) だけで進む (``advance_finished_skill``)。
+    手動本番経路では完了・時間切れでも次の policy へ進まず、操作者の N だけで
+    進む。有限の準備動作だけ実測到達で自動進行する。
 
     YOLO の検出そのものは止めない。``tick()`` は検出を policy 用の filter にも通し、
     ``obs["cleaned"]`` として skill に渡す (台を回す model と hybrid の VLM の
@@ -600,6 +600,11 @@ class Orchestrator:
         timeout_action_by_skill: Optional[dict[str, str]] = None,
         camera_stale_timeout_s: float = CAMERA_STALE_TIMEOUT_S,
         on_tick: Optional[Callable[["TickResult", dict, Any], None]] = None,
+        operator_console: Optional[Any] = None,
+        operator_stage: Optional[int] = None,
+        operator_retry_routes: Optional[dict[str, str]] = None,
+        operator_hold_target: Optional[Callable[[], Optional[np.ndarray]]] = None,
+        operator_terminal_next: bool = False,
     ) -> None:
         if head_perception_view not in {"packed", "left", "right"}:
             raise ValueError(
@@ -641,6 +646,12 @@ class Orchestrator:
                 f"camera_stale_timeout_s must be > 0, got {camera_stale_timeout_s}"
             )
         self.on_tick = on_tick
+        self.operator_console = operator_console
+        self.operator_stage = operator_stage
+        self.operator_retry_routes = dict(operator_retry_routes or {})
+        self.operator_hold_target = operator_hold_target
+        self.operator_terminal_next = operator_terminal_next
+        self._operator_finished = False
         self._policy_cleaned: Optional[list[OBBDetection]] = None
         # active skill の経過時間追跡。`advance_finished_skill()` が使う。
         # run_live() の局所変数だったものを instance に上げた: boundary の driver は
@@ -753,7 +764,36 @@ class Orchestrator:
         if started or fired_to is not None:
             obs = self._build_obs(frame, self._policy_cleaned)
             self._check_observation_freshness(obs)
-        action = self.dispatcher.step(obs)
+        active = self.dispatcher.active_skill
+        if (
+            self.operator_console is not None
+            and active is not None
+            and active.name in LEARNED_STAGE_SKILLS
+            and active.is_complete
+        ):
+            # A finite policy has finished its own motions.  Keep sending its
+            # last published target until N; do not call step() again.
+            action = (
+                self.operator_hold_target()
+                if self.operator_hold_target is not None
+                else None
+            )
+        else:
+            action = self.dispatcher.step(obs)
+        if (
+            self.operator_console is not None
+            and active is not None
+            and active.name in LEARNED_STAGE_SKILLS
+        ):
+            # Inference can take hundreds of milliseconds.  If N/R arrived
+            # while step() was computing, discard that result before publish.
+            pending_key = self.operator_console.poll()
+            if pending_key is not None:
+                self._operator_command(pending_key)
+                action = (
+                    self.operator_hold_target()
+                    if self.operator_hold_target is not None else None
+                )
         if action is not None and self.actuator_send_fn is not None:
             self.actuator_send_fn(action)
 
@@ -772,6 +812,82 @@ class Orchestrator:
         if self.on_tick is not None:
             self.on_tick(result, obs, self.dispatcher.active_skill)
         return result
+
+    def _operator_command(self, key: str) -> None:
+        current = self.dispatcher.active_skill_name
+        if current not in LEARNED_STAGE_SKILLS:
+            return
+        if key == "r":
+            target = self.operator_retry_routes.get(current)
+            if target is None:
+                return
+            reason = "operator_retry"
+        elif key == "n":
+            candidates = self.transitions.get(current, [])
+            if not candidates:
+                if self.operator_terminal_next:
+                    self._operator_finished = True
+                return
+            target = candidates[0]
+            reason = "operator_next"
+        else:
+            return
+        self._log_control_event(reason, skill=current, next_skill=target)
+        self.state.transition(target, self._build_transition_ctx(target))
+        self.dispatcher.start(target, self._build_params(target))
+
+    def _show_operator_view(self) -> None:
+        console = self.operator_console
+        if console is None or self.operator_stage is None:
+            return
+        active = self.dispatcher.active_skill
+        if active is None:
+            return
+        name = active.name
+        if getattr(active, "owns_operator_view", False):
+            # Every operator gate (policy start, R confirmation, leg placement)
+            # prints its own prompt from its input thread.  Overwriting it here
+            # would leave no accepted key, so Enter would be dropped forever.
+            return
+        if name in LEARNED_STAGE_SKILLS:
+            phase = getattr(active, "hybrid_phase", None)
+            pick_phase_labels = {
+                1: "初回把持", 2: "脚の運搬", 3: "持ち替え・insert準備",
+            }
+            suffix = (
+                f"／{pick_phase_labels.get(int(phase), str(phase))}"
+                if phase is not None else ""
+            )
+            completed = "／完了・保持" if active.is_complete else ""
+            labels = {
+                "rotate_table_base": "テーブル回転",
+                "pick_table_leg": "pick",
+                "insert_table_leg": "insert",
+                "rotate_leg_to_tighten": "tighten",
+                "flip_table": "flip",
+            }
+            allowed = (
+                ("n", "r")
+                if self.transitions.get(name) or self.operator_terminal_next
+                else ("r",)
+            )
+            console.show(
+                self.operator_stage, f"{labels.get(name, name)}{suffix}{completed}", allowed
+            )
+        else:
+            if name.startswith("retry_open_"):
+                phase = "やり直し／腕保持・ハンド開放中"
+            elif name.startswith(("retry_arm_", "arm_transition_", "arm_pre_motion_")):
+                phase = "初期姿勢へ移動中"
+            elif name.startswith(("retry_hand_", "hand_transition_", "hand_open_")):
+                phase = "ハンド初期姿勢へ移動中"
+            elif name.startswith(("hold_transition_", "retry_hold_", "hold_pose_")):
+                phase = "姿勢保持・モデル準備中"
+            elif self.operator_stage == 0:
+                phase = "歩行・初期姿勢準備中"
+            else:
+                phase = "準備中"
+            console.show(self.operator_stage, phase, ())
 
     def _check_camera_freshness(self, obs: dict) -> None:
         """4 台のカメラの受信時刻を見て、止まっていれば安全停止に回す (Issue #141 D3)。
@@ -923,6 +1039,21 @@ class Orchestrator:
                     )
                     return
 
+            # Consume N/R before the next policy step.  A key arriving after
+            # the previous tick must invalidate its pending chunk before any
+            # new arm or hand command is computed.
+            if self.operator_console is not None:
+                self._show_operator_view()
+                # N/R act only on a learned policy (`_operator_command`).  While a
+                # gate's input thread waits for Enter/R, polling here would take
+                # that key from the shared queue and drop it.
+                if self.dispatcher.active_skill_name in LEARNED_STAGE_SKILLS:
+                    key = self.operator_console.poll()
+                    if key is not None:
+                        self._operator_command(key)
+                if self._operator_finished:
+                    return
+
             frame = source.get()
             now = time.monotonic()
 
@@ -997,7 +1128,11 @@ class Orchestrator:
                 next_deadline = time.monotonic()
 
     def advance_finished_skill(self, now: Optional[float] = None) -> SkillAdvance:
-        """active skill が終わったか時間切れなら次へ進める。1 回の呼び出しで最大 1 遷移。
+        """有限手順の完了を処理する。旧経路では時間切れも処理する。
+
+        operator_console がある本番 Stage では学習Policyの完了・時間切れによる
+        自動遷移は行わず、未到達の準備動作も次へ進めない。
+        1 回の呼び出しで最大 1 遷移。
 
         `tick()` は **YOLO の `enter_check` しか見ない**。この method はその受け皿で、
         5 つの signal を順に見る:
@@ -1078,6 +1213,17 @@ class Orchestrator:
                 f"target; holding and refusing the next skill: {failure_reason}"
             )
 
+        if self.operator_console is not None:
+            if current_active in LEARNED_STAGE_SKILLS:
+                return SkillAdvance()
+            # A failed finite pose/hand movement must never be interpreted as
+            # permission to begin the next learned policy.
+            if getattr(active_skill_obj, "timeout_reason", None):
+                raise LiveSourceSafetyError(
+                    f"operator transition {current_active!r} did not reach its target: "
+                    f"{active_skill_obj.timeout_reason}"
+                )
+
         # 1) 観測駆動の有限 skill (腕の pre-motion 等) は measured target が収束して
         #    初めて完了する。**max_dwell より先に見る**ので、時間切れを「成功」と
         #    取り違えない。
@@ -1099,6 +1245,23 @@ class Orchestrator:
                 "complete",
                 f"[orch] skill_complete transition: {current_active} -> {candidates[0]}",
             )
+
+        if self.operator_console is not None and self.operator_stage != 0:
+            # Preparation moves may finish only by verified completion.  A
+            # generic max_dwell must never skip an unfinished arm/hand target.
+            max_dwell = (
+                active_skill_obj.max_dwell_sec
+                if active_skill_obj is not None else None
+            )
+            if (
+                max_dwell is not None and started_at is not None
+                and now - started_at >= max_dwell
+            ):
+                raise LiveSourceSafetyError(
+                    f"operator transition {current_active!r} exceeded its "
+                    f"{max_dwell:g}s dwell without verified completion; holding"
+                )
+            return SkillAdvance()
 
         # 1b) 有限手順が自分の締め切りまでに目標へ届かなかった。YAML の時間切れと
         #     同じ扱いで次へ進む。理由は JSONL (detail) と stderr に残す。

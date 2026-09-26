@@ -46,7 +46,7 @@ split、raw robot state は RawRobotState に集約。obs["cleaned"] は現状 f
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -110,6 +110,7 @@ class VlaSkill(Skill):
         skill_id_override: int | None = None,  # Issue #141: per-variant skill_id swap
         progress_monitor: Any = None,  # Issue #137: RotateProgressMonitor (optional)
         teacher_range: Any = None,  # Issue #141: TeacherJointRange (optional)
+        teacher_range_observe_only: bool = False,
         z_ceiling: Any = None,  # Issue #137: LeftHandZCeiling (optional)
         retry_controller: Any = None,  # Issue #137: RotateRetryController (optional)
         retry_options: dict | None = None,  # return_mode / tolerance 等
@@ -174,6 +175,9 @@ class VlaSkill(Skill):
         # Issue #141 (1-4): 教師データの関節範囲を出た腕関節だけを内側へ戻す
         # (`skills/teacher_range.py`)。None なら補正なし = 従来動作。
         self._teacher_range = teacher_range
+        if teacher_range_observe_only and teacher_range is None:
+            raise ValueError("teacher_range_observe_only requires teacher_range")
+        self._teacher_range_observe_only = bool(teacher_range_observe_only)
         # Issue #137 Phase 4: 空振り retry FSM。None = 何もしない (既定)。
         # 成功しても skill は終了させない — 遷移は上位 policy
         # (`enter_pick_table_leg`) が持っているので責務を二重化しない。
@@ -192,6 +196,11 @@ class VlaSkill(Skill):
         self.last_action: PolicyAction | None = None
         self._action_queue: list[np.ndarray] = []
         self._action_queue_next_index = 0
+        self._operator_interrupt_pending: Callable[[], bool] = lambda: False
+
+    def set_operator_interrupt_pending(self, pending: Callable[[], bool]) -> None:
+        """Suppress side-channel hand/waist sends while N/R awaits the loop."""
+        self._operator_interrupt_pending = pending
 
     def _on_start(self, params: dict) -> None:
         """episode 開始時: frame buffer + state buffer reset + policy/limiter reset。"""
@@ -384,9 +393,10 @@ class VlaSkill(Skill):
         teacher_range_result = None
         if self._teacher_range is not None:
             teacher_range_result = self._teacher_range.apply(current_step)
-            current_step = teacher_range_result.target_19d.astype(
-                current_step.dtype, copy=False
-            )
+            if not self._teacher_range_observe_only:
+                current_step = teacher_range_result.target_19d.astype(
+                    current_step.dtype, copy=False
+                )
         if self._motion_limiter is not None:
             measured_19d = self._measured_19d(obs)
             current_step = self._motion_limiter.apply(
@@ -422,9 +432,17 @@ class VlaSkill(Skill):
         # 何回効いたかを見るため)。補正が無効な skill では key ごと出さない。
         if teacher_range_result is not None:
             action_metadata.update({
+                "teacher_range_observe_only": self._teacher_range_observe_only,
+                "teacher_range_applied": (
+                    teacher_range_result.bind and not self._teacher_range_observe_only
+                ),
                 "teacher_range_bind": bool(teacher_range_result.bind),
-                "teacher_range_corrected_joints": list(
+                "teacher_range_would_correct_joints": list(
                     teacher_range_result.corrected_joints
+                ),
+                "teacher_range_corrected_joints": list(
+                    () if self._teacher_range_observe_only
+                    else teacher_range_result.corrected_joints
                 ),
                 "teacher_range_max_excursion_rad": float(
                     teacher_range_result.max_excursion_rad
@@ -494,6 +512,8 @@ class VlaSkill(Skill):
         )
 
         # 3. waist + hand は internal dispatch、arm は return
+        if self._operator_interrupt_pending():
+            return None
         # Issue #144: skill が腰を流す設定でも、腰を出さない ckpt (RAMEN-Ori の 16D
         # 学習) のときは流さない。その chunk[0:3] は推論側が詰めた 0 で、送ると腰が
         # 直立へ寄る。腰を出すかは skill ではなく ckpt の性質なので policy に聞く。

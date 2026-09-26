@@ -10,10 +10,13 @@
 #   ACTUATE_HOLD=60 run_stage.sh 0 stage0_actuate     # --actuate の経路 (下)
 #
 # ACTUATE_HOLD=<秒>: --actuate を付け、Enter 1 の問いが出たら改行を送り、go-live 待ち
-# (`[go-live]`) が出てから <秒> 待って Ctrl+C (python の process にだけ SIGINT) を送る。
-# 指令の経路 (boundary の publish・実測の関節の読み取り) が落ちずに動くことと、Ctrl+C の後の
-# 後始末 (手を開いて腕を下ろす) までを通す。模擬の PC2 の関節は指令と関係なく sin 波で動くので、
-# go-live 待ちは成立し、その先の準備動作は時間切れになる (Stage 0 は腕を下ろせず設計どおり止まる)。
+# (`[go-live]`) が出てから <秒> 待つ。その間に安全停止して「安全停止／保持中・判断待ち」が
+# 出ていれば Enter (戻し動作) を送り、出ていなければ自分の擬似端末へ Ctrl+C を送る。
+# 指令の経路 (boundary の publish・実測の関節の読み取り) が落ちずに動くことと、後始末
+# (手を開いて腕を下ろす) までを通す。模擬の PC2 の関節は指令と関係なく sin 波で動くので、
+# go-live 待ちは成立し、その先の準備動作は時間切れになる (本体 858e107 以降、Stage 1〜5 は
+# 安全停止 → 判断待ち。Stage 0 は腕を下ろせず設計どおり止まり、同じく判断待ち)。
+# 起動口は --actuate のとき対話端末を要るので、pty_run.py で擬似端末の上で動かす (会場の -it と同じ)。
 # result.txt に mode=actuate を書く (summarize.py の判定)。
 #
 # 出力 (${RUNS_DIR:-/root/runs}/<出力名>/):
@@ -29,6 +32,8 @@
 
 set -u
 
+# 下で cd するので、隣の pty_run.py の場所は先に決める
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 N="$1"
 NAME="$2"
 shift 2
@@ -39,7 +44,8 @@ mkdir -p "${OUT}"
 cd "${RAMEN_ROOT:-/app/ramen}"
 
 if [[ -z "${NO_MOCK:-}" ]]; then
-  pixi run --as-is -e runtime python /app/mocks/mock_orin.py --stereo-ego > "${OUT}/mock.log" 2>&1 &
+  setsid pixi run --as-is -e runtime python /app/mocks/mock_orin.py --stereo-ego > "${OUT}/mock.log" 2>&1 &
+  MOCK_PID=$!
   sleep 5
 fi
 
@@ -83,7 +89,8 @@ else
   # 裏で (&) 起動した process は SIGINT が無視の設定で始まり、python は Ctrl+C を受けなくなる
   # (bash は job control の無い裏の process の SIGINT を無視にする)。起動の直前に既定へ戻す。
   RESET_SIGINT=(python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])')
-  IROS_ORIN_HOST=127.0.0.1 "${RESET_SIGINT[@]}" ${TRACE[@]+"${TRACE[@]}"} "${VENUE_BIN}" --stage "${N}" --actuate "$@" \
+  PTY_RUN=(python3 "${SCRIPT_DIR}/pty_run.py")
+  IROS_ORIN_HOST=127.0.0.1 "${RESET_SIGINT[@]}" "${PTY_RUN[@]}" ${TRACE[@]+"${TRACE[@]}"} "${VENUE_BIN}" --stage "${N}" --actuate "$@" \
     > "${OUT}/run.log" 2>&1 < "${FIFO}" &
   VENUE_PID=$!
   # 書き手を開いたままにする (閉じると起動口の input() が EOF で落ちる)
@@ -95,10 +102,15 @@ else
       sleep "${ACTUATE_HOLD}"
     fi
   fi
-  # Ctrl+C 相当。pixi と strace ではなく python の process にだけ送る (会場の Ctrl+C と同じ後始末を通す)。
-  # -i: macOS の python は .../MacOS/Python として動く (手元の test 用。image は python)
-  echo "[run_stage] sending SIGINT" >> "${OUT}/steps.log"
-  pkill -INT -i -f '^[^ ]*python[0-9.]* -m inference\.desktop\.entrypoint' 2>/dev/null  # 信号は先頭 (macOS)
+  if grep -q "判断待ち" "${OUT}/run.log" 2>/dev/null; then
+    # 安全停止の後の判断: Enter = 戻し動作 (後始末の経路を通す)
+    echo "[run_stage] safety stop is waiting for the operator; sending Enter (return)" >> "${OUT}/steps.log"
+    printf '\n' >&3
+  else
+    # 名前検索で別の実行を止めず、この端末の foreground process group にだけ届ける。
+    echo "[run_stage] sending Ctrl+C (SIGINT)" >> "${OUT}/steps.log"
+    printf '\003' >&3
+  fi
   # 後始末 (腕を下ろす、最大 60 s) を待つ。終わらなければ止める
   deadline=$(($(date +%s) + ${ACTUATE_EXIT_TIMEOUT:-180}))
   while kill -0 "${VENUE_PID}" 2>/dev/null && (($(date +%s) <= deadline)); do
@@ -116,6 +128,8 @@ fi
 T1=$(date +%s)
 
 kill "${GPU_PID}" "${MEM_PID}" 2>/dev/null
-pkill -f mock_orin.py 2>/dev/null
+if [[ -n "${MOCK_PID:-}" ]]; then
+  kill -TERM -- "-${MOCK_PID}" 2>/dev/null
+fi
 wait 2>/dev/null
 echo "rc=${RC} secs=$((T1 - T0)) mode=${MODE}" | tee "${OUT}/result.txt"
