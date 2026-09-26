@@ -1,311 +1,67 @@
-# Team RAMEN — IKEA IROS Assembly Challenge Submission (Unitree G1)
+# Team RAMEN — IKEA IROS 提出物
 
-> ## Team RAMEN submission
->
-> - **Lane:** `decoupled` ((T,25) task-space)
-> - **Images** (linux/arm64, GHCR、digest 指定。正本は `manifest.yaml`):
->   - Thor (server): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:249e504251dd7537410199f724e06348b72a746b09b0cf94e486c6b25a6e6ebb`
->   - Orin (client): `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-orin@sha256:b5e61a0dc502cf0b1fe225392bff42bf60812fc91034f7643d8da183b9b257da`
-> - **Base images:** Thor `nvcr.io/nvidia/pytorch:25.12-py3`（`@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8`）、Orin `nvcr.io/nvidia/l4t-jetpack:r35.3.1`
-> - **Status:** `boundary/` unmodified（`components/ramen/tests/test_boundary_is_organizer_code.py`
->   が運営配布物との sha256 一致を固定）、`conformance.py --lane decoupled --full-rig` PASS。
-> - **Policy:** 1 つの image に全部入っている。`rotate_table_base` は RAMEN-Ori、
->   `pick_table_leg` / `insert_table_leg` / `rotate_leg_to_tighten` / `flip_table` は
->   GR00T、それらを YOLO perception の orchestrator が自動遷移させる
->   (`RAMEN_POLICY=groot_orchestrator`)。**hold-still stub ではない。**
-> - **Run / manifest:** `INSTRUCTIONS.md` と `manifest.yaml`。運用手順は
->   **[`GROOT_DEPLOY.md`](./GROOT_DEPLOY.md)**。
->
-> ⚠️ かつて RAMEN-Ori トラックと GR00T トラックを別 manifest で並存させていたが、
-> **その分岐はもう無い**。`manifest.groot.yaml` は 2026-09-22 に `manifest.yaml`
-> へ統合した（運営は `manifest.yaml` をファイル名で要求している / `CONTRACT.md:24`）。
+## Team RAMEN の部分と直す場所
 
-RAMEN submits **two containers**: a policy server for the Jetson AGX Thor and a
-policy client for the Jetson Orin NX onboard the G1. What runs inside them is
-entirely ours — framework, model, architecture, whether we use a VLA at all.
+**推論のコードの正本は本体（`iros_2026_ramen`）。** この repo の `ramen/` は本体の 1 commit の写しで、
+`tools/sync_ramen.sh` だけが書き換える。**`ramen/` は手で直さない**（次のコピーで黙って消え、本体のどの
+commit と同じなのかも分からなくなる）。
 
-The organizer owns three endpoints on the Orin and an independent e-stop.
-Those, and nothing else, are the contract.
-
----
-
-## 1 · The Boundary
-
-```
-JETSON AGX THOR                          JETSON ORIN NX (onboard the G1)
-192.168.100.1                            192.168.100.2
-┌──────────────────────┐                 ┌────────────────────────────────┐
-│ components/server.py │                 │ components/client.py           │
-│                      │◄── ethernet ───►│                                │
-│   our model          │  our transport  │   boundary.CameraStream  :5555 │◄─ cameras
-│                      │                 │   boundary.StateStream   :5557 │◄─ state
-└──────────────────────┘                 │   boundary.ActionSink    :5556 │──► WBC
-        OURS                             └────────────────────────────────┘
-                                              OURS           ORGANIZER'S
-```
-
-| Endpoint | Direction | Port | Format |
-|---|---|---|---|
-| Cameras | we subscribe | `:5555` | msgpack `{"timestamps": {...}, "images": {key: jpeg}}` |
-| State | we subscribe | `:5557` | topic `g1_debug` + msgpack `{body_q, base_quat, ...}` |
-| Actions | **we bind**, the controller dials in | `:5556` | lane-dependent — see §4 |
-
-**We bind `:5556`.** That is backwards from habit and catches everyone once.
-The controller is the long-lived process; our client comes and goes.
-
-We use `boundary/` as shipped and do not edit it — a local change passes our
-tests and fails on the robot.
-
----
-
-## 2 · Layout
-
-```
-ikea_iros_submit/
-├── boundary/            ORGANIZER-OWNED — do not modify
-│   ├── cameras.py         SUB  :5555
-│   ├── states.py          SUB  :5557
-│   └── actions.py         BIND :5556   ← the only lane-aware module
-├── components/          OURS — this is what we edit
-│   ├── server.py          runs on the Thor. Replace Policy.act().
-│   ├── client.py          runs on the Orin. Adapt the loop.
-│   └── transport.py       Thor↔Orin link. Ours to change.
-├── mocks/               develop with no robot
-│   ├── mock_orin.py       fake cameras + fake state
-│   └── mock_wbc.py        fake controller; validates what we publish
-├── conformance.py       run this before we ship
-├── requirements.txt
-├── docker/              RAMEN — **Dockerfile.thor** (提出 image) / Dockerfile.orin
-│                          (Dockerfile.smoke-arm64 は検証用)
-├── manifest.yaml        RAMEN — lane / image digests / base / entrypoints / port
-├── INSTRUCTIONS.md      RAMEN — build & run commands for the organizer
-└── VENDOR_NOTES.md      RAMEN — provenance & our divergences from upstream
-```
-
-Realistically we edit **`components/server.py`** and little else.
-
-| Path | Owner | What it does |
-|---|---|---|
-| **`boundary/`** | organizer | The contract. Three endpoints, nothing else. Editing anything here makes our tests pass and the robot fail. |
-| `boundary/__init__.py` | organizer | Re-exports `CameraStream`, `StateStream`, `ActionSink`. Import from here, not from the submodules. |
-| `boundary/cameras.py` | organizer | Subscribes `:5555`, decodes JPEG, flips BGR→RGB, hands us `(480,640,3)` uint8. Newest frame wins — a slow policy skips frames instead of falling behind. |
-| `boundary/states.py` | organizer | Subscribes `:5557` topic `g1_debug`, validates the schema, returns `RobotState` with `body_q (29,)` and `base_quat (4,)`. Same on both lanes. |
-| `boundary/actions.py` | organizer | **Binds** `:5556` and publishes our actions. The only lane-aware file: `SonicSink` frames latents for the deploy, `DecoupledSink` sends `(T,25)` chunks. Validates every action and raises `ActionError` rather than publish a malformed one. |
-| **`components/`** | **RAMEN** | Our submission. Both files ship as working references — we replace as much as we like. |
-| `components/server.py` | **RAMEN** | **The file we replace.** Runs on the Thor. We load our model in `__init__`, put inference in `Policy.act()`, keep `metadata`/`act`/`reset`. Ships a hold-still policy so the pipeline runs before our model exists. `--delay-ms` fakes inference time. |
-| `components/client.py` | **RAMEN** | Runs on the Orin. Reads both endpoints, calls the Thor, publishes actions. Already pipelined: next inference starts while the current chunk plays, and rows made stale by latency are skipped. Warns when our chunk is too short for our latency. |
-| `components/transport.py` | **RAMEN** | The Thor↔Orin link — WebSocket + msgpack with a numpy hook. Entirely inside our submission; the organizer never speaks it. Ours to change (we version-guard the websockets keepalive kwargs so it runs on the Orin's Python 3.8). |
-| **`mocks/`** | organizer | Fake robot, so we can develop with no hardware. |
-| `mocks/mock_orin.py` | organizer | Stands in for the Orin: publishes synthetic cameras on `:5555` and state on `:5557` in the exact real formats. Defaults to a Dex1-1 rig (no hand state). |
-| `mocks/mock_wbc.py` | organizer | Stands in for the whole-body controller: dials into `:5556`, decodes what we publish, prints `ACTION REJECTED` with a reason. If this is happy, the real controller will parse us. |
-| **`conformance.py`** | organizer | Runs all four processes and gives one PASS/FAIL. We run it before every submission and before every bench session. |
-| `requirements.txt` | organizer | Template deps only — numpy, msgpack, pyzmq, opencv-python, websockets. Our model's deps are ours. |
-| `.gitignore` | — | Keeps `__pycache__` and model weights out of git. |
-
----
-
-## 3 · Quickstart
-
-```bash
-pip install -r requirements.txt
-
-# Prove the unmodified template passes, so we know what a pass looks like.
-python conformance.py --lane decoupled
-```
-
-Then develop against the mocks, in four terminals:
-
-```bash
-python mocks/mock_orin.py                                   # fake cameras + state
-python components/server.py --lane decoupled --port 8765   # our model
-python components/client.py --lane decoupled --thor 127.0.0.1 --orin 127.0.0.1
-python mocks/mock_wbc.py --lane decoupled                  # validates our actions
-```
-
-`mock_orin.py` publishes a Dex1-1 rig by default — **no hand state**, matching
-the real robot. `--with-hands` simulates a Dex3 rig if we need it.
-
----
-
-## 4 · Lanes
-
-Our lane follows from our model. It is a declaration, not a preference — RAMEN
-is on **`decoupled`**.
-
-| Model | Lane | Action format |
-|---|---|---|
-| GR00T N1.7 + `UNITREE_G1_SONIC` | `sonic` | `motion_token (T,64)` + `left/right_hand_joints (T,7)` |
-| Pi 0.5, GR00T N1.6, MolmoAct2, non-VLA methods | `decoupled` | `actions (T,25)` |
-
-Only GR00T N1.7 with the SONIC embodiment emits a 64-dim motion token. RAMEN's
-policy does not, so we are on `decoupled`.
-
-We declare the lane in our manifest. The bench brings up a **different
-controller** for each, so a wrong declaration is caught before we get robot
-time — not during our slot.
-
-### `sonic`
-
-Rows stream to the controller at 50 Hz. `boundary` rejects any chunk with
-`max|motion_token| > 1.25` — a training-range bound, not a correctness check.
-A latent inside the bound can still be nonsense; nothing outside the paired
-decoder can tell.
-
-### `decoupled` (RAMEN)
-
-One `(T,25)` chunk per message. The organizer runs inverse kinematics and
-drives the controller, so we need neither pinocchio nor ROS 2 in our
-container. Fixed row layout:
-
-| Columns | Meaning |
+| 直したいもの | 直す場所 |
 |---|---|
-| `[0:2]` | left hand, 2 finger joints, `-1` open → `+1` closed |
-| `[2:4]` | right hand, same convention |
-| `[4:7]` | left end-effector position, xyz, metres |
-| `[7:11]` | left end-effector quaternion, **`(w, x, y, z)`** |
-| `[11:14]` | right end-effector position |
-| `[14:18]` | right end-effector quaternion, `(w, x, y, z)` |
-| `[18:21]` | `navigate_cmd` — vx, vy, yaw rate |
-| `[21]` | `base_height_cmd` |
-| `[22:25]` | torso orientation, roll-pitch-yaw |
+| 推論の中身（skill・model の読み込み・VLM・設定の YAML・`policy_config.yaml` の model の選択） | **本体**を直して push → この repo で `./tools/sync_ramen.sh <commit>` → commit |
+| image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
+| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
+| 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
+| 接続テスト（09-27）で試して決めること | `CONNECTION_TEST.md`（試す option はここだけに書く。大会本番は option なし） |
+| conformance の受け口 | `components/` |
 
-Quaternions must be unit length and **`w`-first**. `boundary` checks the norm,
-but a `(x,y,z,w)`-ordered quaternion is still unit length and passes — so
-nothing catches wrong ordering for us. We verify it by hand; on the robot it
-shows up as a rotated end-effector, not an error message.
+更新の流れ:
 
----
+```mermaid
+flowchart LR
+  A[本体で直す・test] --> B[本体を push]
+  B --> C["sync_ramen.sh &lt;commit&gt;<br/>(push 前の commit・境界の食い違いは止まる)"]
+  C --> D[submit の test → commit → push]
+  D --> E[CI が arm64 で image を焼く]
+  E --> F["VERIFY.md<br/>(GB10 で image を起動して確認)"]
+```
 
-## 5 · Observations
+- コピー元の commit は `ramen/RAMEN_SOURCE.txt` に残る。コピーしたら差分を読んでから commit する。
+- image を焼き直したら、会場の前に `VERIFY.md` の手順（Vast.ai の GB10 で image を起動し、ネット無しで全 stage が
+  立ち上がるか・外に接続しないか）で確かめる。
 
-### Cameras (`:5555`)
+## 運営の責任範囲
 
-| Key | Shape | Notes |
-|---|---|---|
-| `ego_view` | `(480,640,3)` uint8 RGB | head camera — **always present** |
-| `left_wrist` | `(480,640,3)` uint8 RGB | RealSense D405 — may be absent |
-| `right_wrist` | `(480,640,3)` uint8 RGB | RealSense D405 — may be absent |
+運営が用意するもの。**ここに書いたもの以外は、すべて Team RAMEN のもの。**
 
-JPEGs are BGR on the wire; `boundary/cameras.py` flips to RGB for us. The
-server does not publish until `ego_view` is live, and drops individual wrist
-keys when those cameras fail. We survive a missing wrist key.
+### 会場（ロボットに載っている PC2 の上）
 
-### State (`:5557`)
+| もの | やること |
+|---|---|
+| カメラ bridge | `:5555` に head と手首カメラの JPEG を publish する |
+| 状態 bridge | `:5557` に `body_q`・`base_quat` を 50 Hz で publish する（2026-09-21 以降の bridge は `gripper_q` も載せる。CONTRACT には無い項目） |
+| WBC adapter | 我々が bind した `:5556` に接続し、`(T,25)` を IK で関節の目標にして WBC に渡す。手の列は Dex1 へ relay する |
+| WBC 本体 | 全身の制御 |
+| e-stop | 我々のコードを通らずにモータを止める |
 
-| Key | Shape | Notes |
-|---|---|---|
-| `body_q` | `(29,)` float32 | canonical G1 body joints, radians |
-| `base_quat` | `(4,)` float32 | base orientation, wxyz |
-| `left_hand_q` | `(7,)` float32 | **usually absent** — Dex1-1 rig |
-| `right_hand_q` | `(7,)` float32 | usually absent |
+これらを誰が起動するかは、運営の README（"You do not run any of this"）と
+RUNBOOK（"you run the whole pipeline yourself"）で食い違っている。
 
-One schema for both lanes, whichever controller the organizer is running —
-so our client never needs ROS 2.
+### この repo の中（運営の repo から取り込む。手で変更しない）
 
-`body_q` follows Unitree's canonical G1 29-DoF ordering (`G1JointIndex`).
-We slice it however our model was trained — no subset or reordering is imposed.
+`tools/update_organizer.sh` で運営の repo から上書きする。`boundary/` は interface package
+（運営が更新するのはこちら。本体の `inference/desktop/boundary` も同じ所から取る）、残りは template から。
+取り込んだ commit は `ORGANIZER_SOURCE.txt` に残る。
 
-Angles are **radians**. Limits are the mechanical ranges, listed so we can
-sanity-check our own outputs; the controller enforces them, not `boundary`.
+| path | 役割 |
+|---|---|
+| `boundary/` | 3 socket（`:5555` / `:5557` / `:5556`）の契約の実装（`:5556` は pose lane と joint lane） |
+| `mocks/` | ロボット無しで試すための偽 PC2（`mock_orin.py`）と偽 WBC（`mock_wbc.py`） |
+| `conformance.py` | 提出前の配線確認（提出の条件）。`components/server.py` と `components/client.py` をこの名前で起動する |
+| `requirements.txt` | template の依存 |
 
-| # | Joint | Limit (rad) | | # | Joint | Limit (rad) |
-|---|---|---|---|---|---|---|
-| 0 | `L_LEG_HIP_PITCH` | −2.5307 … 2.8798 | | 15 | `L_SHOULDER_PITCH` | −3.0892 … 2.6704 |
-| 1 | `L_LEG_HIP_ROLL` | −0.5236 … 2.9671 | | 16 | `L_SHOULDER_ROLL` | −1.5882 … 2.2515 |
-| 2 | `L_LEG_HIP_YAW` | −2.7576 … 2.7576 | | 17 | `L_SHOULDER_YAW` | −2.618 … 2.618 |
-| 3 | `L_LEG_KNEE` | −0.0873 … 2.8798 | | 18 | `L_ELBOW` | −1.0472 … 2.0944 |
-| 4 | `L_LEG_ANKLE_PITCH` | −0.8727 … 0.5236 | | 19 | `L_WRIST_ROLL` | −1.9722 … 1.9722 |
-| 5 | `L_LEG_ANKLE_ROLL` | −0.2618 … 0.2618 | | 20 | `L_WRIST_PITCH` | −1.6144 … 1.6144 |
-| 6 | `R_LEG_HIP_PITCH` | −2.5307 … 2.8798 | | 21 | `L_WRIST_YAW` | −1.6144 … 1.6144 |
-| 7 | `R_LEG_HIP_ROLL` | −2.9671 … 0.5236 | | 22 | `R_SHOULDER_PITCH` | −3.0892 … 2.6704 |
-| 8 | `R_LEG_HIP_YAW` | −2.7576 … 2.7576 | | 23 | `R_SHOULDER_ROLL` | −2.2515 … 1.5882 |
-| 9 | `R_LEG_KNEE` | −0.0873 … 2.8798 | | 24 | `R_SHOULDER_YAW` | −2.618 … 2.618 |
-| 10 | `R_LEG_ANKLE_PITCH` | −0.8727 … 0.5236 | | 25 | `R_ELBOW` | −1.0472 … 2.0944 |
-| 11 | `R_LEG_ANKLE_ROLL` | −0.2618 … 0.2618 | | 26 | `R_WRIST_ROLL` | −1.9722 … 1.9722 |
-| 12 | `WAIST_YAW` | −2.618 … 2.618 | | 27 | `R_WRIST_PITCH` | −1.6144 … 1.6144 |
-| 13 | `WAIST_ROLL` | −0.52 … 0.52 | | 28 | `R_WRIST_YAW` | −1.6144 … 1.6144 |
-| 14 | `WAIST_PITCH` | −0.52 … 0.52 | | | | |
+### 正本
 
-Groups: legs `0–11` (6 per leg), waist `12–14`, left arm `15–21`, right arm
-`22–28`.
-
-**Ankles have two names for the same indices.** `4/5` and `10/11` appear as
-both `ANKLE_PITCH`/`ANKLE_ROLL` and `ANKLE_B`/`ANKLE_A` depending on whether
-the controller is in PR or AB mode. Same slots, different convention.
-
-**Waist roll and pitch (`13`, `14`) can be mechanically locked** on some G1
-builds, leaving yaw-only control. We do not assume those two carry meaningful
-signal until we have seen live data from the competition robot.
-
----
-
-## 6 · Hardware
-
-| | Jetson AGX Thor | Jetson Orin NX |
-|---|---|---|
-| **Role** | policy server — our model | policy client — our control loop |
-| **Container** | ours | ours |
-| **Address** | `192.168.100.1` | `192.168.100.2` |
-| **OS** | JetPack 7.2, L4T R39.2, aarch64 | JetPack 5.1.1, L4T R35.3.1, aarch64 |
-| **CPU** | Arm Neoverse-V3AE, 14 cores, 2.6 GHz | Arm Cortex-A78AE, 8 cores / 8 threads, 2.0 GHz |
-| **Cache** | 1 MB L2 per core + 16 MB shared L3 | 2 MB L2 + 4 MB L3 |
-| **GPU** | Blackwell, 2560 CUDA cores, 5th-gen tensor cores, **sm_110** | Ampere, 1024 CUDA cores, 32 tensor cores, 918 MHz, **sm_87** |
-| **CUDA** | 13.0 | 11.4 |
-| **Python** | 3.12 | 3.8 (image default; we ship on 3.8, a newer one can be installed in-container if needed) |
-| **Memory** | **128 GB unified** LPDDR5X, 256-bit, 273 GB/s | **16 GB unified** (shared CPU + GPU) |
-| **Storage** | NVMe over PCIe | 2 TB |
-| **Power** | 40–130 W | — |
-| **Graphics** | — | OpenGL 4.6, OpenCL 3.0 |
-
-**Both machines use unified memory** — CPU and GPU share one physical pool. On
-the Thor that is a luxury (128 GB, no host-to-device copy). On the Orin it is a
-constraint: **16 GB total, not 16 CPU + 16 GPU.** We keep the client light — it
-moves images and actions, it does not infer. Our model belongs on the Thor.
-
-**The two GPUs are different architectures.** Thor is Blackwell `sm_110`, Orin
-NX is Ampere `sm_87`. A wheel built for one will not load on the other, so we
-build our two containers separately.
-
-NVIDIA quotes **2070 TFLOPS (FP4, sparse)** for the Thor. That is a ceiling for
-a quantized sparse workload, not throughput we will see from an unquantized
-checkpoint — we size our model against the 128 GB and our own measured latency.
-
-Robot: **Unitree G1 EDU**, 29 body DoF, **Dex1-1** two-finger grippers (not
-Dex3). Cameras: 1× head + 2× RealSense D405, all 480×640×3.
-
-**Base images** — the Thor and Orin are on different JetPack lines and GPU
-architectures, so we build two separate images; one will not run on both.
-
-- **Thor** (policy server): `nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04`.
-  JetPack 7 uses unified Arm CUDA, so this is the standard NGC CUDA image, not
-  an `l4t-*` tag. `nvcr.io/nvidia/pytorch:25.08-py3` also works as a framework
-  base.
-- **Orin** (policy client): `nvcr.io/nvidia/l4t-jetpack:r35.3.1`. This tag must
-  match the device's L4T exactly — the CUDA and driver userspace are mounted
-  from the host at runtime, so a different tag fails on the robot. Since the
-  client does no inference, `nvcr.io/nvidia/l4t-base:r35.3.1` is a lighter
-  alternative.
-
-If we get a **401** pulling from `nvcr.io`: those images need an NGC login even
-though they're public. Create a free account at ngc.nvidia.com, generate an API
-key, then `docker login nvcr.io` with username `$oauthtoken` and the API key as
-the password.
-
----
-
-## 7 · Safety
-
-- `boundary/` validates every action before publishing and refuses malformed
-  ones. That is a floor, not a safety system.
-- Submissions are **video pre-screened**: we show our policy working in
-  simulation or on our own G1 before it runs on the organizer's.
-
----
-
-## 8 · Submitting
-
-1. `python conformance.py --lane decoupled` passes against the **current**
-   template.
-2. Policy server (Thor) and policy client (Orin).
-3. A manifest declaring our lane, our entrypoints, and our ports.
-4. Our pre-screen video.
+- template: https://github.com/iacevaltest/ikea_iros_submit （取り込んだ commit は `ORGANIZER_SOURCE.txt`）
+- interface package: https://github.com/iacevaltest/iros_g1_orin_package （取り込んだ commit は `ORGANIZER_SOURCE.txt`）
+  （`docs/CONTRACT.md`。doc とコードが食い違ったらコードが正）

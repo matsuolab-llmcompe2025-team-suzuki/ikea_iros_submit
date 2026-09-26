@@ -18,17 +18,18 @@
 name: build thor image
 
 on:
-  # ⚠️ workflow_dispatch は **default branch (main) に workflow が無いと呼べない**。
-  # main には .github/workflows 自体が無く、提出まわりが全部終わるまで PR も切らない
-  # 方針なので、それまではこの branch への push で起動する。
-  # ビルド条件 (tag / push / platform) は workflow_dispatch の inputs が使えない分、
-  # `.github/ci-build-request.env` に書いて push する。main に入ったらこの push
-  # trigger と env ファイルは落とし、workflow_dispatch だけにしてよい。
+  # 2 通りで起動する:
+  #   - issue/* の branch への push: ビルド条件 (tag / push / platform) は
+  #     `.github/ci-build-request.env` に書いて push する (VERIFY.md 4-1)。branch 名を
+  #     決め打ちにすると、次の作業 branch で起動しなくなる (PR #11 のレビュー)。
+  #   - workflow_dispatch: main にあるこの workflow から inputs で呼ぶ
+  #     (`gh workflow run build-thor-image.yml --ref <branch> -f tag=… -f push=true`)。
   push:
-    branches: [issue/1-vendor-sync-and-sdk-layer]
+    branches: ["issue/**"]
     paths:
       - .github/workflows/build-thor-image.yml
       - .github/ci-build-request.env
+      - docker/Dockerfile.thor
   workflow_dispatch:
     inputs:
       tag:
@@ -109,18 +110,12 @@ jobs:
     # platform に合わせてネイティブ runner を選ぶ (QEMU だと数時間かかる)。
     runs-on: ${{ needs.params.outputs.runner }}
     timeout-minutes: 180
-    # **Thor だけ焼くと壊れずに静かに劣化する。** client 側の変更 (カメラ凍結の
-    # 検出 / JPEG 転送 / gripper_q の 2 本目 SUB) は Orin image にしか入らないので、
-    # Thor だけ新しいと「動いてはいるが機能が無い」状態になり、起動ログからは
-    # 見分けが付かない。既定で両方焼く。
+    # 提出 image は Thor の 1 つだけ (PC2 に私たちの container は置かない。INSTRUCTIONS.md)。
     strategy:
-      fail-fast: false      # 片方が落ちてももう片方の digest は取りたい
       matrix:
         include:
           - image: ikea-thor
             file: docker/Dockerfile.thor
-          - image: ikea-orin
-            file: docker/Dockerfile.orin
     steps:
       - uses: actions/checkout@v4
 
@@ -137,16 +132,22 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # 秘密の値は env から読む (run の文字列に直接展開しない。PR #11 のレビュー)
       - name: nvcr.io にログイン
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
-          echo '${{ secrets.NGC_API_KEY }}' \
+          printf '%s' "$NGC_API_KEY" \
             | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
       - name: ghcr.io にログイン
         if: ${{ needs.params.outputs.push == 'true' }}
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GHCR_USER: ${{ github.actor }}
         run: |
-          echo '${{ secrets.GHCR_PAT }}' \
-            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          printf '%s' "$GHCR_PAT" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
       - name: ビルド (+ push)
         id: build
@@ -174,8 +175,7 @@ jobs:
             echo "digest:   $DIGEST"
             echo '```'
             if [ "$PLATFORM" = "linux/arm64" ]; then
-              echo "⚠️ manifest.yaml の images.* と、本体 repo の venue_runbook §1-2 /"
-              echo "   offline_bundle.md の digest を更新すること (**3 箇所**)。"
+              echo "⚠️ manifest.yaml の images.thor と INSTRUCTIONS.md の digest を更新すること。"
             else
               echo "⚠️ **amd64 は検証専用。manifest.yaml に書かないこと** (Thor は aarch64)。"
             fi

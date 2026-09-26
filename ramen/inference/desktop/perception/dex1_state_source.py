@@ -1,0 +1,285 @@
+"""Latest-only read-only source for the two Dex1-1 motor states.
+
+The official ``dex1_1_gripper_server`` publishes the motor output position in
+physical radians on ``rt/dex1/{left,right}/state``.  It does not normalize the
+value to ``[0, 1]``.  This adapter deliberately preserves those units because
+the Team RAMEN LeRobot datasets store ``hand_state`` and ``hand_cmd`` in the
+same physical coordinate (typically 0--4.5 rad).
+
+``ChannelFactoryInitialize`` must be called before constructing this class.
+The source only creates DDS subscribers; it cannot command either gripper.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+import numpy as np
+
+
+DEX1_LEFT_STATE_TOPIC = "rt/dex1/left/state"
+DEX1_RIGHT_STATE_TOPIC = "rt/dex1/right/state"
+# ``dex1_1_gripper_server`` reserve-field health extension.  The magic keeps
+# older official servers (whose reserve fields are unspecified) compatible.
+DEX1_HEALTH_PROTOCOL_MAGIC = 0x44583131  # ASCII "DX11"
+
+
+@dataclass(frozen=True)
+class Dex1StateData:
+    """Atomic bilateral Dex1 snapshot in physical motor-output radians."""
+
+    position_rad: np.ndarray
+    left_received_monotonic_ns: int
+    right_received_monotonic_ns: int
+    t: int
+    # Defaults preserve compatibility with snapshots created by tests and by
+    # callers that still model the unextended official bridge.
+    motor_mode: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint8)
+    )
+    shell_temperature_c: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint8)
+    )
+    fault_code: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.uint32)
+    )
+    health_diagnostics_available: bool = False
+    # 実測か (False = 指令エコーの合成値)。合成値では「実測と指令の差」で把持を
+    # 判定するロジック (hybrid pick の interlock 等) が成立しないので区別する。
+    measured: bool = True
+
+
+class Dex1StateSource:
+    """Subscribe to both official Dex1 state topics and retain the latest pair."""
+
+    def __init__(
+        self,
+        left_topic: str = DEX1_LEFT_STATE_TOPIC,
+        right_topic: str = DEX1_RIGHT_STATE_TOPIC,
+        *,
+        subscriber_factory: Optional[Callable[[str, object], object]] = None,
+        message_type: Optional[object] = None,
+    ) -> None:
+        if subscriber_factory is None or message_type is None:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
+
+            if subscriber_factory is None:
+                subscriber_factory = ChannelSubscriber
+            if message_type is None:
+                message_type = MotorStates_
+
+        self._lock = threading.Lock()
+        self._closed = False
+        self._positions: list[float | None] = [None, None]
+        self._motor_modes = [0, 0]
+        self._shell_temperatures_c = [0, 0]
+        self._fault_codes = [0, 0]
+        self._health_available = [False, False]
+        self._received_ns = [0, 0]
+        self._latest: Dex1StateData | None = None
+
+        self._left_subscriber = subscriber_factory(left_topic, message_type)
+        self._right_subscriber = subscriber_factory(right_topic, message_type)
+        self._left_subscriber.Init(self._handle_left, 1)
+        self._right_subscriber.Init(self._handle_right, 1)
+
+    def _handle_left(self, message: object) -> None:
+        self._handle(0, message)
+
+    def _handle_right(self, message: object) -> None:
+        self._handle(1, message)
+
+    def _handle(self, side: int, message: object) -> None:
+        try:
+            states = getattr(message, "states", None)
+            if not states:
+                raise ValueError("empty MotorStates.states")
+            motor = states[0]
+            q = float(motor.q)
+            if not math.isfinite(q):
+                raise ValueError(f"non-finite motor position: {q!r}")
+            received_ns = time.monotonic_ns()
+            with self._lock:
+                if self._closed:
+                    return
+                self._positions[side] = q
+                self._motor_modes[side] = int(getattr(motor, "mode", 0))
+                self._shell_temperatures_c[side] = int(
+                    getattr(motor, "temperature", 0)
+                )
+                reserve = tuple(getattr(motor, "reserve", ()) or ())
+                health_available = (
+                    len(reserve) >= 2
+                    and int(reserve[1]) == DEX1_HEALTH_PROTOCOL_MAGIC
+                )
+                self._health_available[side] = health_available
+                self._fault_codes[side] = int(reserve[0]) if health_available else 0
+                self._received_ns[side] = received_ns
+                if self._positions[0] is None or self._positions[1] is None:
+                    return
+                positions = np.asarray(self._positions, dtype=np.float32)
+                self._latest = Dex1StateData(
+                    position_rad=positions,
+                    motor_mode=np.asarray(self._motor_modes, dtype=np.uint8),
+                    shell_temperature_c=np.asarray(
+                        self._shell_temperatures_c, dtype=np.uint8
+                    ),
+                    fault_code=np.asarray(self._fault_codes, dtype=np.uint32),
+                    health_diagnostics_available=all(self._health_available),
+                    left_received_monotonic_ns=self._received_ns[0],
+                    right_received_monotonic_ns=self._received_ns[1],
+                    t=max(self._received_ns),
+                )
+        except Exception as exc:
+            side_name = "left" if side == 0 else "right"
+            print(
+                f"[Dex1StateSource] invalid {side_name} state: {exc!r}",
+                file=sys.stderr,
+            )
+
+    def get(self) -> Dex1StateData | None:
+        """Return the latest atomic bilateral sample, or ``None`` until ready."""
+
+        with self._lock:
+            return self._latest
+
+    def close(self) -> None:
+        """Close both readers.  Idempotent and never creates a command writer."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            left = self._left_subscriber
+            right = self._right_subscriber
+            self._left_subscriber = None
+            self._right_subscriber = None
+            self._latest = None
+        for subscriber in (left, right):
+            if subscriber is not None:
+                subscriber.Close()
+
+
+class SyntheticDex1StateSource:
+    """hand state が配信されないリグ向けの、指令エコー型の合成 source。
+
+    # なぜ要るか
+
+    大会会場では Dex1 の state が **どこからも来ない**。運営の contract がそう決めている:
+
+        boundary/states.py:
+          "HAND STATE IS USUALLY ABSENT. The competition G1 carries Dex1-1 two-finger
+           grippers, not Dex3 hands ... synthesize whatever your model expects if it
+           needs a hand vector."
+
+    `rt/dex1/*`（`Dex1StateSource` が読む方）は Orin 上の serial↔DDS 中継
+    (`dex1_1_gripper_server`) が要る **ラボ専用構成**で、会場には無い。
+    それでも `hand_state` は policy の state ベクトル (38D/49D/59D) の必須要素なので、
+    こちらで作って入れるしかない。
+
+    # なぜ定数ではいけないか
+
+    提出側 (`components/ramen/orchestrator_io.py`) は `(1.0, 1.0)` = 常に全開 4.5 rad の
+    定数を入れている。`pick_table_leg` / `rotate_table_base` のように開いた状態から
+    始まる skill では正しいが、`skill_config.yaml` で
+    ``requires_separate_hand_initialization: true`` の skill（`insert_table_leg` /
+    `rotate_leg_to_tighten` ほか）は **脚を掴んだ状態が frame 0** なので、
+    「掴んでいるのに開いていると policy に伝える」ことになる。
+
+    # 何をするか
+
+    - **seed**: run の開始 skill の frame-0 hand 値
+      (`SkillInitialPose.dex1_target_rad`、dataset の開き割合 × 4.5 rad)
+    - **以降**: policy が出した hand 指令をそのままエコーする (open-loop)
+
+    実センサが無い以上、滑りや把持失敗は見えない。**定数よりは確実に正しい**、
+    というのがこの class の位置づけであって、実 state の代替ではない。
+
+    Args:
+        initial_position_rad: seed する (left, right) [rad]。
+        command_source: `latest` 属性で直近の hand 指令 `(left, right)` を返すもの
+            (`MockHandActuator` 等)。`bind_command_source()` で後から繋いでもよい。
+    """
+
+    def __init__(
+        self,
+        initial_position_rad: tuple[float, float],
+        *,
+        command_source: Optional[object] = None,
+    ) -> None:
+        self._initial = self._clamp(initial_position_rad)
+        self._commanded: Optional[tuple[float, float]] = None
+        self._command_source = command_source
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @staticmethod
+    def _clamp(position_rad) -> tuple[float, float]:
+        # Layer 2 の hardware range に合わせる (actuator 側と同じ [0, 5.4])。
+        from inference.desktop.lower_policy.actuators.hand import (
+            HAND_GRIP_MAX,
+            HAND_GRIP_MIN,
+        )
+
+        arr = tuple(float(v) for v in position_rad)
+        if len(arr) != 2:
+            raise ValueError(f"position_rad must have length 2, got {len(arr)}")
+        if not all(math.isfinite(v) for v in arr):
+            raise ValueError(f"position_rad must be finite, got {arr}")
+        return tuple(max(HAND_GRIP_MIN, min(HAND_GRIP_MAX, v)) for v in arr)
+
+    def bind_command_source(self, command_source: object) -> None:
+        """`latest` で直近 hand 指令を返すものを後から繋ぐ。"""
+
+        with self._lock:
+            self._command_source = command_source
+
+    def update(self, position_rad) -> None:
+        """policy が出した hand 指令を state として取り込む。"""
+
+        clamped = self._clamp(position_rad)
+        with self._lock:
+            self._commanded = clamped
+
+    def get(self) -> Dex1StateData | None:
+        """指令があればそれ、無ければ seed した frame-0 値を返す。
+
+        `Dex1StateSource` と違い **None を返さない**。合成なので「まだ来ていない」
+        という状態が存在せず、preflight も素通りする。
+        """
+
+        with self._lock:
+            if self._closed:
+                return None
+            commanded = self._commanded
+            source = self._command_source
+            initial = self._initial
+
+        # 繋がれた actuator の方が live なので優先する。update() は actuator を
+        # 繋がない配線 (test / 別経路) のための口。
+        if source is not None:
+            latest = getattr(source, "latest", None)
+            if latest is not None:
+                commanded = self._clamp(latest)
+
+        position = commanded if commanded is not None else initial
+        now_monotonic = time.monotonic_ns()
+        return Dex1StateData(
+            position_rad=np.asarray(position, dtype=np.float64),
+            left_received_monotonic_ns=now_monotonic,
+            right_received_monotonic_ns=now_monotonic,
+            t=time.time_ns(),
+            measured=False,
+        )
+
+    def close(self) -> None:
+        """`Dex1StateSource` と同じ形。冪等。"""
+
+        with self._lock:
+            self._closed = True

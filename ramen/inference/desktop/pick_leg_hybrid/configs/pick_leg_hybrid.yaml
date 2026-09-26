@@ -1,0 +1,214 @@
+# pick_table_leg ハイブリッド構成の数値 (Issue #136)
+#
+# CLAUDE.md の「Skill numerics live in YAML」規約に従い、数値はすべてここに置く。
+# Python 側に定数を置かない。読み込みは yaml.safe_load のみ (plain yaml.load は RCE)。
+#
+# 実測値の出所: Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1
+#   2114 episode / 975,291 frame を全走査して算出 (2026-09-06)。
+#   算出スクリプト: evaluate/pick_leg_hybrid/derive_thresholds.py
+
+# ---------------------------------------------------------------- 把持インターロック
+#
+# 追従誤差と値の帯を AND で取る。**追従誤差だけでは足りない**:
+# 閉じ始めの過渡でも実測は指令に追いつかず、err>0.2 が最初に立つ瞬間の
+# hand_state は median 4.46 (ほぼ全開) で、HOLD 帯に入るのは 0.6% のみ。
+#
+# 両方を課したときの実測: 右手が掴んだ瞬間の hand_state は median 2.315
+# (5-95% [2.225, 2.347])、2114 episode 中 2112 で検出できる。
+interlock:
+  follow_error_min: 0.2    # hand_state − hand_cmd がこれ以上 = 追従していない
+  hold_min: 1.45           # 保持帯の下限 [rad 相当]
+  hold_max: 2.35           # 保持帯の上限
+
+# ---------------------------------------------------------------- 区間 1 → 2 の境界検出
+boundary:
+  confirm_count: 2         # 何回続けて成立したら進むか。1 で連続確認を無効化
+  min_interval_sec: 1.0    # VLM 呼び出しの最短間隔 [s]
+  require_interlock: true  # false = VLM 単独判定 (評価用。実機では非推奨)
+  # VLM は別 thread で問い合わせる (制御 tick を止めない、Codex #8)。問い合わせた
+  # 観測からこれ以上経った応答は捨てる。vlm.timeout_sec (5 s) + 間引き 1 s。
+  max_answer_age_sec: 6.0
+
+# ---------------------------------------------------------------- 手の実測が無いとき
+#
+# 会場の公式 :5557 は Dex1 の実測を契約では保証しない。運営 state bridge が
+# `gripper_q` を載せていれば実測を使い (上の interlock がそのまま効く)、無いときだけ
+# ここを使う (2026-09-23 決定、Codex #2)。合成 state は指令のエコーなので
+# 「実測 − 指令」の interlock は常に不成立になり、pick が Phase 1 から進まない。
+#
+# 手が物に当たって止まったかは見えない。**視覚 (VLM) の確認と、指令後の待ち時間で
+# 代える縮退動作**であり、実測の代わりではない。
+unmeasured_hand:
+  # Phase 1: 右手の閉指令が把持帯 (interlock.hold_max 以下) に入ってから、
+  # これだけ続いたら VLM の確認へ進む。運営 relay は 2 rad/s (run_wbc_with_dex1.py
+  # --dex1-max-speed 既定) で、全開 4.5 → hold_max 2.35 は約 1.1 s。
+  phase1_command_settle_sec: 1.0
+  # Phase 3: 全閉の探り (close_hand_value) は接触を測れないと巻線の過熱まで押し
+  # 続けるので使わない。代わりにこの開度を指令する。ラボ実測で脚を握るとき
+  # model は 1.85 を出し、脚に当たって 2.15 で止まる (締め付けは差の 0.3 rad)。
+  phase3_grasp_command_rad: 1.85
+  # Phase 3 の手の段 (閉じる・開く・insert 初期幅) で、指令後に待つ時間。
+  # 4.5 → 1.85 の 2.65 rad を 2 rad/s で約 1.3 s + 余裕。各段の timeout 以下。
+  phase3_hand_settle_sec: 2.0
+
+# ---------------------------------------------------------------- VLM
+#
+# 2026-09-20の実機hybrid試験で使用・self-check済みの8Bモデル。
+vlm:
+  endpoint: "http://127.0.0.1:8000/v1/chat/completions"
+  model: "Qwen/Qwen3-VL-8B-Instruct"
+  timeout_sec: 5.0
+  max_tokens: 32
+  temperature: 0.0         # 同じ入力に対する揺れを抑える
+  history_frames: 2        # 現在画像より前に何枚渡すか
+  jpeg_quality: 85
+
+# 参照画像 (overlay 済み)。[A = 遷移前, B = 遷移後] の順。
+# source dataset revision 4a5aef3b...、episode 0、head-left の frame 43 / 60。
+# 右Dex1の実測把持 interlock は frame 50 で初めて成立する。現在の v11b OBB
+# (best_20260818.pt, imgsz=800) と同じ描画器で overlay した固定資産。
+references:
+  # sha256: 1b50bea9ebf8065660d4efa6e70a14cb67b27df538e38b8855f9bfefd2e0fa34
+  before: "../assets/ref_before_ep000_f0043.jpg"
+  # sha256: 96cb20503517bfdd3d05a580fb1f1b1a0573c5e9ea17aa034fb2f651246c93c1
+  after: "../assets/ref_after_ep000_f0060.jpg"
+
+# 本番Stage内でhybrid全体に許す時間。単体実機runは約19.1秒で完了した。
+# 従来pickの21秒ではVLM/USBの通常揺らぎに余裕がないため30秒とする。超過時は
+# skill_config.yaml の on_timeout (advance) に従って次へ進む。持ち替えの段の
+# 時間切れも同じく pick を終えて次へ。止めるのは人 (Ctrl+C / e-stop)。
+runtime:
+  hard_timeout_sec: 30.0
+
+# ---------------------------------------------------------------- overlay
+#
+# YOLO-OBB の枠を画像に描いてから VLM に渡す。描画は
+# policies/ramen_ori.py:overlay_obb_on_frame を使う (実装済み)。
+# class_id: 1=leg(緑) / 5=hand_right(オレンジ) / 6=hand_left(マゼンタ)
+overlay:
+  enabled: true
+  class_ids: [1, 5, 6]
+  conf_threshold: 0.30     # training OverlayRenderer の既定と一致
+  line_thickness: 2
+
+# ---------------------------------------------------------------- 区間 2 (Motion planning)
+#
+# 可変始点 (1→2 遷移時の実姿勢) → 固定終点 (下記) へ補間する。
+#
+# 終点は「左手が脚を掴んだ瞬間」の実測 median (2094 episode)。
+# duration_sec は同区間の実測長 median 81 frame @30fps = 2.70 秒。
+#
+# !!! ee_frame に注意 (determinded.md D-3) !!!
+# 下の値は G1WristFK (wrist_yaw_link + 実測 tool offset、pelvis 基準) = ツール点で計算した。
+# データセット記録の ee_state とは 左 99 mm / 右 129 mm ずれる。
+# hybrid の目標・IK・実測の到達判定はすべてこのツール点 (real_skill._tool_ee)。
+# 運営 IK が受け取るのは wrist_yaw_link 原点 (tool offset 無し) だが、それは送る境界
+# (boundary_sink / taskspace_adapter の compute_ee_transforms) で関節角から作るので、
+# ここの値と hybrid の判定はツール点のままでよい。両者を混ぜると 13 cm ずれる (B8a-01)。
+phase2:
+  ee_frame: "g1_wrist_fk"  # "g1_wrist_fk" | "dataset_ee_state"
+  duration_sec: 2.7
+  pos_tol: 0.02            # 到達判定の位置許容 [m]
+  rot_tol: 0.12            # 到達判定の姿勢許容 [rad]
+  # 右手だけが脚を保持する区間。episode 0 の区間内 command median は
+  # left=4.50 / right=1.86、right state median=2.21。左まで2.2へ閉じると
+  # VLAより前に脚へ接触するため、左右を分ける。
+  hold_hand_value: 2.2     # 旧config readerとの互換fallback
+  hold_hand_left_value: 4.5
+  hold_hand_right_value: 1.85
+
+  # 位置 = 2094 episode の median、姿勢 = quaternion 平均 (Markley 固有ベクトル法)。
+  goal_left:
+    # IQR 幅 [0.049, 0.047, 0.032] m
+    # dataset_ee_state 版: pos [0.3321, 0.0751, 0.2386] / quat [0.8797, -0.2903, 0.0365, -0.3749]
+    pos:  [0.3783, 0.1172, 0.3107]
+    quat: [0.8964, -0.3106, 0.0475, -0.3127]   # (w, x, y, z)
+  goal_right:
+    # IQR 幅 [0.032, 0.039, 0.034] m
+    # dataset_ee_state 版: pos [0.2961, -0.1075, 0.1840] / quat [0.8934, 0.0964, 0.0178, 0.4383]
+    pos:  [0.3970, -0.0434, 0.1382]
+    quat: [0.8752, 0.0888, 0.0505, 0.4728]   # (w, x, y, z)
+
+# ---------------------------------------------------------------- 区間 3 rule-based版
+#
+# 本番Stage・単体pick評価とも既定の区間3はrule_basedで、次の有限FSMを使う。
+# GR00Tへ戻すvlaは単体評価で --pick-leg-phase3-executor vla を明示した場合のみ:
+#   左把持 -> 右解放 -> 左で提示 -> 右再把持 -> 左解放
+#   -> 左腕insert初期姿勢 -> 右腕insert初期姿勢 -> Dex1 insert初期指令
+#
+# 数値は上と同じdataset revisionの全2114 episodeから再導出した。右の再把持を
+# Dex1実測interlockで確認できた1111 episode、さらに左解放まで確認できた751
+# episodeを使用。姿勢はquaternionのMarkley平均、位置は中央値。
+phase3_rule_based:
+  source:
+    dataset_repo_id: "Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1"
+    dataset_revision: "4a5aef3bc43470b636f5c9d4f9102a30311b79a5"
+    right_regrasp_episodes: 1111
+    left_release_episodes: 751
+    statistic: "median_g1_wrist_fk_pose_and_markley_quaternion"
+
+  # 物体を噛んだかは実測state-command差で判定するため、把持時は全閉指令。
+  close_hand_value: 0.0
+  open_hand_value: 4.5
+  right_initial_hold_value: 1.85
+  # 全閉0.0は接触検出にだけ使用する。把持確認後は実測開度より0.35radだけ
+  # 閉じ側を保持し、interlock (>0.2rad)を維持しながら過大な連続押付けを防ぐ。
+  grasp_preload_rad: 0.35
+  open_min: 3.5
+  confirm_count: 5
+  # 閉じる段 (close_left / close_right) の把持確定だけは tick 数でなく、保持帯に居続けた秒数。
+  # 空振りでも閉じる途中は実測が指令より遅れたまま帯 (0.9 rad) を通り、4.2 rad/s で約 0.21 s、
+  # 2 rad/s でも 0.45 s で抜ける。物に当たって帯に留まったときだけ確定させる (B8a-03)。
+  # 2026-09-20 の実機 run (WandB kjyk6gw9) では左の確定が 6.28 s → 6.64 s に遅れるだけ。
+  grasp_confirm_sec: 0.5
+  pos_tol: 0.025
+  rot_tol: 0.15
+  # 脚全荷重を左手だけで支える提示区間では、実機の関節コンプライアンスにより
+  # 2026-09-20 runで2.96cm/0.156radに安定収束した。右再把持目標は遷移時の
+  # 実測左poseから相対生成するため、この区間だけ許容を広げても位置誤差を
+  # 次段へ持ち越さない。右手再把持には上の厳しいpos_tol/rot_tolを維持する。
+  left_present_pos_tol: 0.035
+  left_present_rot_tol: 0.20
+  # DDS arm_sdk 経路の関節到達誤差。下の速度と最終指令も連続確認する。
+  # Boundary 経路は運営 IK による関節の非一意性があるため、手首 pose と
+  # boundary_joint_guard_rad を併用し、この joint_tol は直接適用しない。
+  joint_tol: 0.10
+  # Boundary は手首 pose を送り運営 IK が関節角を再計算する。EEF 到達・静止・
+  # 最終指令到達を必須にした上で、教師姿勢からの逸脱もこの上限で拒否する。
+  boundary_joint_guard_rad: 0.40
+  joint_velocity_tol: 0.05
+  joint_command_tol: 0.02
+  hand_tol: 0.15
+
+  # 右再把持時の左手（脚を保持して提示する側）のroot_link基準pose。
+  left_present:
+    pos:  [0.3142, 0.0829, 0.3377]
+    quat: [0.8167, -0.1583, 0.0156, -0.5547]
+
+  # 右手の再把持位置は、固定root座標ではなく左手の実測local frame基準。
+  # 左提示poseへ適用するとroot位置は約[0.3587,-0.0300,0.1273]になる。
+  right_regrasp:
+    offset_left_local: [0.0818, 0.0704, -0.2175]
+    quat: [0.7423, 0.0831, 0.1711, 0.6425]
+
+  # 左解放後は固定EEF終点へ直行しない。runnerから渡される正本
+  # skill_config.yaml:skills.insert_table_leg.initial_pose の腕14D/Dex1 2Dへ、
+  # 左腕→右腕→手の順で接続する。
+
+  # insert初期姿勢への関節targetは最初から終点を提示し、共通MotionLimiterだけが
+  # 加減速軌道を生成する（二重補間は禁止）。timeoutは到達を成功扱いする時刻では
+  # なく、実測条件を満たさなければ最終安全targetを保持したままfail-closedする。
+  timings:
+    close_left:          {duration_sec: 0.5, timeout_sec: 4.0}
+    open_right:          {duration_sec: 0.8, timeout_sec: 4.0}
+    move_left_present:   {duration_sec: 2.0, timeout_sec: 6.0}
+    move_right_regrasp:  {duration_sec: 2.0, timeout_sec: 6.0}
+    close_right:         {duration_sec: 0.5, timeout_sec: 4.0}
+    open_left:           {duration_sec: 0.8, timeout_sec: 4.0}
+    move_left_insert_initial:  {duration_sec: 1.5, timeout_sec: 5.0}
+    move_right_insert_initial: {duration_sec: 2.5, timeout_sec: 7.0}
+    set_insert_hand_initial:   {duration_sec: 1.0, timeout_sec: 5.0}
+
+# 残っている TODO (todo.md と対応):
+#   - ee_frame が運営と未確定 (調査 Q1)
+#   - vlm.endpoint / model は Thor 上で実際に動かして確認していない

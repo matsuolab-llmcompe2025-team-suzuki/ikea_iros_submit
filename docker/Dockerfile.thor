@@ -1,406 +1,335 @@
 # syntax=docker/dockerfile:1
 #
-# Policy SERVER container — GR00T-pick track (Team RAMEN)。
-#   Jetson AGX Thor: sm_110 (Blackwell) / JetPack 7.x / CUDA 13 / aarch64 / 128 GB unified
+# 提出 image (Thor 側) — Team RAMEN (#10)。
+#   Jetson AGX Thor: aarch64 / sm_110 (Blackwell) / JetPack 7.x / CUDA 13
 #
-# RAMEN-Ori 用 Dockerfile.thor とは別 image。GR00T pick を decoupled lane で動かす。
-# server.py は RAMEN_POLICY=groot_pick_real で GrootPickTaskspacePolicy を選び、
-# GrootPickWorker が components/ramen/vendor の worker script を同一 env の python で
-# spawn する (RAMEN_WORKER_PYTHON=python3)。
+# 本体 iros_2026_ramen の推論をそのまま動かす。Python の環境は本体の pixi (ramen/ に同じ
+# 相対パスでコピー) で作り、この Dockerfile には Python 以外 (apt / CycloneDDS の C ライブラリ /
+# unitree SDK のソース / pixi 本体) だけを書く。
 #
-#   ⚠️ image は linux/arm64 (aarch64) build。x86 host から:
-#      docker buildx build --platform linux/arm64 -f docker/Dockerfile.thor.groot \
-#        -t <registry>/ramen-thor-groot:<tag> --push .
-#   ⚠️ nvcr.io は NGC login 必須:
-#      docker login nvcr.io -u '$oauthtoken' -p <NGC_API_KEY>
-#
-# torch sm_110 の入手 (調査 2026-08-30、numpy ABI で 2026-08-31 更新):
-#   - base = nvcr.io/nvidia/pytorch:25.12-py3 は arm64 variant が Grace-Blackwell 向け
-#     torch (CUDA13) を同梱し、かつ numpy 2.x ABI (25.08 は numpy 1.x ABI = 下記の理由で不可)。
-#     lerobot[groot]==0.6.0 の torch 制約 (>=2.7,<2.12) を満たすので
-#     `pip install lerobot[groot]` は NGC torch を差し替えない (満たす dep を pip は再取得しない)。
-#   - repo に Thor 専用 torch install script は無い (server.py docstring の Isaac-GR00T
-#     install path は upstream 参照)。標準 NGC pytorch base を採る。
-#   - inference は lerobot[groot] のみで足りる (dataset/training 不要 = torchcodec aarch64 回避)。
-#
-# ⚠️ 未検証 (要 Thor 実機 or arm64/Blackwell): 本 image は sm_110 GPU が無いと GR00T 推論を
-#    実行検証できない (QEMU は build 可・GPU 実行不可)。build 段階で lerobot[groot] の CUDA
-#    拡張 (flash-attn 等) が sm_110 向けに compile 通るかが残リスク。実 Thor で
-#    `RAMEN_POLICY=groot_pick_real python3 components/server.py` の ready + conformance を確認する。
+# 本体コードは ramen/ (tools/sync_ramen.sh が本体の 1 commit からコピー、手で直さない) を
+# 環境の層の後に入れる。起動口は docker/venue_entry.sh (会場は `… <image> --stage N --actuate`)。
+# ⚠️ linux/arm64。.github/workflows/build-thor-image.yml が ubuntu-24.04-arm でネイティブに焼く。
 
-# ⚠️ base は numpy 2.x ABI の torch であること。lerobot 0.6.x は numpy>=2.0,<2.3 を要求する
-# ため、pip が必ず numpy 2.x を入れる。pytorch:25.08 は torch が numpy 1.x ABI compile で、
-# numpy 2.x を入れると torch.from_numpy()/.numpy() が "Numpy is not available" で全推論クラッシュ
-# する (IAC eval 指摘、実 weight load 時のみ発現)。25.12 は numpy 2.1.0 同梱 + torch 2.10 が
-# numpy 2.x ABI なので bridge OK (QEMU 検証済: numpy 2.2.6 でも from_numpy 成功)。下の build 中
-# assert が bridge を毎回検証する。
-# ⚠️ tag ではなく **index digest で pin** する。`25.12-py3` は可変 tag で、NVIDIA が
-# 同じ tag を再 push すると中身が変わる。上の 25.08 の事故が「build は緑で通るのに
-# 実推論だけ壊れる」形だったので、base が黙って入れ替わる余地を残さない。
-#   tag      : nvcr.io/nvidia/pytorch:25.12-py3
-#   解決日   : 2026-09-20 (docker buildx imagetools inspect)
-#   linux/arm64 manifest: sha256:a086b7d17665c18526fd28f8d65fde91b92475289262bf419ca4b55e244709eb
-# index digest なので multi-platform のまま解決される (arm64 host なら arm64 を引く)。
-ARG BASE=nvcr.io/nvidia/pytorch@sha256:1dc787f5c6264fcc1c99809f99b84823e73ed4588d5a581b94290fc2a8fecff8
+# torch は pixi が cu130 の wheel で入れる (CUDA のランタイムも wheel に同梱。sm_110 を含むのは
+# cu130 の aarch64 build だけ)。driver は Thor の host から nvidia container runtime が入れる
+# ので、base は CUDA の最小構成で足りる (NGC の pytorch image は使わない)。
+# tag ではなく index digest で固定する (同じ tag の再 push で中身が変わらないように)。
+#   tag   : nvidia/cuda:13.0.3-base-ubuntu24.04 (NVIDIA 公式、2026-04-14 公開)
+#   arm64 : sha256:56d9d8183e2181a20be6b0d3801d1f056a0e75c17706df939ba207b126e1cb9c
+ARG BASE=nvidia/cuda@sha256:7c7413a56200486f71f181cad9310f6fd31b6bb21816ade15fc9c1e1e927a5c1
 FROM ${BASE}
 
-WORKDIR /app
+# NVIDIA_DISABLE_REQUIRE: 運営 onboarding の Finding 1。以前は docker run の -e で
+# 渡してもらっていた。image に焼いて渡し忘れで起動を拒否されないようにする。
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    NVIDIA_DISABLE_REQUIRE=1
 
-# opencv (headless) 用の最小 system lib (NGC base に無い場合の保険)。
+# --- 1) apt -----------------------------------------------------------------
+#   git / cmake / build-essential : CycloneDDS と cyclonedds の python binding の build
+#   ca-certificates / curl        : pixi の取得
+#   libgl1 / libglib2.0-0         : opencv
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgl1 libglib2.0-0 \
-      && rm -rf /var/lib/apt/lists/*
+      ca-certificates curl git cmake build-essential libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# --- deps ---
-# 1) submission template deps (numpy/msgpack/pyzmq/opencv/websockets)。
-# 2) GR00T inference: lerobot[groot]==0.6.0 (NGC torch を保持: >=2.7,<2.12 を満たす)。
-#    numpy は worker と揃える (2.2.6)。
-COPY requirements.txt ./
-# lerobot[groot] を先に入れ、numpy==2.2.6 (worker 検証済 = model/subtask_policy_training)
-# を **最後に固定**する。NGC base 同梱の RAPIDS/numba/cupy/scipy が numpy 版を巻き戻す/
-# 衝突警告を出すが、GR00T pick inference はそれらを import しないので無害。
-RUN python3 -m pip install --no-cache-dir -r requirements.txt \
-    && python3 -m pip install --no-cache-dir "lerobot[groot]==0.6.0" \
-    && python3 -m pip install --no-cache-dir "numpy==2.2.6" \
-    && python3 - <<'PY'
-import torch, numpy, numpy as np, huggingface_hub, cv2
-print("[build] torch", torch.__version__, "cuda", torch.version.cuda,
-      "| numpy", numpy.__version__, "| hf_hub", huggingface_hub.__version__)
-maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
-assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
-assert numpy.__version__ == "2.2.6", numpy.__version__      # worker と一致
-# torch<->numpy ABI bridge を build 時に検証 (numpy 1.x ABI torch + numpy 2.x を弾く)。
-# これが緑で通れば実推論の from_numpy/.numpy() がクラッシュしない。
-_arr = torch.from_numpy(np.zeros(3, dtype=np.float32)); _ = _arr.numpy()
-print("[build] torch<->numpy bridge OK")
-import lerobot  # groot inference path が import 可能なこと
-print("[build] lerobot", lerobot.__version__)
-PY
+# CUDA 13 の compiler 部品 (base image に入っている NVIDIA の apt source から)。VLM server 用:
+#   cuda-nvcc-13-0       : ptxas。Triton が同梱する ptxas は CUDA 12.8 版で sm_110a を知らない
+#                          (check-thor-vlm で確認) ので、TRITON_PTXAS_PATH でこちらを使わせる。
+#                          nvcc は FlashInfer の事前 compile 済み kernel に無い形が来たときの予備
+#   cuda-cudart-dev-13-0 : その予備の compile に要る header
+#   cuda-cuobjdump-13-0  : build 時の確認 (事前 compile 済み kernel に sm_110a があるか)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cuobjdump-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
 
-# parent (boundary server) が 53D の vendored config_loader を読むのに pyyaml、
-# full orchestrator の perception に ultralytics (YOLO-OBB、NGC torch を保持) が要る。
-RUN python3 -m pip install --no-cache-dir "pyyaml" "ultralytics"
-
-# --- RAMEN-Ori 推論の依存 (rotate_table_base を GR00T の代わりに回す選択肢) -----
-#
-# 推論に **lerobot fork は要らない**。`policies/ramen_ori.py` の from_ckpt が
-# import するのは torch / huggingface_hub / hydra / model.ramen_ori.* / lingbot_vision
-# だけ (fork を使うのは model/ramen_ori/pixi.toml = training env の方)。
-# nn.Module 本体と Hydra config は vendor/desktop/model/ramen_ori に同梱している。
-#
-#   hydra-core / omegaconf : from_ckpt が compose(config_name="base") で model を組む
-#   lingbot-vision         : configs/base.yaml の vision_backbone.variant=lingbot-base
-#                            (backbone の重みは runtime に HF から取る)
-#
-# ⚠️ torch / numpy を動かさせない。NGC の torch と numpy 2.2.6 は上で固定済みで、
-#    ここで巻き戻ると全推論が壊れる (base image の注意書き参照)。下の assert が
-#    毎回確かめる。
-ARG LINGBOT_VISION_REF=151e46321bae4399f8568829f190c7bdec216b49
-RUN python3 -m pip install --no-cache-dir \
-      "hydra-core==1.3.5" "omegaconf==2.3.1" \
-      "lingbot-vision @ git+https://github.com/robbyant/lingbot-vision.git@${LINGBOT_VISION_REF}" \
-    && python3 - <<'PY'
-import numpy, torch
-import hydra, omegaconf  # noqa: F401
-import lingbot_vision  # noqa: F401
-
-# ⚠️ ここで torch/numpy が入れ替わっていたら、この image の推論は全部壊れる。
-assert numpy.__version__ == "2.2.6", numpy.__version__
-maj, minr = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
-assert (maj, minr) >= (2, 7) and (maj, minr) < (2, 12), torch.__version__
-import numpy as np
-torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
-print("[build] RAMEN-Ori deps OK (hydra + omegaconf + lingbot_vision、torch/numpy 据置き)")
-PY
-
-# --- 53D skills 用 lerobot 0.6.1 env (pick=0.6.0 とは checkpoint 形式が違うため別 venv) ---
-# base torch(sm_110)を --system-site-packages で継承し、lerobot 0.6.1 + accelerate +
-# safetensors を venv に入れる (torch は制約 >=2.7,<2.12 を満たすので差し替わらない)。
-# desktop の custom GR00T load (raw_config + streaming shards、tied-embedding 復元) が
-# takada/suzuki 53D checkpoint を読むのに必要。
-RUN python3 -m venv --system-site-packages /opt/venv-groot53 \
-    && /opt/venv-groot53/bin/pip install --no-cache-dir \
-        "lerobot[groot]==0.6.1" "numpy==2.2.6" accelerate safetensors \
-    && /opt/venv-groot53/bin/python - <<'PY'
-import lerobot, torch, numpy, numpy as np, accelerate, safetensors
-print("[build] groot53 venv: lerobot", lerobot.__version__, "torch", torch.__version__,
-      "numpy", numpy.__version__)
-assert lerobot.__version__ == "0.6.1", lerobot.__version__
-# 53D venv も base torch を継承するので同じ bridge 検証をする。
-_arr = torch.from_numpy(np.zeros(3, dtype=np.float32)); _ = _arr.numpy()
-print("[build] groot53 venv: torch<->numpy bridge OK")
-PY
-
-# --- Unitree SDK + CycloneDDS (自前経路用、Issue #1) ---------------------------
-# 大会経路 (components/server.py) は boundary の ZMQ だけで完結するのでこの層は
-# 要らない。要るのは自前経路 (inference/desktop/entrypoint.py) の方で、
-# rt/arm_sdk への直 publish・LocoClient・rt/lowstate の直読みに DDS を使う。
-#
-# 会場で持てる image を 1 個にするため (提出 image と自前経路 image を分けない)、
-# ここに同居させる。大会経路には影響しない (import されない)。
-#
-#   自前経路 : 歩行 (Stage 0 = +2点) と腕。運営 IK を通らないので EE frame 問題が無い
-#   大会経路 : グリッパが動く唯一の経路 ((T,25) の [0:2]/[2:4] を運営 adapter が relay)
-
-# 1) CycloneDDS C ライブラリ。python binding の cyclonedds 0.10.2 は
-#    linux/aarch64 wheel が存在せず (wheel は cp310 まで)、CYCLONEDDS_HOME を見て
-#    libddsc にリンクする形で sdist から source build される。
-#    → 2026-09-20 に base (Python 3.12.3 / aarch64) 上で単体検証済み:
-#      cyclonedds-0.10.2-cp312-cp312-linux_aarch64.whl の生成に成功。
-#
-#    ⚠️ branch ではなく **tag で pin** する。releases/0.10.x の先端は 0.10.5 で、
-#    binding (0.10.2) と版がずれる。同版に揃えておく。
+# --- 2) CycloneDDS の C ライブラリ --------------------------------------------
+# python binding の cyclonedds 0.10.2 は linux/aarch64 の wheel が無く、pixi install が
+# CYCLONEDDS_HOME を見て sdist から build する。binding と同じ版を tag で取り、commit も確かめる
+# (releases/0.10.x の先端は 0.10.5 で、binding とずれる。tag は付け替えられうるので、
+# 他の依存と同じく commit で固定する。PR #11 のレビュー)。
 ARG CYCLONEDDS_REF=0.10.2
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git cmake build-essential \
-    && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
-         https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cyclonedds \
+ARG CYCLONEDDS_COMMIT=9995905bce6c4cf9f740d6438bbf7fcfd1c83dfd
+RUN git clone --depth 1 --branch "${CYCLONEDDS_REF}" \
+      https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cyclonedds \
+    && test "$(git -C /tmp/cyclonedds rev-parse HEAD)" = "${CYCLONEDDS_COMMIT}" \
     && cmake -S /tmp/cyclonedds -B /tmp/cyclonedds/build \
          -DCMAKE_INSTALL_PREFIX=/usr/local \
          -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DBUILD_IDLC=ON \
     && cmake --build /tmp/cyclonedds/build --target install -j"$(nproc)" \
     && ldconfig \
     && rm -rf /tmp/cyclonedds
-
-# CYCLONEDDS_HOME は build 時 (binding の link) と run 時 (import 時の .so 探索) の
-# 両方で要る。焼いておかないと import cyclonedds が LoaderException になる。
+# build 時 (binding の link) と run 時 (import 時の .so 探索) の両方で要る。
 ENV CYCLONEDDS_HOME=/usr/local
 
-RUN python3 -m pip install --no-cache-dir "cyclonedds==0.10.2"
+# --- 3) pixi (版と checksum を固定) --------------------------------------------
+# #152 (実機評価) の方と同じ版。lock の書き方 (空の run_exports 等) がそろう。
+ARG PIXI_VERSION=v0.73.0
+ARG PIXI_SHA256=0788f47eb37e0706de209c3ce81cc804ee128f7dd4ec09a686754a67170ddb64
+RUN curl -fsSL -o /tmp/pixi.tar.gz \
+      "https://github.com/prefix-dev/pixi/releases/download/${PIXI_VERSION}/pixi-aarch64-unknown-linux-musl.tar.gz" \
+    && echo "${PIXI_SHA256}  /tmp/pixi.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/pixi.tar.gz -C /usr/local/bin \
+    && rm /tmp/pixi.tar.gz \
+    && pixi --version
 
-# 2) unitree_sdk2py。**pip install せず、ソースを置いて .pth で sys.path に通す。**
-#    setup.py が find_packages() だけで package_data を宣言しないため、wheel には
-#    utils/lib/crc_aarch64.so などが入らず CRC() の初期化で落ちる (実機で 21〜25
-#    ファイル不足を確認)。ソースごと置けばこの取りこぼしが起きない。
-#
-#    ⚠️ ref は固定する。運営 vendor 版 (GR00T-WholeBodyControl/external_dependencies)
-#    は LOCO_SERVICE_NAME="loco" で robot と話せず、全 RPC が 3102 になる。
-#    robot が publish しているのは rt/api/sport/*。下の assert がこれを毎回確かめる。
+WORKDIR /app/ramen
+
+# --- 4) unitree SDK のソース ---------------------------------------------------
+# root の runtime env が third_party/unitree_sdk2_python を editable で参照する (本体と同じ置き場所)。
+# ref は固定する。運営 vendor 版 (GR00T-WholeBodyControl/external_dependencies) は
+# LOCO_SERVICE_NAME="loco" で robot と話せず、全 RPC が 3102 になる (下の assert で確かめる)。
 ARG UNITREE_SDK_REF=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
 RUN git clone https://github.com/unitreerobotics/unitree_sdk2_python \
-      /opt/unitree_sdk2_python \
-    && git -C /opt/unitree_sdk2_python checkout --quiet "${UNITREE_SDK_REF}" \
-    && rm -rf /opt/unitree_sdk2_python/.git
+      third_party/unitree_sdk2_python \
+    && git -C third_party/unitree_sdk2_python checkout --quiet "${UNITREE_SDK_REF}" \
+    && rm -rf third_party/unitree_sdk2_python/.git
 
-# PYTHONPATH ではなく .pth で sys.path に入れるのは、base の NGC image が
-# PYTHONPATH を設定している可能性があり、上書きで torch 側を壊したくないため。
-# .pth は --system-site-packages の groot53 venv からも効く。
-RUN python3 - <<'PY'
-import pathlib, site
-target = pathlib.Path(site.getsitepackages()[0], "unitree_sdk2py.pth")
-target.write_text("/opt/unitree_sdk2_python\n")
-print("[build] wrote", target)
-PY
+# --- 5) pixi の環境 (Python のものは全部ここ) ------------------------------------
+# lock どおりに入れ、解き直さない (--frozen)。定義だけを先に COPY して、コードの変更で
+# この重い層を作り直さないようにする。
+#   runtime                          : entrypoint 本体 / YOLO / RAMEN-Ori (py3.10)
+#   inference/desktop の default      : GR00T 53D の worker (py3.12、lerobot 0.6.1)
+#   inference/desktop の groot-pick   : GR00T pick の worker (py3.12.11、lerobot 0.6.0、#152 の .venv と同じ版)
+#   inference/desktop の vlm          : pick hybrid の VLM server (vLLM 0.29.0 + Qwen3-VL-8B)
+# 1 つの RUN で入れる: 同じ wheel (torch 2.11.0 は default と groot-pick の両方) を cache からの
+# hardlink で共有させ、image を小さくする。
+COPY ramen/pixi.toml ramen/pixi.lock ./
+COPY ramen/scripts/ scripts/
+COPY ramen/inference/desktop/pixi.toml ramen/inference/desktop/pixi.lock inference/desktop/
+RUN export PIXI_CACHE_DIR=/tmp/pixi-cache UV_CACHE_DIR=/tmp/uv-cache \
+    && pixi install --frozen -e runtime \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick \
+    && pixi install --frozen --manifest-path inference/desktop/pixi.toml -e vlm \
+    && rm -rf /tmp/pixi-cache /tmp/uv-cache
 
-# 3) unitree の interface 指定 config から <Tracing> を落とす。
-#
-#    cyclonedds 0.10.2 は `<Tracing><Verbosity>config</Verbosity></Tracing>` を
-#    含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって
-#    `*** buffer overflow detected ***` で **core dump** する
-#    (この image の中で実測、2026-09-21)。unitree の ChannelConfigHasInterface は
-#    必ずこの block を持つので `ChannelFactoryInitialize(0, <interface>)` が全滅
-#    = **自前経路 (entrypoint.py) が起動できない** (Stage 0 の歩行 = +2点 を含む)。
-#
-#    interface を渡さない ChannelConfigAutoDetermine は元から Tracing を持たず
-#    落ちない。これが「interface を渡したときだけ落ちる」理由で、素の import や
-#    DomainParticipant(0) では露見しない。
-#    Tracing は /tmp/cdds.LOG への診断出力なので、落としても通信に影響しない。
+# GR00T pick の worker は groot_pick_legs.py が repo root (/app/ramen) からのパス
+# model/subtask_policy_training/.venv/bin/python で起動する (開発機の uv の .venv)。コードは変えず、
+# そこに groot-pick 環境の python を置く。
+RUN mkdir -p model/subtask_policy_training/.venv/bin \
+    && ln -s /app/ramen/inference/desktop/.pixi/envs/groot-pick/bin/python \
+         model/subtask_policy_training/.venv/bin/python
+
+# unitree SDK の interface 指定の config から <Tracing> を落とす。cyclonedds 0.10.2 はこの
+# block を含む config で Domain を作ると glibc の _FORTIFY_SOURCE に引っかかって core dump し、
+# ChannelFactoryInitialize(0, <interface>) が全滅する (理由は tools/patch_unitree_tracing.py)。
+# runtime env は SDK をソースのまま (editable) 参照するので、install の後に当てても効く。
 COPY tools/patch_unitree_tracing.py /tmp/patch_unitree_tracing.py
-RUN python3 /tmp/patch_unitree_tracing.py && rm /tmp/patch_unitree_tracing.py
+RUN pixi run --frozen -e runtime python /tmp/patch_unitree_tracing.py \
+      third_party/unitree_sdk2_python/unitree_sdk2py/core/channel_config.py \
+    && rm /tmp/patch_unitree_tracing.py
 
-RUN python3 - <<'PY'
+# vLLM の Conv3dLayer (Qwen3-VL の画像エンコーダの入口) に、Thor (sm_110) で F.linear の cuBLAS が
+# 落ちたときだけ畳み込み (F.conv3d、cuDNN) に切り替える fallback を入れる。報告元の直し方
+# (ms1design/thorllm の Patch 6) を、落ちたときだけ効く形にしたもの。理由と動きは
+# tools/patch_vllm_conv3d_sm110.py。RAMEN_VLLM_CONV3D=conv で最初から畳み込み。
+COPY tools/patch_vllm_conv3d_sm110.py /tmp/patch_vllm_conv3d_sm110.py
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm \
+      python /tmp/patch_vllm_conv3d_sm110.py \
+    && rm /tmp/patch_vllm_conv3d_sm110.py
+
+# --- 6) build 時の確認 ---------------------------------------------------------
+# GPU は無いので推論はできないが、「焼けたのに会場で import から落ちる」類はここで全部出す。
+# torch <-> numpy の受け渡しは NGC 25.08 で全推論が落ちた件の再発防止 (build は緑なのに
+# 実推論だけ壊れる形だった)。runtime は numpy 1.26.4、53D は numpy 2.2.6。
+RUN cat > /tmp/probe_runtime.py <<'PY'
+import numpy as np
+import torch
+
+assert torch.__version__.startswith("2.12.1+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+
+# torch / cv2 の後に pinocchio (libstdc++ の読み込み順、scripts/activate_runtime.sh)
+import cv2, ultralytics, pinocchio, hydra, omegaconf, lingbot_vision  # noqa: E401,F401
+import zmq, msgpack, websockets  # noqa: E401,F401
+
 from importlib.metadata import version
-
-# import が通れば libddsc の解決まで出来ている (CYCLONEDDS_HOME が効いている)。
-# cyclonedds package は __version__ を持たないので metadata から取る。
 from cyclonedds.domain import DomainParticipant  # noqa: F401
 from unitree_sdk2py.g1.loco.g1_loco_api import LOCO_SERVICE_NAME
 from unitree_sdk2py.utils.crc import CRC
-
-# robot は rt/api/sport/*。"loco" 版を掴むと全 RPC が 3102 で死ぬ。
-assert LOCO_SERVICE_NAME == "sport", LOCO_SERVICE_NAME
-assert version("cyclonedds") == "0.10.2", version("cyclonedds")
-CRC()  # crc_aarch64.so が無いとここで落ちる (find_packages 取りこぼしの検出)
-
-# ⚠️ **interface を渡した初期化まで実際にやる。** import や DomainParticipant(0) は
-# 通るのに `ChannelFactoryInitialize(0, <iface>)` だけが core dump する、という形の
-# 事故を踏んだ (cyclonedds 0.10.2 + Tracing block)。自前経路はこの呼び出しから
-# 始まるので、ここが通らないと歩行も腕も動かない。
-# lo は build container にも必ずあるので CI で検証できる。
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-ChannelFactoryInitialize(0, "lo")
 
-print("[build] cyclonedds", version("cyclonedds"),
-      "| unitree_sdk2py OK (service=sport, CRC ok, iface init ok)")
+assert LOCO_SERVICE_NAME == "sport", LOCO_SERVICE_NAME  # "loco" 版だと全 RPC が 3102
+assert version("cyclonedds") == "0.10.2", version("cyclonedds")
+CRC()  # crc_aarch64.so が無いとここで落ちる
+ChannelFactoryInitialize(0, "lo")  # <Tracing> が残っていると core dump する
+print("[build] runtime env OK:", torch.__version__, "numpy", np.__version__, "sm_110",
+      "| cyclonedds", version("cyclonedds"), "| unitree SDK (sport, CRC, iface init)")
 PY
+RUN pixi run --frozen -e runtime python /tmp/probe_runtime.py && rm /tmp/probe_runtime.py
 
-RUN /opt/venv-groot53/bin/python - <<'PY'
-# 53D venv も system site-packages 経由で SDK を見られること。
-from unitree_sdk2py.utils.crc import CRC
-CRC()
-print("[build] groot53 venv: unitree_sdk2py OK")
+RUN cat > /tmp/probe_desktop.py <<'PY'
+import numpy as np
+import torch
+
+assert torch.__version__.startswith("2.11.0+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+
+import lerobot
+from lerobot.policies.groot import modeling_groot  # noqa: F401
+import transformers, hydra, omegaconf, lingbot_vision, yaml  # noqa: E401,F401
+
+assert lerobot.__version__ == "0.6.1", lerobot.__version__
+print("[build] inference/desktop env OK:", torch.__version__, "numpy", np.__version__,
+      "sm_110 | lerobot", lerobot.__version__, "| transformers", transformers.__version__)
 PY
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml python /tmp/probe_desktop.py \
+    && rm /tmp/probe_desktop.py
 
-# --- submission code (boundary は無改変、components/ramen + vendor を含む) ---
-COPY . ./
-
-# 既定は pick (RAMEN_POLICY=groot_pick_real, worker=同 env python3=lerobot0.6.0)。
-# 53D skill に切替える時は run 時に -e RAMEN_POLICY=groot_53d_real -e RAMEN_VARIANT=<skill>。
-# 53D worker は別 env python (RAMEN_WORKER_PYTHON_53D=0.6.1 venv) を使う。
-# full orchestrator (RAMEN_POLICY=groot_orchestrator) 用の YOLO weight は HF から runtime 取得
-# (要 HF_TOKEN)。single-skill 直指定は RAMEN_POLICY=groot_pick_real / groot_53d_real+RAMEN_VARIANT。
-ENV RAMEN_POLICY=groot_pick_real \
-    RAMEN_WORKER_PYTHON=python3 \
-    RAMEN_WORKER_PYTHON_53D=/opt/venv-groot53/bin/python \
-    RAMEN_YOLO_WEIGHT=Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy@8221d0aef45d63666537c1f030810fb9b56dd1ed \
-    PEVAL_LANE=decoupled
-
-# --- worker の起動可能性を build 時に確かめる ---
-#
-# model の重みは runtime に HF から取るので build 中に推論はできないが、worker が
-# **spawn された直後に落ちる**類の事故 (deps 欠落 / import path ずれ / lerobot 版
-# 違い) はここで全部出せる。image が緑なのに会場で worker だけ死ぬ、を防ぐ。
-# --help は argparse が即 SystemExit(0) するので module 直下の import だけを通す。
-#
-# 1) pick (38D) worker: system python3 = lerobot 0.6.0。worker 自身が
-#    `importlib.metadata.version("lerobot") != LEROBOT_VERSION` で落ちる契約。
-#    accelerate / safetensors は _load_model の遅延 import なので別途 import する。
-RUN python3 /app/components/ramen/vendor/model/subtask_policy_training/deployment/real_groot_n17_worker.py \
-      --help > /dev/null \
-    && cd /app/components/ramen/vendor \
-    && python3 - <<'PY'
+# GR00T pick の worker: 起動されるのと同じパス (.venv/bin/python) の python で確かめる。
+RUN cat > /tmp/probe_pick.py <<'PY'
 import importlib.metadata as md
+import sys
 
-import accelerate  # noqa: F401  (worker の _load_model が遅延 import する)
-import safetensors  # noqa: F401
+import numpy as np
+import torch
 
-from inference.desktop.upper_policy.groot_pick_leg_contract import LEROBOT_VERSION
-
-got = md.version("lerobot")
-assert got == LEROBOT_VERSION, f"pick worker requires lerobot {LEROBOT_VERSION}, got {got}"
-print(f"[build] pick worker OK (lerobot {got} + accelerate + safetensors)")
+assert sys.version.startswith("3.12.11"), sys.version  # #152 の .venv と同じ
+assert torch.__version__.startswith("2.11.0+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+assert md.version("lerobot") == "0.6.0", md.version("lerobot")
+# real_groot_n17_worker.py が使うもの (GR00T N1.7 と公式の前処理・後処理、遅延 import の 2 つ、cv2)
+from lerobot.policies.groot.groot_n1_7 import GR00TN17, GR00TN17Config  # noqa: F401
+from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors_from_pretrained  # noqa: F401
+import accelerate, safetensors, cv2  # noqa: E401,F401
+print("[build] groot-pick env OK:", sys.version.split()[0], torch.__version__, "sm_110 | lerobot",
+      md.version("lerobot"), "| accelerate", accelerate.__version__)
 PY
+RUN model/subtask_policy_training/.venv/bin/python /tmp/probe_pick.py && rm /tmp/probe_pick.py
 
-# 2) 53D worker: /opt/venv-groot53 = lerobot 0.6.1。vendor/desktop を repo root と
-#    して -m で起動されるので、同じ形で import できることを確かめる。
-RUN cd /app/components/ramen/vendor/desktop \
-    && /opt/venv-groot53/bin/python -m inference.desktop.lower_policy.policies.groot_worker \
-         --help > /dev/null \
-    && echo "[build] 53D worker OK (lerobot 0.6.1 env から -m で起動できる)"
+# VLM server: vLLM と、FlashInfer の事前 compile 済み kernel に Qwen3-VL-8B の言語部分
+# (bf16 / head_dim 128) の prefill・decode があり、sm_110a の機械語が入っていること。
+# Triton は TRITON_PTXAS_PATH の ptxas (CUDA 13) で sm_110a に compile できること。
+# vLLM の GPU の部品 (_C_stable_libtorch) は driver (libcuda.so.1) が要るので build 中は import しない。
+RUN cat > /tmp/probe_vlm.py <<'PY'
+import os, pathlib, subprocess, tempfile
 
-# 3) orchestrator が pick worker の runtime を解決できること。vendor tree は
-#    desktop/ が 1 段挟まるので、上流の parents[4] だけでは model/ を見失う
-#    (tools/vendor_patches.py がこれを直している)。Popen の直前まで実際に走らせる。
-RUN cd /app/components/ramen/vendor/desktop \
-    && python3 - <<'PY'
+import torch
+import flashinfer, flashinfer_jit_cache, vllm
+
+assert vllm.__version__ == "0.29.0", vllm.__version__
+assert torch.__version__.startswith("2.13.0+cu130"), torch.__version__
+assert "sm_110" in torch._C._cuda_getArchFlags(), torch._C._cuda_getArchFlags()
+cache = pathlib.Path(flashinfer_jit_cache.__file__).parent / "jit_cache"
+common = "dtype_q_bf16_dtype_kv_bf16_dtype_o_bf16_dtype_idx_i32_head_dim_qk_128_head_dim_vo_128_posenc_0_use_swa_False_use_logits_cap_False"
+for name in (f"batch_prefill_with_kv_cache_{common}_f16qk_False", f"batch_decode_with_kv_cache_{common}"):
+    so = cache / name / f"{name}.so"
+    assert so.is_file(), so
+    elf = subprocess.run(["cuobjdump", "--list-elf", str(so)], capture_output=True, text=True).stdout
+    assert "sm_110" in elf, f"{so.name} に sm_110 の機械語が無い"
+ptxas = os.environ["TRITON_PTXAS_PATH"]
+with tempfile.TemporaryDirectory() as d:
+    src = pathlib.Path(d, "k.ptx")
+    src.write_text(".version 9.0\n.target sm_110a\n.address_size 64\n.visible .entry k() { ret; }\n")
+    subprocess.run([ptxas, "-arch=sm_110a", str(src), "-o", str(pathlib.Path(d, "k.cubin"))], check=True)
+print("[build] vlm env OK: vllm", vllm.__version__, "| torch", torch.__version__, "sm_110 | flashinfer",
+      flashinfer.__version__, "jit-cache (Qwen3-VL prefill/decode sm_110) | TRITON_PTXAS_PATH sm_110a")
+PY
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py \
+    && rm /tmp/probe_vlm.py
+
+# Conv3dLayer の fallback の動き (GPU 無しで、計算の中身を差し替えて確かめる):
+#   普段は行列の掛け算 (develop と同じ) / cuBLAS の例外なら畳み込みに切り替わり以後もそのまま /
+#   cuBLAS 以外の例外は握りつぶさない / RAMEN_VLLM_CONV3D=conv なら最初から畳み込み
+RUN cat > /tmp/probe_conv3d.py <<'PY'
 import os
 import subprocess
 import sys
-from pathlib import Path
+from types import SimpleNamespace
 
-sys.path.insert(0, "/app/components/ramen/vendor/desktop")
-from inference.desktop.lower_policy.policies import groot_pick_legs as m
-from inference.desktop.lower_policy.policies.base import PolicyConfig
+from vllm.model_executor.layers.conv import Conv3dLayer as C
 
-
-class Spawned(Exception):
-    pass
+CUBLAS = "CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasLtCreate(&handle)`"
 
 
-captured = {}
+def layer(fail_with=None):
+    calls = []
+
+    def mulmat(x):
+        calls.append("mulmat")
+        if fail_with:
+            raise RuntimeError(fail_with)
+        return "mulmat"
+
+    def conv(x):
+        calls.append("conv")
+        return "conv"
+
+    ns = SimpleNamespace(enable_linear=True, calls=calls, _forward_mulmat=mulmat, _forward_conv=conv)
+    ns._forward_mulmat_or_conv = lambda x: C._forward_mulmat_or_conv(ns, x)
+    return ns
 
 
-def fake_popen(cmd, **kw):
-    captured["cmd"] = list(cmd)
-    raise Spawned
-
-
-m.subprocess.Popen = fake_popen
-# ckpt は HF に取りに行かせない。実在 directory を渡すと存在チェックだけになる。
-ckpt = Path("/tmp/_ckpt_probe")
-ckpt.mkdir(exist_ok=True)
-for name in ("config.json", "processor_config.json", "statistics.json",
-             "embodiment_id.json", "model.safetensors.index.json"):
-    (ckpt / name).touch()
+C._ramen_use_conv = False
+assert C.forward_cuda(layer(), None) == "mulmat"
+assert C.forward_native(layer(), None) == "mulmat"
+failing = layer(CUBLAS)
+assert C.forward_cuda(failing, None) == "conv" and failing.calls == ["mulmat", "conv"], failing.calls
+assert C._ramen_use_conv is True
+after = layer()
+assert C.forward_cuda(after, None) == "conv" and after.calls == ["conv"], after.calls
+C._ramen_use_conv = False
 try:
-    m._PickLegsWorkerClient(PolicyConfig(mode="none", ckpt_ref=str(ckpt)))
-except Spawned:
-    pass
-finally:
-    for p in ckpt.iterdir():
-        p.unlink()
-    ckpt.rmdir()
-
-py, script = captured["cmd"][0], captured["cmd"][1]
-assert Path(py).is_file(), f"worker python が無い: {py}"
-assert Path(script).is_file(), f"worker script が無い: {script}"
-print(f"[build] orchestrator pick worker OK ({py} {script})")
+    C.forward_cuda(layer("some other error"), None)
+    sys.exit("cuBLAS 以外の例外を握りつぶした")
+except RuntimeError as exc:
+    assert "some other error" in str(exc)
+code = "from vllm.model_executor.layers.conv import Conv3dLayer as C; assert C._ramen_use_conv is True"
+subprocess.run([sys.executable, "-c", code], check=True, env=dict(os.environ, RAMEN_VLLM_CONV3D="conv"))
+print("[build] vLLM Conv3dLayer fallback OK (normal=mulmat / cuBLAS error -> conv, sticky / "
+      "other errors raised / RAMEN_VLLM_CONV3D=conv)")
 PY
+RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_conv3d.py \
+    && rm /tmp/probe_conv3d.py
 
-# 4) pick の hybrid (`-e RAMEN_PICK_HYBRID=1`) が image の中で組めること。
-#    VLM は立てないので endpoint の probe だけ差し替え、そこまでの
-#    「config が読めて / 参照画像が焼けていて / class が import できる」を見る。
-#    参照画像は .dockerignore に引っかかると **無言で欠ける** ので実体を確認する。
-RUN cd /app/components/ramen/vendor/desktop \
-    && python3 - <<'PY'
-import sys
-from pathlib import Path
+# --- 7) 本体のコード ------------------------------------------------------------
+# 環境の層の後に置き、コードを直しても環境を入れ直さないようにする。
+COPY ramen/ ./
+COPY docker/venue_entry.sh /usr/local/bin/ramen-venue
 
-sys.path.insert(0, "/app/components/ramen/vendor/desktop")
-sys.path.insert(0, "/app")
+# 運営の conformance 一式 (template と同じ並び)。image の環境のまま回せるように /app に置く:
+#   docker run --rm <image> pixi run --as-is -e runtime python /app/conformance.py --lane decoupled
+# components/server.py は /app/ramen の本番と同じ受け口・送り口を使う (conformance 専用)。
+COPY conformance.py requirements.txt /app/
+COPY boundary/ /app/boundary/
+COPY mocks/ /app/mocks/
+COPY components/ /app/components/
+# 重みの事前取得とネット無しの確認 (WEIGHTS.md)。/app/ramen の本物の解決関数を呼ぶ
+COPY tools/prefetch_weights.py /app/tools/prefetch_weights.py
 
-from inference.desktop.pick_leg_hybrid import real_skill
-from inference.desktop.pick_leg_hybrid.config import DEFAULT_CONFIG_PATH
+# 会場は実行時オフライン: 重みは HF の cache (読み取り専用で mount) から読み、取りに行かない。
+# YOLO_OFFLINE: ultralytics は import 時に DNS でネットの有無を調べ、推論の開始時に Google Analytics
+# へ利用統計を送る (GB10 で strace、2026-09-25)。true で両方止まる。
+# VLM の compile 結果の置き場は /cache (container は run ごとに作り直すので host の directory を mount)。
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    YOLO_OFFLINE=true \
+    RAMEN_VLM_CACHE_DIR=/cache
 
-assert DEFAULT_CONFIG_PATH.is_file(), f"hybrid config が無い: {DEFAULT_CONFIG_PATH}"
-cfg, references = real_skill.load_reference_images(DEFAULT_CONFIG_PATH)
-assert len(references) == 2, f"参照画像は 2 枚のはず: {len(references)}"
-for name in (cfg.references.before, cfg.references.after):
-    path = (DEFAULT_CONFIG_PATH.parent / name).resolve()
-    assert path.is_file() and path.stat().st_size > 0, f"参照画像が無い: {path}"
+# コピー漏れをここで止める: 会場で動く入口を、それぞれの環境で import する。
+#   runtime    : entrypoint (と --help で CLI の定義)、VLM の起動と待ち
+#   desktop    : GR00T 53D の worker
+#   groot-pick : GR00T pick の worker の script (依存は上の probe_pick で確認済み)
+#   vlm        : VLM の起動 script
+RUN pixi run --as-is -e runtime python -c \
+      "import inference.desktop.entrypoint, inference.desktop.pick_leg_hybrid.vlm_server" \
+    && pixi run --as-is -e runtime python -m inference.desktop.entrypoint --help > /dev/null \
+    && pixi run --as-is --manifest-path inference/desktop/pixi.toml python -c \
+      "import inference.desktop.lower_policy.policies.groot_worker" \
+    && model/subtask_policy_training/.venv/bin/python -m py_compile \
+      model/subtask_policy_training/deployment/real_groot_n17_worker.py \
+    && bash -n inference/desktop/pick_leg_hybrid/run_venue_vlm_server.sh \
+    && echo "[build] ramen code OK (entrypoint / VLM server / GR00T 53D worker / pick worker)"
 
-# VLM は image build 時には居ない。probe だけ差し替えて driver の配線を通す。
-real_skill.probe_vlm_endpoint = lambda cfg, refs=None, timeout_sec=3.0: {cfg.vlm.model}
-import os
-
-os.environ["RAMEN_PICK_HYBRID"] = "1"
-from components.ramen.orchestrator_driver import (
-    _hybrid_pick_settings,
-    _load_skill_config,
-)
-
-settings = _hybrid_pick_settings(_load_skill_config("/app/components/ramen/vendor/desktop"))
-assert settings is not None and settings.skill_cls is real_skill.RealPickLegHybridVlaSkill
-assert settings.extra_kwargs["phase3_executor"] == "rule_based"
-
-# JPEG encode は cv2、HTTP は requests。どちらも lazy import なので、
-# 欠けていても **最初の VLM 呼び出しまで気付けない** = 会場で踏む。
-import cv2  # noqa: F401
-import requests  # noqa: F401
-
-print(
-    f"[build] pick hybrid OK (VLM {cfg.vlm.model}, timeout "
-    f"{cfg.runtime.hard_timeout_sec:g}s, refs 2, cv2 + requests あり)"
-)
-PY
-
-# weights (ver2-lora, private Team-RAMEN) は image に焼かず runtime に HF から取得。
-#   docker run 時に -e HF_TOKEN=<token> を渡す (private repo pull に必須)。
-#   manifest.yaml の weights_uri と整合。
-
-# 既定 (CMD) は大会経路。自前経路はこの image の中から直接起動できる:
-#
-#   docker run --rm --runtime nvidia --network host \
-#     -e NVIDIA_DISABLE_REQUIRE=1 -e HF_TOKEN=<token> \
-#     -v ~/.cache/huggingface:/root/.cache/huggingface \
-#     <image> \
-#     python3 -m inference.desktop.entrypoint --help
-#
-# PYTHONPATH=/app/components/ramen/vendor/desktop を渡すこと (vendor tree が
-# inference.desktop の repo root を兼ねる)。会場の I/O に合わせる主な option:
-#   --head-source zmq         会場は ROS2 カメラを publish しない (boundary :5555)
-#   --synthetic-hand-state    会場は hand state を publish しない (Dex1-1、設計どおり)
-#   --action-sink boundary    (T,25) を運営 adapter へ。グリッパはこの経路でのみ動く
-CMD ["python3", "-u", "components/server.py", \
-     "--lane", "decoupled", "--host", "0.0.0.0", "--port", "8765"]
+# --- 8) 起動口 ------------------------------------------------------------------
+# 会場: docker run … <image> --stage N --actuate。`-` で始まらない引数はそのまま実行する。
+ENTRYPOINT ["/usr/local/bin/ramen-venue"]
+CMD []

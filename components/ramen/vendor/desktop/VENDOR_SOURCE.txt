@@ -1,8 +1,0 @@
-# tools/sync_vendor_desktop.sh が生成。手で編集しない。
-source_repo   : iros_2026_ramen
-source_commit : 84cdcce8e17170a1252998d06d507e71a6702bd4
-source_branch : issue/157-preflight-reverification
-source_dirty  : no
-synced_at     : 2026-09-22T13:09:42Z
-excluded      : tests/ __pycache__/ *.pyc .pytest_cache/ pixi.toml pixi.lock
-patches       : tools/vendor_patches.py

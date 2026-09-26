@@ -1,0 +1,152 @@
+# inference/desktop VLA policy inference 用 pixi env (Issue #125)。
+#
+# 別 env 必要な理由:
+#   - lerobot 0.6.x = Python >= 3.12 要求
+#   - 既存 root runtime env = Python 3.10 pin (cyclonedds SDK の wheel が 3.10 のみ)
+#   - この 2 制約は同 env 内で両立不可 → VLA inference 用に別 env を切って解決
+#
+# 責務境界:
+#   root runtime env  (Python 3.10):  cyclonedds / unitree_sdk2py / ultralytics YOLO
+#                                     = SDK / ROS / perception 実体 (実機 driver)
+#   inference/desktop (本 env、3.12):  lerobot 0.6.x / GR00T / RAMEN-Ori policy
+#                                     load + forward verify (integration test 用)
+#
+# 実運用 (実機 loop) はruntime envのGr00tPolicy proxyが本envにUnix-socket
+# workerを起動する。DDS/actuatorはPython 3.10、model/LeRobotはPython 3.12に分離し、
+# 実機指令がmodel worker側に入らない境界を維持する。
+#
+# NOTE: 本 pixi.toml は project 内で完結 (`.pixi/envs/default/` に install、
+# global 汚染しない、user 指摘の "Global に入れるな" 準拠)。
+
+[workspace]
+name = "iros_inference_desktop"
+version = "0.1.0"
+description = "VLA policy inference-side loader + preprocessing verify env (Issue #125)"
+authors = ["Team RAMEN"]
+channels = ["conda-forge"]
+# linux-aarch64 は会場の Thor (提出 image) 用 (Issue #161)。
+platforms = ["linux-64", "linux-aarch64"]
+
+[dependencies]
+python = "==3.12.13"
+pytest = "==9.1.1"
+# lerobot 0.6.1 は packaging <26 要求、conda default (26.3) と衝突するので pin
+packaging = "==25.0"
+
+[pypi-dependencies]
+# Core: 官方 upstream lerobot 0.6.x (Team-RAMEN training-side が使ってる fork と
+# 同世代、GrootConfig の新 field 群 = action_decode_transform / use_flash_attention
+# / use_relative_actions 等 = に対応)。
+# [groot] extra = transformers + Isaac-GR00T native deps (GR00T policy 走らせるのに必須)
+lerobot = { version = "==0.6.1", extras = ["groot"] }
+# lerobot 依存で自動 pull される (torch >=2.7 <2.12 / torchvision / numpy 2.x 等)、
+# 明示的な pin は unnecessary (lerobot の constraint に従う)
+
+# RAMEN-Ori loader 用 (model/ramen_ori/model.py の Hydra instantiate 経路で必要)
+hydra-core = "==1.3.5"
+omegaconf = "==2.3.1"
+
+# huggingface_hub は lerobot が pull するが明示的 pin (from_ckpt の HF DL 経路)
+huggingface_hub = "==1.28.0"
+
+# YAML load (config_loader.py の safe_load 経路)
+pyyaml = "==6.0.3"
+
+# LingBot-B vision backbone (RAMEN-Ori policy load 時の from_pretrained 経路で
+# 必須、Issue #134 Phase H)。root runtime env / model/ramen_ori pixi.toml と同 rev。
+lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision.git", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
+
+# Thor (linux-aarch64 / sm_110) の torch (Issue #161)。linux-64 は lerobot の制約で決まる版
+# (lock では 2.11.0 / 0.26.0) を、aarch64 は同じ版で cu130 から取る。PyPI 既定の aarch64 torch は
+# (少なくとも 2.8 までは) CPU 版で、sm_110 を含むのは cu130 の aarch64 build だけ。
+[target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" }
+
+# --- vlm 環境: pick hybrid の VLM server (vLLM + Qwen/Qwen3-VL-8B-Instruct) (Issue #161) ---
+# vLLM は torch と transformers の版を強く固定する (0.29.0 = torch 2.13.0 / transformers>=5.10.4) ので、
+# default env (lerobot 0.6.1 = torch 2.11 / transformers 5.5) とは両立しない → 独立した環境にする。
+# 0.29.0 は develop が 2026-09-20 に RTX 5090 (vllm/vllm-openai:latest) で動かした時点の最新。
+# 開発機は今までどおり pick_leg_hybrid/run_local_vlm_server.sh (docker) でよい。この環境は提出 image 用。
+[feature.vlm.dependencies]
+python = "==3.12.13"
+
+# vLLM 0.29.0 が固定する tilelang 0.1.12 の wheel は manylinux_2_34 (glibc 2.34 以上)。pixi は既定で
+# glibc 2.28 を前提に解くのでその wheel を選ばず、sdist の build (Cython 3.3 の Limited API 制約) で
+# 落ちる。この環境だけ glibc 2.34 以上を宣言する (提出 image = Ubuntu 24.04 は 2.39、workspace 全体に
+# 書くと既存の環境まで解き直しになるので feature に書く)。
+[feature.vlm.system-requirements]
+libc = { family = "glibc", version = "2.34" }
+
+[feature.vlm.pypi-dependencies]
+vllm = "==0.29.0"
+
+# Thor (linux-aarch64 / sm_110): torch は cu130 (aarch64 build だけ sm_110 を含む)。
+# FlashInfer は 0.6.18 本体が Python だけで kernel を実行時に compile する (Thor の初回起動で
+# 5〜15 分の報告がある) ので、sm_110a 入りの事前 compile 済み kernel (flashinfer-jit-cache) を入れる。
+# Qwen3-VL-8B の言語部分 (bf16 / head_dim 128) の prefill・decode の kernel が入っていることを確認済み。
+[feature.vlm.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" }
+torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+flashinfer-jit-cache = { version = "==0.6.18", index = "https://flashinfer.ai/whl/cu130" }
+
+# --- groot-pick 環境: GR00T pick の worker (Issue #161) ---
+# 開発機では model/subtask_policy_training/.venv (uv + requirements.txt、lock 無し) で動いていて、
+# groot_pick_legs.py がそのパスの python で worker を起動する。提出 image ではこの環境を作り、
+# 同じパスに置く (コードは変えない)。
+# 版は #152 の実機評価マシンの .venv (2026-09-24 の uv pip freeze、x86_64 / Python 3.12.11) に
+# 合わせる。数値の結果に効くものだけ pin し、残りは lock で固定する。学習用の dataset / training
+# extra (wandb / datasets / mcap 等) は推論に要らないので入れない。
+# pick の checkpoint は lerobot 0.6.0 の形式 (0.6.1 の 53D とは読めない) なので、default env とは別。
+[feature.groot-pick.dependencies]
+python = "==3.12.11"
+
+[feature.groot-pick.pypi-dependencies]
+lerobot = { version = "==0.6.0", extras = ["groot"] }
+torch = "==2.11.0"
+torchvision = "==0.26.0"
+transformers = "==5.5.4"
+tokenizers = "==0.22.2"
+accelerate = "==1.14.0"
+safetensors = "==0.8.0"
+diffusers = "==0.35.2"
+peft = "==0.20.0"
+timm = "==1.0.29"
+numpy = "==2.2.6"
+huggingface-hub = "==1.22.0"
+opencv-python-headless = "==4.13.0.92"
+pillow = "==11.3.0"
+dm-tree = "==0.1.10"
+einops = "==0.8.2"
+# 上以外で、lock を作った日の最新が選ばれて freeze とずれていた周辺のもの (2026-09-24 に突き合わせ)。
+# 重なる全 package を #152 の .venv と同じ版にするため pin する。
+cuda-bindings = "==13.3.1"
+cuda-pathfinder = "==1.8.0"
+anyio = "==4.14.2"
+filelock = "==3.32.4"
+idna = "==3.19"
+multidict = "==6.7.1"
+networkx = "==3.6.1"
+propcache = "==0.5.2"
+pyarrow = "==24.0.0"
+pytz = "==2026.3.post1"
+regex = "==2026.7.19"
+tqdm = "==4.67.1"
+tzdata = "==2026.3"
+urllib3 = "==2.7.0"
+wrapt = "==2.4.0"
+yarl = "==1.24.5"
+
+# Thor (linux-aarch64 / sm_110): 同じ版を cu130 から取る (aarch64 の cu130 build だけ sm_110 を含む)。
+[feature.groot-pick.target.linux-aarch64.pypi-dependencies]
+torch = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.26.0", index = "https://download.pytorch.org/whl/cu130" }
+
+[environments]
+vlm = { features = ["vlm"], no-default-feature = true }
+groot-pick = { features = ["groot-pick"], no-default-feature = true }
+
+[tasks]
+# VLA policy tests (default env の test-desktop とは別、torch / lerobot 依存を含む)
+test-vla = "pytest lower_policy/policies/tests/ -v"

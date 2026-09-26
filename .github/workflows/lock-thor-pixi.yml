@@ -1,0 +1,268 @@
+# 本体 (iros_2026_ramen) の推論用 pixi 環境に Thor (linux-aarch64 / sm_110) の lock を足す (#10、本体 #161)。
+#
+# ramen/ には本体の環境定義を同じ相対パスでコピーしてある (pixi.toml / pixi.lock /
+# inference/desktop/pixi.* / scripts/activate_runtime.sh)。ここで作った lock を本体に戻して
+# commit する (本体が正本。以後のコピーで aarch64 の分が消えないように)。
+#
+# ここで作る理由: 本体 repo は Actions が無効。手元 (Mac) では、root の runtime env が参照する
+# unitree SDK のソース (third_party/unitree_sdk2_python) と、aarch64 の wheel が無い cyclonedds を
+# build する C ライブラリが無い。どちらも提出 image の Dockerfile.thor と同じ版をここで用意する。
+#
+# やること:
+#   1. pixi lock (root と inference/desktop)
+#   2. 既存の環境の linux-64 の中身が 1 つも変わっていないこと (#152 の実機評価の環境を動かさない)
+#   3. できた lock から `pixi install --frozen` し、torch の sm_110 とライブラリの import を確かめる
+#      (本体コードの import は、コピーの仕組みができてから確かめる)
+#   4. lock を成果物として残す
+
+name: lock-thor-pixi
+
+on:
+  # main に無い workflow は workflow_dispatch で呼べないので、このブランチで
+  # 対象のファイルを push したときに走らせる (build-thor-image.yml と同じ事情)。
+  push:
+    branches: ["issue/**"]
+    paths:
+      - .github/workflows/lock-thor-pixi.yml
+      - ramen/pixi.toml
+      - ramen/inference/desktop/pixi.toml
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    runs-on: ubuntu-24.04-arm
+    env:
+      # #152 の方の pixi と同じ版 (0.72 は noarch に空の run_exports を書き、lock の差分がちらつく)
+      PIXI_VERSION: v0.73.0
+      PIXI_SHA256: 0788f47eb37e0706de209c3ce81cc804ee128f7dd4ec09a686754a67170ddb64
+      # docker/Dockerfile.thor と同じ版
+      CYCLONEDDS_REF: "0.10.2"
+      UNITREE_SDK_REF: 65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+    defaults:
+      run:
+        working-directory: ramen
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: 元の lock を残す
+        run: |
+          mkdir -p before
+          cp pixi.lock before/root.pixi.lock
+          cp inference/desktop/pixi.lock before/desktop.pixi.lock
+
+      - name: CycloneDDS の C ライブラリ
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake build-essential
+          git clone --depth 1 --branch "$CYCLONEDDS_REF" \
+            https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cyclonedds
+          cmake -S /tmp/cyclonedds -B /tmp/cyclonedds/build \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DBUILD_IDLC=ON
+          sudo cmake --build /tmp/cyclonedds/build --target install -j"$(nproc)"
+          sudo ldconfig
+          echo "CYCLONEDDS_HOME=/usr/local" >> "$GITHUB_ENV"
+
+      - name: unitree SDK のソース
+        run: |
+          git clone https://github.com/unitreerobotics/unitree_sdk2_python \
+            third_party/unitree_sdk2_python
+          git -C third_party/unitree_sdk2_python checkout --quiet "$UNITREE_SDK_REF"
+
+      - name: pixi (版と checksum を固定)
+        run: |
+          curl -fsSL -o /tmp/pixi.tar.gz \
+            "https://github.com/prefix-dev/pixi/releases/download/${PIXI_VERSION}/pixi-aarch64-unknown-linux-musl.tar.gz"
+          echo "${PIXI_SHA256}  /tmp/pixi.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.pixi/bin"
+          tar -xzf /tmp/pixi.tar.gz -C "$HOME/.pixi/bin"
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+
+      - name: lock
+        run: |
+          pixi --version
+          pixi lock
+          pixi lock --manifest-path inference/desktop/pixi.toml
+
+      - name: lock を成果物に残す
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thor-pixi-locks
+          path: |
+            ramen/pixi.lock
+            ramen/inference/desktop/pixi.lock
+            ramen/before/
+
+      - name: 既存の環境の linux-64 が変わっていないか
+        run: |
+          cat > /tmp/compare_locks.py <<'EOF'
+          """lock の前後で、既存の環境の linux-64 の package 一覧と中身 (hash 等) を比べる。"""
+          import sys
+          import yaml
+
+          def load(path):
+              with open(path) as f:
+                  return yaml.safe_load(f)
+
+          def key(entry):
+              kind = "conda" if "conda" in entry else "pypi"
+              return kind, entry[kind]
+
+          def normalized(rec):
+              # pixi 0.72 は noarch の conda package に空の run_exports ({}) を書き出すが、
+              # 以前の版は書かない。中身 (版・URL・hash) は同じなので同一とみなす
+              # (1 回目の run 35947696324 で、差はこの欄だけだったことを確認済み)。
+              rec = dict(rec)
+              if rec.get("run_exports") in (None, {}):
+                  rec.pop("run_exports", None)
+              return rec
+
+          def records(lock):
+              return {key(rec): normalized(rec) for rec in lock.get("packages", [])}
+
+          changed = False
+          for label, before_path, after_path in [
+              ("root", "before/root.pixi.lock", "pixi.lock"),
+              ("inference/desktop", "before/desktop.pixi.lock", "inference/desktop/pixi.lock"),
+          ]:
+              before, after = load(before_path), load(after_path)
+              brec, arec = records(before), records(after)
+              for env, spec in before["environments"].items():
+                  b = [key(e) for e in spec["packages"].get("linux-64", [])]
+                  a = [key(e) for e in after["environments"][env]["packages"].get("linux-64", [])]
+                  added, removed = sorted(set(a) - set(b)), sorted(set(b) - set(a))
+                  diff_meta = sorted(k for k in set(a) & set(b) if brec.get(k) != arec.get(k))
+                  status = "unchanged" if not (added or removed or diff_meta) else "CHANGED"
+                  print(f"{label} / {env} / linux-64: {len(b)} -> {len(a)} packages, {status}")
+                  for k in added:
+                      print(f"  + {k}")
+                  for k in removed:
+                      print(f"  - {k}")
+                  for k in diff_meta:
+                      print(f"  ~ {k}")
+                  changed |= status != "unchanged"
+                  aarch = after["environments"][env]["packages"].get("linux-aarch64", [])
+                  print(f"{label} / {env} / linux-aarch64: {len(aarch)} packages")
+              for env in sorted(set(after["environments"]) - set(before["environments"])):
+                  pk = after["environments"][env]["packages"]
+                  print(f"{label} / {env} (new) / linux-64: {len(pk.get('linux-64', []))}, "
+                        f"linux-aarch64: {len(pk.get('linux-aarch64', []))} packages")
+          sys.exit(1 if changed else 0)
+          EOF
+          pixi run --frozen -e default python /tmp/compare_locks.py
+
+      - name: runtime env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen -e runtime
+          cat > /tmp/probe_runtime.py <<'EOF'
+          import importlib, json, sys
+
+          r = {}
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          # torch / cv2 の後に pinocchio (libstdc++ の読み込み順、scripts/activate_runtime.sh)
+          for name in ["torchvision", "cv2", "ultralytics", "pinocchio", "hydra", "omegaconf",
+                       "lingbot_vision", "timm", "zmq", "msgpack", "websockets", "cyclonedds",
+                       "unitree_sdk2py.core.channel"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  r[name] = f"FAILED {type(exc).__name__}: {exc}"
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] else 0)
+          EOF
+          pixi run --frozen -e runtime python /tmp/probe_runtime.py
+
+      - name: inference/desktop env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen --manifest-path inference/desktop/pixi.toml
+          cat > /tmp/probe_desktop.py <<'EOF'
+          import importlib, json, sys
+
+          r = {}
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          for name in ["torchvision", "lerobot", "lerobot.policies.groot.modeling_groot",
+                       "transformers", "hydra", "omegaconf", "lingbot_vision",
+                       "huggingface_hub", "yaml"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  r[name] = f"FAILED {type(exc).__name__}: {exc}"
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] else 0)
+          EOF
+          pixi run --frozen --manifest-path inference/desktop/pixi.toml python /tmp/probe_desktop.py
+
+      - name: vlm env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen --manifest-path inference/desktop/pixi.toml -e vlm
+          cat > /tmp/probe_vlm.py <<'EOF'
+          import importlib, json, sys
+
+          r = {}
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          # vLLM 0.29 の GPU の部品は _C_stable_libtorch / _moe_C_stable_libtorch
+          # (platforms/cuda.py)。GPU の無い runner で driver (libcuda.so.1) が無いことだけが
+          # 理由の失敗は、Thor では host から入るので失敗扱いにしない。
+          for name in ["vllm", "vllm._C_stable_libtorch", "vllm._moe_C_stable_libtorch",
+                       "flashinfer", "flashinfer_jit_cache", "transformers", "triton"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  msg = f"{type(exc).__name__}: {exc}"
+                  r[name] = ("NEEDS_DRIVER " if "libcuda.so.1" in msg else "FAILED ") + msg[:300]
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] else 0)
+          EOF
+          pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python /tmp/probe_vlm.py
+
+      - name: groot-pick env を lock から入れて import を確かめる
+        run: |
+          pixi install --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick
+          cat > /tmp/probe_pick.py <<'EOF'
+          import importlib, importlib.metadata as md, json, sys
+
+          r = {}
+          import numpy as np
+          import torch
+
+          r["torch"] = torch.__version__
+          r["cuda"] = torch.version.cuda
+          r["sm_110"] = "sm_110" in torch._C._cuda_getArchFlags()
+          torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy()
+          r["numpy_bridge"] = "ok"
+          r["lerobot"] = md.version("lerobot")
+          # real_groot_n17_worker.py が使うもの (GR00T N1.7 と公式の前処理・後処理、遅延 import の 2 つ)
+          for name in ["lerobot.policies.groot.groot_n1_7", "lerobot.policies.groot.processor_groot",
+                       "lerobot.policies.groot.configuration_groot", "accelerate", "safetensors", "cv2",
+                       "transformers"]:
+              try:
+                  mod = importlib.import_module(name)
+                  r[name] = getattr(mod, "__version__", "ok")
+              except Exception as exc:  # noqa: BLE001
+                  r[name] = f"FAILED {type(exc).__name__}: {exc}"[:300]
+          print("PROBE_RESULT " + json.dumps(r, sort_keys=True, default=str))
+          bad = [k for k, v in r.items() if isinstance(v, str) and v.startswith("FAILED")]
+          sys.exit(1 if bad or not r["sm_110"] or r["lerobot"] != "0.6.0" else 0)
+          EOF
+          pixi run --frozen --manifest-path inference/desktop/pixi.toml -e groot-pick python /tmp/probe_pick.py

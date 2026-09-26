@@ -1,0 +1,11 @@
+.venv/
+.cache/
+data/
+outputs/
+wandb/
+__pycache__/
+*.py[cod]
+*.mcap
+*.mp4
+*.tmp
+.env

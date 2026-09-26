@@ -1,5 +1,5 @@
-# docker/Dockerfile.* は `COPY . ./` で repo を丸ごと image に焼く。
-# ここに書いたものは image に入らない。
+# docker/Dockerfile.thor は ramen/ と conformance 一式だけを COPY するが、build context には repo が
+# 丸ごと送られる。ここに書いたものは context に入らない (= image にも入らない)。
 #
 # 注意: build context は **git ではなく working directory** なので、.gitignore で
 # 無視されているだけのファイルも放っておくと image に入る。両方で弾く。
@@ -27,3 +27,9 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# pixi の環境の実体と SDK のソース。image の中で pixi install / git clone して作るので、
+# 手元で作ったものを build context に持ち込まない (巨大で、しかも手元の platform 用)。
+.pixi/
+**/.pixi/
+ramen/third_party/
