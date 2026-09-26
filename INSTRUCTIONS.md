@@ -42,8 +42,8 @@ flowchart LR
 export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag 20260925-rebuild3。digest は manifest.yaml の images.thor と同じ。GB10 で確認済み = VERIFY.md）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:3064ee8bc0348bae4a31b7e7b98309850843eababbd2071cfe69b2cabcbaa8b8
+# image（tag 20260926-rebuild4。digest は manifest.yaml の images.thor と同じ。GB10 で確認済み = VERIFY.md）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
@@ -112,7 +112,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:3064ee8bc0348bae4a31b7e7b98309850843eababbd2071cfe69b2cabcbaa8b8 \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572 \
   --stage N --actuate
 ```
 
@@ -143,8 +143,8 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 - Stage 1〜5: 開始姿勢に移って保持 → `Enter 2` で policy が始まる。stage の中の model の切り替えは
   自動（腕を次の開始姿勢へ → 保持 → 次の model）。次へ進むのは model の完了か時間切れだけ（YOLO では進まない）。
-- `Enter 2` の問い: 本体 `9849a17` 以降の image は、開始姿勢に届いていなければ `[gate] WARNING: … NOT reached (…)` と出す。
-  それより前の image（本番 `20260925-rebuild3` を含む）は、準備動作が時間切れで先へ進んだときも「initial arm/hand pose is
+- `Enter 2` の問い: 本体 `9849a17` 以降の image（本番 `20260926-rebuild4` を含む）は、開始姿勢に届いていなければ
+  `[gate] WARNING: … NOT reached (…)` と出す。それより前の image（`20260925-rebuild3` など）は、準備動作が時間切れで先へ進んだときも「initial arm/hand pose is
   reached」と出る。**どちらでも、押す前に腕が開始姿勢にあるかを目で確かめる**。直前に `[orch] … timed out short of its
   target` の行が出ていたら、届いていない。
 - Stage 0（Enter 2 無し）: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし

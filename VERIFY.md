@@ -1,7 +1,7 @@
 # 会場前の確認（Vast.ai の GB10）— Team RAMEN
 
 提出 image を会場に持っていく前に、**Thor に近い機械で image そのものを起動して**、ネット無しで
-全 stage が立ち上がるかを確かめる手順。image を焼き直したら毎回やる（30 分・$0.3〜0.5 ほど）。
+全 stage が立ち上がるかを確かめる手順。image を焼き直したら毎回やる（準備込みで 45 分〜1 時間、$1〜3 ほど。§7）。
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
@@ -169,34 +169,34 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
-## 6. 基準値（2026-09-25 夕、image `gb10-test-5631708` = `sha256:3064ee8b…` をそのまま起動 = 本番 `20260925-rebuild3`）
+## 6. 基準値（2026-09-26 昼、image `gb10-test-9965c90` = `sha256:0cf460af…` をそのまま起動 = 本番 `20260926-rebuild4`）
 
-既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。host はスペイン（offer 41941375）。
+既定の `--gpu-models all`（起動口が付ける）で、stage の model を全部載せた状態。host はハンガリー（offer 52373900、
+前回 `gb10-test-5fac481` と同じ host）。この image から既定の送り方は **joint lane**（本体 #170）。時間の都合で DP は流していない
+（DP の読み込みは本体・image とも前回 `20260925-rebuild3` から変わっていない）。
 
 | 項目 | 値 |
 |---|---|
 | 4 環境の GPU | runtime torch 2.12.1 / desktop 2.11.0 / vlm 2.13.0 / pick 2.11.0、全部 cu130、`cap (12, 1)`・integrated |
-| 重み | 既定・set の全部・`--variant` の DP で 約 85 GB。`--check` は all present |
-| Stage 1（strace 無し） | 全体 263 秒。VLM の起動 194 秒、`vlm_latency` 0.81 秒。その後 model 3 つ |
-| strace 下の各 stage（既定） | Stage 0: 22 秒 / Stage 1: 478 秒 / Stage 2: 440 秒 / Stage 5: 45 秒、すべて rc=0 |
-| 候補 `all6_400k` | Stage 2: 341 秒・GPU 31.2 GB（台を回す・insert・締め付けが all6）/ Stage 5: 24 秒（flip の RAMEN-Ori と YOLO） |
-| DP（`rotate_table_base_diffusion`） | Stage 2: 483 秒・GPU 43.3 GB |
-| joint lane（`--boundary-lane joint`） | Stage 2: 430 秒・GPU 42.7 GB。`[boundary] JointSink (joint lane)` |
-| GPU の使用量の最大（既定） | Stage 1: 41.7 GB / **Stage 2: 42.7 GB（VLM と 4 model）** / Stage 5: 7.1 GB |
-| MemAvailable の最小 | Stage 2 で 47.8 GB 残る（Thor の 128 GB でも余裕） |
-| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 6〜20 GB と出る。MemAvailable（53〜70 GB）で判断しているので読み込める |
+| 重み | 既定・set の全部で `--check` は all present（DP の `--variant` は付けていない） |
+| Stage 1（strace 無し） | 全体 198 秒。VLM の起動 160 秒、`vlm_latency` 0.75 秒。その後 model 3 つ |
+| strace 下の各 stage（既定 = joint lane） | Stage 0: 8 秒 / Stage 1: 267 秒 / Stage 2: 247 秒 / Stage 5: 22 秒、すべて rc=0。起動 log に `[boundary] JointSink (joint lane)` |
+| 候補 `all6_400k` | Stage 2: 223 秒・GPU 30.6 GB（台を回す・insert・締め付けが all6）/ Stage 5: 9 秒（flip の RAMEN-Ori と YOLO） |
+| pose lane（`--boundary-lane pose`） | Stage 2: 235 秒・GPU 42.7 GB。`[boundary] DecoupledSink (pose lane)` と `wrist_roll clamp: off` |
+| GPU の使用量の最大（既定） | Stage 1: 41.7 GB / **Stage 2: 41.9 GB（VLM と 4 model）** / Stage 5: 7.1 GB |
+| MemAvailable の最小 | Stage 2 で 44.6 GB 残る（Thor の 128 GB でも余裕） |
+| 空きの判断 | cudaMemGetInfo は page cache を使用中と数えて空き 7〜9 GB と出る。MemAvailable（55〜65 GB）で判断しているので読み込める |
 | 外向き connect | **strace を付けた全 run で 0 件**（VLM `:8000`・カメラ `:5555`・状態 `:5557`・FlashInfer の閉じた `:9` と Unix socket だけ） |
-| `--actuate`（4-6） | pose・joint とも Stage 5: rc=0（103〜104 秒）/ Stage 0: 設計どおりの停止（67 秒）。コードの誤り 0 件。準備動作の判定は pose が手先（`ee_pos_error`）、joint が関節角（`joint_error`） |
+| `--actuate`（4-6） | joint・pose とも Stage 5: rc=0（88 秒）、Enter 2 の問いは `NOT reached`（joint は `worst=R.wrist_yaw error=0.831rad`、pose は `ee_pos_error=0.0684m`）/ Stage 0: 設計どおりの停止（64 秒）。`--wrist-roll-clamp on` で `clamp: on`、`--walk-lowering-check converged` で `walk latch check = converged (cli)`。コードの誤り 0 件 |
 | conformance | PASS |
 
-起動秒は host の disk の速さで変わる。同じ host の前回（`gb10-test-8c5f4f9`、本番 `20260925-rebuild2`）とほぼ同じ
-（Stage 1 素 271 秒・VLM 200 秒）。別の host（ハンガリー、`gb10-test-5fac481`）は Stage 1 素 194 秒（VLM 151 秒）。
-GPU の使用量はどれも同じ。費用 $0.99（instance 1 台、約 1.1 時間）。
+起動秒は host の disk の速さで変わる（前回のスペインの host は strace 下の Stage 1 が 478 秒）。GPU の使用量はどれも同じ。
+費用は instance 1 台・約 45 分で約 $3.0（この host は回線の従量料金が高い。重み 85 GB と image 9 GB の取得が大半とみられる）。
 
-**見つけて本体で直した（本番 `20260925-rebuild3` には未反映、本体 `9849a17` 以降の image に入る）**: Stage 1〜5 の
-開始姿勢への準備動作が時間切れで先へ進んでも、Enter 2 の問いは「initial arm/hand pose is reached and actively held」と
-出ていた（模擬の PC2 の Stage 5 で、準備動作が 15 秒で時間切れ → 手の姿勢 → 保持 → この問い）。進む決まり（完了か
-時間切れで次へ）はそのままで、届いていなければ `[gate] WARNING: … NOT reached (…)` と出す（本体 `ed28f38`）。
+**`20260925-rebuild3` から入った直しで、この image で確かめたもの**: Stage 1〜5 の開始姿勢への準備動作が時間切れで
+先へ進んだとき、Enter 2 の問いが「reached」ではなく `[gate] WARNING: … NOT reached (…)` と出る（本体 `ed28f38`）。
+rebuild3 までは「initial arm/hand pose is reached and actively held」と出ていた（模擬の PC2 の Stage 5 で、準備動作が
+15 秒で時間切れ → 手の姿勢 → 保持 → この問い）。進む決まり（完了か時間切れで次へ）は変わらない。
 
 この確認で見つけて直したもの（1 回目、image `gb10-test-d029549`。2 回目で直った image を確認）:
 
@@ -218,4 +218,6 @@ GPU の使用量はどれも同じ。費用 $0.99（instance 1 台、約 1.1 時
 ## 7. 費用
 
 GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後）。1 回の確認は image の pull 10 分・
-重み 3 分・stage の起動 20〜30 分で、合わせて $0.5 ほど。2026-09-25 の初回は $0.90（不具合の調査を含む）。
+重み 3 分・stage の起動 30〜40 分（4-5・4-6 の全部）で、合わせて 45 分〜1 時間。host によっては回線の従量料金が
+時間料金より大きい（2026-09-26 のハンガリーの host は約 45 分で $3.0。スペインの host は約 1.1 時間で $0.99）。
+借りる前に offer の `inet_down_cost`（1 GB あたり）を見る。2026-09-25 の初回は $0.90（不具合の調査を含む）。

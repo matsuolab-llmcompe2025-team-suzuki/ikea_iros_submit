@@ -10,11 +10,12 @@
 #
 # The image is a private GHCR package: the organizer account needs read access.
 # Before release this exact image (same digest) was started offline on an arm64 GB10 with
-# 128 GB unified memory: every stage's preflight passed (defaults, the all6_400k candidate
-# set, the rotate DP, and the joint lane), nothing connected outside loopback, and the
-# --actuate command path ran to the go-live wait and the return-before-release on both the
-# pose and the joint lane (procedure and numbers: VERIFY.md). The lane stays decoupled (pose)
-# unless --boundary-lane joint is passed; we will tell the organizer before using it.
+# 128 GB unified memory: every stage's preflight passed (defaults and the all6_400k candidate
+# set), nothing connected outside loopback, and the --actuate command path ran to the go-live
+# wait and the return-before-release on both the joint and the pose lane (procedure and
+# numbers: VERIFY.md). The adapter lane is decoupled; on it our arms go by default on the joint
+# lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
+# sends (T,25) end-effector poses through the organizer IK instead.
 
 team: RAMEN
 lane: decoupled
@@ -22,8 +23,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260925-rebuild3"
-    digest: "sha256:3064ee8bc0348bae4a31b7e7b98309850843eababbd2071cfe69b2cabcbaa8b8"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260926-rebuild4"
+    digest: "sha256:0cf460af991f9cc7e4e2232d45fb7c8d019b6ee69bfa33ab88d0ba32ec667572"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for the two Enter prompts.
     run: >-
