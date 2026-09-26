@@ -163,6 +163,8 @@ def main() -> int:
             for pid, destination, command in external[:12]:
                 print(f"     pid {pid} -> {destination}  cmd: {command}")
             failed |= bool(external)
+        else:
+            print("   外向き通信: 未検査 (connect.log がない)")
         if "mode=actuate" in result:
             problems = actuate_problems(result, log)
             for problem in problems:
@@ -170,6 +172,9 @@ def main() -> int:
             failed |= bool(problems)
         else:
             failed |= not re.search(r"\brc=0\b", result)
+            if not re.search(r"\[preflight\].*validation passed; NO command sent", log):
+                print("   preflight 完了の記録がない")
+                failed = True
     return 1 if failed else 0
 
 

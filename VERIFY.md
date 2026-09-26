@@ -235,21 +235,22 @@ GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後�
 
 ## 8. rebuild5 の拡張検証と merge gate
 
-以下は実施予定の検証表であり、合格記録ではない。GB10 への接続と private GHCR の読み取り権限を確保後に実施する。
+rebuild5 の実測記録は [GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) を参照。
+下表には未完了項目も含まれるため、全項目合格として扱わない。
 この検証が完了する前に Issue #12 を main へ merge しない。
 
 | 項目 | 必須証拠 | rebuild5 状態 |
 |---|---|---|
-| image 同一性 | manifest digest、image ID、RAMEN_SOURCE.txt、CPU/GPU/driver/空き容量 | 未実施 |
-| 4 Python 環境 | check_envs.sh の成功終了、CUDA bf16 演算の有限値、各環境の版 | 未実施 |
-| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | 未実施 |
-| 全 Stage | **0/1/2/3/4/5 を省略せず**既定の joint lane で起動。4 RGB・関節・Dex1 の入力記録 | 未実施 |
-| 実モデル forward | RAMEN-Ori、GR00T 53D、pick worker、DP、YOLO、VLM の実推論・有限出力・所要時間。validate_load_and_release だけでは合格にしない | 未実施 |
-| 代替経路 | all6_400k、pose lane、wrist clamp、walk-lowering option を個別記録 | 未実施 |
-| joint の送信契約 | 実 socket で chunk を受信し、shape、有限値、hand 範囲、base height、joint 順序、時刻・周期を検査 | 未実施 |
-| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | 未実施 |
-| 故障注入 | camera/state 途絶、worker 異常、未到達を区別し、停止時の nav=0、最後の arm/hand target 保持、判断待ちを記録 | 未実施 |
-| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 未実施 |
+| image 同一性 | manifest digest、image ID、RAMEN_SOURCE.txt、CPU/GPU/driver/空き容量 | 確認済み。vendor 300 file の SHA-256 一致 |
+| 4 Python 環境 | check_envs.sh の成功終了、CUDA bf16 演算の有限値、各環境の版 | 4 環境で成功 |
+| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | cache 検査成功。外向き通信は未監査 |
+| 全 Stage | **0/1/2/3/4/5 を省略せず**既定の joint lane で起動。4 RGB・関節・Dex1 の入力記録 | 全 Stage の明示的 preflight 完了を確認 |
+| 実モデル forward | RAMEN-Ori、GR00T 53D、pick worker、DP、YOLO、VLM の実推論・有限出力・所要時間。validate_load_and_release だけでは合格にしない | 11 構成 x 90 call、VLM の起動時 self-check 成功 |
+| 代替経路 | all6_400k、pose lane、wrist clamp、walk-lowering option を個別記録 | Stage 2 all6/DP、Stage 5 all6/pose/clamp、Stage 0 converged の preflight 成功 |
+| joint の送信契約 | 実 socket で chunk を受信し、shape、有限値、hand 範囲、base height、joint 順序、時刻・周期を検査 | 模擬 socket の 16 行、nav=0、height=0.74、時刻単調性を確認。関節順序は回帰 test。PC2 の実時計は未確認 |
+| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | retry と Stage 2 rotate -> N -> pick 開始待ち -> Ctrl+C が成功。各試験で独立再起動 |
+| 故障注入 | camera/state 途絶、worker 異常、未到達を区別し、停止時の nav=0、最後の arm/hand target 保持、判断待ちを記録 | 4 ケースで判断待ちを確認。未到達 mock は戻しも非収束。実 WBC の保持・歩行からの制動は未確認 |
+| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 既定 Stage 最大 42.69 GiB、最小空き 44.94 GiB。残留なし、ログ回収・instance 削除済み |
 
 ### 検証データの扱い
 
@@ -263,3 +264,20 @@ GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後�
 手元の検証ツール回帰: `tests/test_gb10_envs.py` の 5 件が成功。
 従来の check_envs.sh は command substitution の失敗を echo が隠していたが、各環境の失敗を非ゼロ終了として返すよう修正済み。
 これは **GB10 での GPU 実測ではない**。
+
+### 追加の検証ツール
+
+`tools/gb10/` は image に含めず、隔離した GB10 container へ別途転送する。
+`forward_matrix.py` は `policy_config.yaml` の既定・variant set と DP を順番に実推論する。
+`operator_probe.py` は Enter/R/N と camera/state/worker 故障を、loopback の
+`following_mock.py` と `wire_probe.py` で検査する。後者は物理 simulator ではない。
+
+```bash
+# GB10 container の /app/ramen で実行。helper 一式を /root へ転送済みであること。
+pixi run --as-is -e runtime python /root/forward_matrix.py --output /root/runs/forwards
+pixi run --as-is -e runtime python /root/operator_probe.py --case retry --output /root/runs/retry
+# 他の case: next / camera / state / worker。port を共有するので同時起動しない。
+```
+
+model forward は合成画像での実行可能性検査であり、タスク成功率の評価ではない。
+`summarize.py` の `外向き通信: 未検査` は通信ゼロの証拠に数えない。
