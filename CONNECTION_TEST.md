@@ -20,10 +20,10 @@ flowchart LR
 ## 1. 前日まで
 
 - [ ] **使う image を決め、Thor に入れる。** `manifest.yaml` の `images.thor` の digest で pull するか、USB から `docker load`（`WEIGHTS.md` §3・§4）。
-- [ ] **その image の中身（本体の commit）を確かめる。** submit repo の `ramen/RAMEN_SOURCE.txt`。
-  - 本体 `9965c90` 以降の image: 既定は **joint lane**・手首 roll の clamp **off**（運営の最新 package `497f3ab` に合わせた、本体 #170）。この手順書はこの image 用。
-  - それより前の image（本番 `20260925-rebuild3` など）は既定が pose lane・clamp on。`9849a17` より前は `--wrist-roll-clamp` と `--walk-lowering-check` も無い（R1b・R4 は試せない）。
-    **rebuild3 で試すときは、R2 に `--boundary-lane joint` を足し、R3 は option なし**（pose lane・clamp on 固定）で読み替える。
+- [ ] **使うのは `20260926-rebuild4`（digest `sha256:0cf460af…`、本体 `9965c90`）だけ。** 既定は **joint lane**・手首 roll の clamp **off**
+  （運営の最新 package `497f3ab` に合わせた、本体 #170）。この手順書はこの image 用。古い image（`20260925-rebuild3` など）は GHCR と USB から消した。
+  Thor に古い image が残っていても使わない（既定の送り方が違い、R1b・R4 の option も無い）。`docker image inspect <image> --format '{{.Id}}'` が
+  USB の `IMAGE_ID.txt` と一致するかで確かめる。
 - [ ] **重み**: Thor で `prefetch_weights.py --check` が `all present`（`WEIGHTS.md` §4）。
 - [ ] **役割を決める**:
   - Thor を操作する人（Enter 1 / Enter 2）
@@ -75,8 +75,8 @@ PC2 の中を読むときは、必ず運営に断ってからにします。
 | R6 | 2 など | `--policy-variant-set all6_400k` | 候補の model（時間があれば） | 既定の model と比べて明らかに良いか |
 
 **Enter 2 の問い（policy を始める前）の読み方**
-- 本体 `9849a17` 以降の image: 届いていれば `[gate] … initial arm/hand pose is reached (…)`、届いていなければ `[gate] WARNING: … initial arm pose is NOT reached (…)` と、一番ずれた量が出る。
-- それより前の image: 時間切れで先へ進んだときも「reached」と出る。**押す前に、腕が開始姿勢にあるかを目で確かめる。** 直前に `[orch] … timed out short of its target` が出ていれば届いていない。
+- 届いていれば `[gate] … initial arm/hand pose is reached (…)`、届いていなければ `[gate] WARNING: … initial arm pose is NOT reached (…)` と、一番ずれた量が出る
+  （joint lane は関節角の `worst=… error=…rad`、pose lane は手先の `ee_pos_error=…m`）。**どちらでも、押す前に腕が開始姿勢にあるかを目で確かめる。**
 
 ## 5. 決める（決定表）
 
@@ -154,7 +154,7 @@ log は Thor の `$RAMEN_HOST_DIR/outputs/orch_logs/`（`orch_*.jsonl` と VLM �
 
 ### 指令の送り方（`--boundary-lane`）
 
-| | joint（既定、本体 `9965c90` 以降） | pose |
+| | joint（既定） | pose |
 |---|---|---|
 | 送るもの | 腕の関節角 (T,22)。運営 IK を通らない。手・歩行・骨盤高さの列は pose と同じ値 | 手先の位置と向き (T,25)。運営 IK が関節角に戻す |
 | 「腕が着いたか」 | 関節角で比べる（0.10 rad） | 手先で比べる |
@@ -164,13 +164,13 @@ log は Thor の `$RAMEN_HOST_DIR/outputs/orch_logs/`（`orch_*.jsonl` と VLM �
 - 運営のシミュレーションでは、同じ軌道で joint lane が誤差 0.05 rad 以内、pose lane は最大 0.75 rad（IK は全部成功していても）。
 - 運営はまだ実機で試していない（「組み込んでよいが、本番で頼るのはまだ」）。
 
-### 手首 roll の clamp（`--wrist-roll-clamp {on,off}`、本体 `9849a17` 以降の image）
+### 手首 roll の clamp（`--wrist-roll-clamp {on,off}`）
 
-- pose lane で、手首 roll を運営 IK の古い上限（±0.9、余裕を見て ±0.88）に寄せるか。既定は `off`（本体 `9965c90` 以降。それより前の image は `on`）。
+- pose lane で、手首 roll を運営 IK の古い上限（±0.9、余裕を見て ±0.88）に寄せるか。既定は `off`。
 - 運営 IK の `a1af470`（package `609f61d`）でこの上限は無くなった。学習データは 0.9 を超える手首 roll を使うので、新しい IK なら `off` の方が学習どおりに動く。古い IK に `off` で送ると、0.9 を超えた目標でその腕が丸ごと止まる → 古い IK のときだけ `on`。
 - 起動 log の `[boundary] wrist_roll clamp: on …` / `off …` で分かる（pose lane のときだけ出る）。joint lane と sdk 経路では無視される。
 
-### Stage 0 の下ろした腕の確かめ方（`--walk-lowering-check {joint,converged}`、本体 `9849a17` 以降の image）
+### Stage 0 の下ろした腕の確かめ方（`--walk-lowering-check {joint,converged}`）
 
 - Stage 0 は go-live の後に腕を下ろしてから歩く。下ろし終わった腕を歩行中に保持する前に、`joint`（既定）は関節ごとの歩行の範囲に入っているかを確かめ、外れていれば歩かずに止める（腕を上げたまま歩かない）。
 - pose lane では下ろし終わりを手先で判定し、運営 IK が同じ手先を別の関節角で作るので、範囲をわずかに外れて止まることがありうる。`converged` は、下ろす動きが収束していれば、外れた関節を log に残して実測の姿勢を保持して歩く。
