@@ -48,7 +48,7 @@ unmeasured_hand:
   # model は 1.85 を出し、脚に当たって 2.15 で止まる (締め付けは差の 0.3 rad)。
   phase3_grasp_command_rad: 1.85
   # Phase 3 の手の段 (閉じる・開く・insert 初期幅) で、指令後に待つ時間。
-  # 4.5 → 1.85 の 2.65 rad を 2 rad/s で約 1.3 s + 余裕。各段の timeout 以下。
+  # 4.5 → 1.85 の 2.65 rad を 2 rad/s で約 1.3 s + 余裕。
   phase3_hand_settle_sec: 2.0
 
 # ---------------------------------------------------------------- VLM
@@ -73,12 +73,13 @@ references:
   # sha256: 96cb20503517bfdd3d05a580fb1f1b1a0573c5e9ea17aa034fb2f651246c93c1
   after: "../assets/ref_after_ep000_f0060.jpg"
 
-# 本番Stage内でhybrid全体に許す時間。単体実機runは約19.1秒で完了した。
-# 従来pickの21秒ではVLM/USBの通常揺らぎに余裕がないため30秒とする。超過時は
-# skill_config.yaml の on_timeout (advance) に従って次へ進む。持ち替えの段の
-# 時間切れも同じく pick を終えて次へ。止めるのは人 (Ctrl+C / e-stop)。
+# 旧runとの設定互換のため残す値。手動本番経路では以下の時間上限を使用せず、
+# phase1/phase2/phase3 の完了は実測/VLM の通常判定だけで決める。
+# 認識の取りこぼしで時間切れによる強制遷移はしない。
 runtime:
-  hard_timeout_sec: 30.0
+  hard_timeout_sec: 65.0
+  phase1_timeout_sec: 18.0
+  phase2_timeout_sec: 16.0
 
 # ---------------------------------------------------------------- overlay
 #

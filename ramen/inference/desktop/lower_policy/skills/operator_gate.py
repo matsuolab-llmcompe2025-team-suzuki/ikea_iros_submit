@@ -64,11 +64,15 @@ class OperatorConfirmationHoldSkill(Skill):
     ``failure_reason``; it never advances to the policy.
 
     ``arrival_check`` は問いを出す時点の実測の腕で「開始姿勢に届いたか」を見て、問いの
-    文言を変える。手前の準備動作が時間切れでも run は先へ進む (完了か時間切れで次へ) ので、
-    届いていないのに「届いた」と出すと、操作者は違う姿勢から policy を始めてしまう。
+    文言を変える。手前の準備動作が未到達なら本番経路では先へ進まないが、
+    到達判定もこの gate で重ねて確認し、違う姿勢からの開始を防ぐ。
     判定は準備動作と同じもの (pose lane は手先、sdk・joint lane は関節角) を渡す。
     省略時は判定せずに従来の文言。
     """
+
+    #: 入力 thread が自分の問い (操作・到達の詳細) を出すので、orchestrator は
+    #: この skill の間は操作表示を上書きしない (上書きすると受け付けるキーが消える)。
+    owns_operator_view = True
 
     def __init__(
         self,
@@ -78,6 +82,8 @@ class OperatorConfirmationHoldSkill(Skill):
         input_fn: Callable[[str], str] = input,
         discard_pending_input_fn: Callable[[], None] = discard_pending_stdin,
         arrival_check: Optional[ArrivalCheck] = None,
+        require_arrival: bool = False,
+        hold_arm_target_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
     ) -> None:
         super().__init__()
         self.name = name
@@ -85,7 +91,10 @@ class OperatorConfirmationHoldSkill(Skill):
         self._input_fn = input_fn
         self._discard_pending_input_fn = discard_pending_input_fn
         self._arrival_check = arrival_check
+        self._require_arrival = bool(require_arrival)
+        self._hold_arm_target_provider = hold_arm_target_provider
         self._hold_arm: Optional[np.ndarray] = None
+        self._latest_arm: Optional[np.ndarray] = None
         self._confirmed = threading.Event()
         self._reader_started = False
         self._failure_reason: Optional[str] = None
@@ -93,6 +102,7 @@ class OperatorConfirmationHoldSkill(Skill):
 
     def _on_start(self, params: dict) -> None:
         self._hold_arm = None
+        self._latest_arm = None
         self._confirmed.clear()
         self._reader_started = False
         self._failure_reason = None
@@ -113,17 +123,41 @@ class OperatorConfirmationHoldSkill(Skill):
                 f"({detail}) and actively held. Press Enter to start the policy, or "
                 "Ctrl+C to stop: "
             )
+        instruction = (
+            "Enter after arrival, or Ctrl+C to stop: "
+            if self._require_arrival
+            else "Enter to start the policy from here anyway, or Ctrl+C to stop: "
+        )
         return (
             f"[gate] WARNING: {self._next_skill_name} initial arm pose is NOT reached "
             f"({detail}); the arms are held where they are. Check the robot, then press "
-            "Enter to start the policy from here anyway, or Ctrl+C to stop: "
+            + instruction
         )
 
     def _read_confirmation(self, prompt: str) -> None:
         try:
             # 姿勢に着く前に押された Enter で policy を始めない。
             self._discard_pending_input_fn()
-            self._input_fn(prompt)
+            while True:
+                self._input_fn(prompt)
+                with self._lock:
+                    latest = None if self._latest_arm is None else self._latest_arm.copy()
+                if (
+                    not self._require_arrival
+                    or self._arrival_check is None
+                    or (latest is not None and self._arrival_check(latest)[0])
+                ):
+                    break
+                detail = (
+                    "no live arm state"
+                    if latest is None else self._arrival_check(latest)[1]
+                )
+                print(
+                    f"[gate] initial pose not reached ({detail}); Enter ignored",
+                    file=sys.stderr,
+                )
+                # 次の問いは今の実測で作り直す (どの関節がどれだけ離れているかを出す)
+                prompt = self._prompt(latest if latest is not None else self._hold_arm)
         except (EOFError, OSError) as exc:
             with self._lock:
                 self._failure_reason = (
@@ -138,15 +172,26 @@ class OperatorConfirmationHoldSkill(Skill):
         )
 
     def step(self, obs: dict) -> np.ndarray:
+        state = obs.get("joint_state")
+        if state is not None:
+            latest = arm_positions_from_joint_state(
+                tuple(state.name), np.asarray(state.position, dtype=np.float64), self.name
+            )
+            with self._lock:
+                self._latest_arm = latest
         if self._hold_arm is None:
-            state = obs.get("joint_state")
             if state is None:
                 raise RuntimeError(f"{self.name} requires a live joint state to hold")
-            self._hold_arm = arm_positions_from_joint_state(
-                tuple(state.name),
-                np.asarray(state.position, dtype=np.float64),
-                self.name,
+            target = (
+                self._hold_arm_target_provider()
+                if self._hold_arm_target_provider is not None else None
             )
+            self._hold_arm = (
+                self._latest_arm.copy() if target is None
+                else np.asarray(target, dtype=np.float64).copy()
+            )
+            if self._hold_arm.shape != (14,) or not np.isfinite(self._hold_arm).all():
+                raise RuntimeError(f"{self.name} cannot hold an invalid arm target")
         if not self._reader_started:
             self._reader_started = True
             threading.Thread(

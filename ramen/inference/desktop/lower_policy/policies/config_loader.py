@@ -271,10 +271,11 @@ def load_policy_variant(
         )
 
     policy_type = entry.get("policy_type")
-    if policy_type not in ("groot", "ramen_ori", "groot_pick_legs", "act_diffusion"):
+    if policy_type not in ("groot", "ramen_ori", "groot_pick_legs", "groot_pick_legs_ee_rel", "act_diffusion"):
         raise ValueError(
             f"variant {variant_name!r}: policy_type must be one of "
-            f"'groot' / 'ramen_ori' / 'groot_pick_legs' / 'act_diffusion', "
+            f"'groot' / 'ramen_ori' / 'groot_pick_legs' / "
+            f"'groot_pick_legs_ee_rel' / 'act_diffusion', "
             f"got {policy_type!r}"
         )
 
@@ -309,7 +310,7 @@ def load_policy_variant(
         from inference.desktop.lower_policy.policies.groot import CAMERAS as GROOT_CAMS
 
         cams = GROOT_CAMS
-    elif policy_type == "groot_pick_legs":
+    elif policy_type in ("groot_pick_legs", "groot_pick_legs_ee_rel"):
         from inference.desktop.lower_policy.policies.groot_pick_legs import (
             CAMERAS as PICK_LEGS_CAMS,
         )
@@ -559,6 +560,12 @@ def resolve_policy_class(policy_type: str):
         )
 
         return Gr00tPolicyPickLegs
+    if policy_type == "groot_pick_legs_ee_rel":
+        from inference.desktop.lower_policy.policies.groot_pick_legs_ee_rel import (
+            Gr00tPolicyPickLegsEERel,
+        )
+
+        return Gr00tPolicyPickLegsEERel
     if policy_type == "ramen_ori":
         from inference.desktop.lower_policy.policies.ramen_ori import RamenOriPolicy
 

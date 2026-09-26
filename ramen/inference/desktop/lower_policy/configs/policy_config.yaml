@@ -64,8 +64,8 @@ default_variant_by_skill:
   pick_table_leg: groot_pick_legs_v1
   insert_table_leg: groot_insert_leg_200k
   rotate_leg_to_tighten: groot_rotate_leg_200k
-  # step 20k pin (checkpoints/020000)。
-  flip_table: groot_flip_table_n17_2_baseline
+  # v2 baseline step 20k with only the near-success wrist-tool FK definition.
+  flip_table: groot_flip_table_n17_2_legacy_fk
 
 # model の組み合わせを名前で切り替える (Issue #159)。会場で焼き直さずに、起動の引数
 #   ramen-venue --stage <N> --policy-variant-set <名前>     (自前経路も同じ引数)
@@ -227,6 +227,62 @@ policies:
     temporal_lambda: -0.1
     execution_steps: 8
 
+  # Isolate the model-input FK convention from the 2026-08-04 near-success
+  # run. The matching wrist-tool offset is applied only by the flip_table
+  # skill's variant profile; checkpoint and action/safety settings stay fixed.
+  groot_flip_table_n17_2_legacy_fk:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff
+    checkpoint_subdir: checkpoints/020000/pretrained_model
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    temporal_lambda: -0.1
+    execution_steps: 8
+
+  # Controlled follow-up to the 2026-09-26 teacher-range observe-only run:
+  # restore the teacher range guard and vary only temporal ensembling.
+  # The near-success legacy runner did not use temporal ensembling; keep the
+  # checkpoint, FK, execution cadence and physical safety limits unchanged.
+  groot_flip_table_n17_2_te_off:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff
+    checkpoint_subdir: checkpoints/020000/pretrained_model
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    temporal_lambda: null
+    execution_steps: 8
+
+  # 2026-09-26 follow-up: isolate the effect of executing ten predicted
+  # steps before replanning. Keep the same checkpoint, no temporal blend,
+  # teacher-range guard, and all robot-side safety limits as the prior run.
+  groot_flip_table_n17_2_te_off_steps10:
+    policy_type: groot
+    mode: none
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff
+    checkpoint_subdir: checkpoints/020000/pretrained_model
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    temporal_lambda: null
+    execution_steps: 10
+
+  # Experimental step100 fine-tune of the v2 baseline.  The local overlay
+  # preserves the pinned HF weights and relocates two training-host paths in
+  # config/processor JSON; it is not a released or validated policy.
+  groot_flip_table_kori_step100:
+    policy_type: groot
+    mode: none
+    ckpt_ref: .checkpoints/pana_kori_flip_table_step100_770fc5ed/pretrained_model
+    device: cuda
+    dtype: bf16
+    replan_family: "groot_relative_eef_v1"
+    temporal_lambda: -0.1
+    execution_steps: 8
+
   groot_flip_table_n17_4:
     policy_type: groot
     mode: none
@@ -283,6 +339,15 @@ policies:
     policy_type: groot_pick_legs
     mode: none
     ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ver2-lora@8f875028fffb1b35ebaf6a95d1575ccec86c12a1
+    device: cuda
+    dtype: bf16
+
+  # Distinct 56-D state / relative-EEF 20-D action model. Never route through
+  # the 38-D absolute-joint pick adapter.
+  groot_pick_legs_ee_rel:
+    policy_type: groot_pick_legs_ee_rel
+    mode: none
+    ckpt_ref: Team-RAMEN/groot-n1.7-pick-legs-ee-rel-lora@ba3a20f30f5d0388c6656390e1b88228c06aa332
     device: cuda
     dtype: bf16
 

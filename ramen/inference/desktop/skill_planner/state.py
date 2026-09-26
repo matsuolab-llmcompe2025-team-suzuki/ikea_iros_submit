@@ -154,7 +154,7 @@ class SkillState:
             self.left_hand_touched_leg_since_pick = False
             self.leg_tip_touched_hole_since_pick = False
             self.left_right_hand_overlapped_since_pick = False
-        if prev == "rotate_leg_to_tighten":
+        if prev == "rotate_leg_to_tighten" and not new_skill.startswith("retry_"):
             self.n_legs_completed += 1
         if new_skill == "rotate_table_base":
             # 新しい天板回転を、前 stage の成功 latch で即完了させない。
