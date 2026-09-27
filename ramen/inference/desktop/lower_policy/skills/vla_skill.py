@@ -857,8 +857,8 @@ class InsertTableLegVlaSkill(VlaSkill):
           (takada training dataset `Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal`:
            meta/tasks.parquet の task_index=0 に対応する task 文字列)
 
-    現在対応 policy = Gr00tPolicy (LeRobot fork format、REAL_G1_RELATIVE_EEF)。
-    ckpt 例 = groot_insert_leg_200k (takada 200k step optimal)。
+    本番既定は ActDiffusionPolicy (19D absolute、raw 3-camera、100k step)。
+    旧 Gr00tPolicy (REAL_G1_RELATIVE_EEF、200k step) も明示選択で使用できる。
     """
 
     name = "insert_table_leg"

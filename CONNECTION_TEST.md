@@ -20,7 +20,7 @@ flowchart LR
 ## 1. 前日まで
 
 - [ ] **使う image を決め、Thor に入れる。** `manifest.yaml` の `images.thor` の digest で pull するか、USB から `docker load`（`WEIGHTS.md` §3・§4）。
-- [ ] **使うのは `20260927-rebuild5`（digest `sha256:b58c2cd5…`、本体 `e3a4187`）。** 既定は **joint lane**・手首 roll の clamp **off**・
+- [ ] **使うのは `20260927-insert-dp100k-01`（digest `sha256:c98c80c7…`、本体 `c73c922`）。** 既定は **joint lane**・手首 roll の clamp **off**・
   **重力の垂れ補正 on**・**送り方は変化時だけ 16 行**、policy の間は**操作者の N / R / Enter** で進む（本体 #170・858e107・#172）。
   この手順書はこの image 用。`20260926-rebuild4`（本体 `9965c90`）は、腕が重力で下がり続ける送り方・R のやり直しで固まる不具合・
   安全停止の後に確認なしで腕を動かす不具合を持つので使わない。`docker image inspect <image> --format '{{json .RepoDigests}}'` で manifest の registry digest と照合する（`.Id` は別の値）。

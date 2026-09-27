@@ -337,7 +337,7 @@ skills:
 
   # insert_table_leg: issue-70 の INSERT_LEG_OPTIMAL_FRAME0 転写。
   #   dataset: Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal (1510 ep)。
-  #   Model: groot_insert_leg_200k (200k step)。
+  #   本番既定 Model: insert_table_leg_diffusion_optimal_100k (100k step)。
   #   requires_separate_hand_initialization=true (leg が hand に入った状態が start、
   #   operator が起動前に物理的に leg を配置する必要あり)。
   insert_table_leg:

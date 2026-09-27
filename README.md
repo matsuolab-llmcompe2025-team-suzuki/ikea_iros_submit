@@ -1,9 +1,10 @@
 # Team RAMEN — IKEA IROS 提出物
 
-提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。image は検証済みの
-`20260927-rebuild5` を digest 固定で使用してください。重みの取得は [WEIGHTS.md](WEIGHTS.md)、
-会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、検証結果は
-[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) を参照してください。
+提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。insert Diffusion に切り替えた image
+`20260927-insert-dp100k-01` は [manifest.yaml](manifest.yaml) の digest 固定で使用してください。
+重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md) を参照してください。
+この版は [arm64 CI build](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36318545130) に成功しましたが、
+[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) は**旧版**の検証結果です。新しい image のGB10・Thor/G1検証は未実施です。
 
 ## Team RAMEN の部分と直す場所
 

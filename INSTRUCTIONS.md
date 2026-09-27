@@ -47,9 +47,9 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag 20260927-rebuild5 = 本体 e3a4187。digest は manifest.yaml の images.thor と同じ。
-# GB10の確認記録はGB10_REBUILD5_REPORT.md。Thor/G1接続テストは別途必要）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f
+# image（tag 20260927-insert-dp100k-01 = 本体 c73c922。digest は manifest.yaml と同じ。
+# この版はarm64 CIビルド済み。旧rebuild5のGB10記録は新しいinsertモデルの検証ではない）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
@@ -118,7 +118,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923 \
   --stage N --actuate
 ```
 
@@ -132,8 +132,8 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。
-  rebuild5の全Stage連続試験ではGPU使用量の最大49.46 GiB、MemAvailableの最小31.99 GiBを記録した。
-  起動時間・メモリはThorで再確認する（詳細は`GB10_REBUILD5_REPORT.md`）。
+  旧rebuild5の全Stage連続試験ではGPU使用量の最大49.46 GiB、MemAvailableの最小31.99 GiBを記録した。
+  **新しいinsert Diffusion版の測定値ではない**。起動時間・メモリは再確認する（旧結果は`GB10_REBUILD5_REPORT.md`）。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
 - 腕の送り方（既定、本体 #172）: joint lane で、目標が変わったときだけ最短 0.1 s おきに同じ目標を 16 行送る
   （`[boundary] publish: 16 row(s) per chunk, on change at most every 0.1s …`）。運営 WBC は腕を重力補償なしで
