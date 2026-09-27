@@ -29,6 +29,11 @@ flowchart LR
 - VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 の run の中で container が自分で起動し、run の終わりに止める。
 - container は run ごとに作り直す。重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
 
+**通信断・強制終了は停止操作ではありません。** 運営adapter `497f3ab` は送信元が消えても
+最後の歩行速度をkeepaliveで再送します（非作動試験で確認）。SSH切断、`kill`、`docker stop`で
+ロボットが停止すると想定しないでください。通常停止は操作端末のCtrl+C、危険時・通信断時は現地の
+E-stop担当者が対応します。運営側のclient-loss時の停止策を確認するまでは無人で歩行させないでください。
+
 | Stage | 中身 | 操作（§2「操作キー」） |
 |---|---|---|
 | 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | Enter 1（安全確認）だけ |
@@ -43,7 +48,7 @@ export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
 # image（tag 20260927-rebuild5 = 本体 e3a4187。digest は manifest.yaml の images.thor と同じ。
-# GB10 での確認（VERIFY.md）はまだ。接続テストの前に通すこと）
+# GB10の確認記録はGB10_REBUILD5_REPORT.md。Thor/G1接続テストは別途必要）
 docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認

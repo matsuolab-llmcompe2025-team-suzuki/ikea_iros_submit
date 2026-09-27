@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import argparse
 import collections
 import re
 import sys
@@ -135,8 +136,12 @@ def actuate_problems(result: str, log: str) -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--require-trace", action="store_true")
+    parser.add_argument("runs", nargs="+", type=Path)
+    args = parser.parse_args()
     failed = False
-    for run_dir in map(Path, sys.argv[1:]):
+    for run_dir in args.runs:
         result = (run_dir / "result.txt").read_text()
         log = (run_dir / "run.log").read_text(errors="replace")
         print(f"== {run_dir.name}: {result.strip()}")
@@ -156,15 +161,20 @@ def main() -> int:
         connect_log = run_dir / "connect.log"
         if connect_log.exists():
             counts, external = connect_summary(connect_log)
+            if not counts:
+                print("   外向き通信: 未検査 (接続記録がない)")
+                failed |= args.require_trace
             print(
                 "   接続先: " + ", ".join(f"{k} x{v}" for k, v in counts.most_common())
             )
-            print(f"   外向き connect: {len(external)} 件")
+            if counts:
+                print(f"   外向き connect: {len(external)} 件")
             for pid, destination, command in external[:12]:
                 print(f"     pid {pid} -> {destination}  cmd: {command}")
             failed |= bool(external)
         else:
             print("   外向き通信: 未検査 (connect.log がない)")
+            failed |= args.require_trace
         if "mode=actuate" in result:
             problems = actuate_problems(result, log)
             for problem in problems:

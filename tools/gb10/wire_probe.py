@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import signal
+import struct
 import sys
 import time
 
@@ -55,12 +56,16 @@ def main() -> None:
     socket.setsockopt(zmq.LINGER, 0)
     socket.connect("tcp://127.0.0.1:5556")
     rows, issued, received, lengths, errors = [], [], [], [], []
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    raw = args.output.with_suffix(".wire").open("wb")
     start = time.monotonic()
     try:
         while not stop and time.monotonic() - start < args.seconds:
             if not socket.poll(100):
                 continue
             message = socket.recv()
+            raw.write(struct.pack("!I", len(message)))
+            raw.write(message)
             try:
                 chunk, stamp = decode_joint(message)
             except (ValueError, KeyError, TypeError) as exc:
@@ -71,14 +76,15 @@ def main() -> None:
             received.append(time.monotonic())
             lengths.append(len(chunk))
     finally:
+        raw.close()
         socket.close()
         context.term()
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output.with_suffix(".npz"),
                         rows=np.concatenate(rows) if rows else np.empty((0, 22)),
                         issued_at=issued, received_monotonic=received, chunk_lengths=lengths)
     delta = np.diff(received)
     result = {"passed": bool(rows) and not errors, "messages": len(rows), "errors": errors,
+              "raw_capture": args.output.with_suffix(".wire").name,
               "endpoint": "tcp://127.0.0.1:5556", "physical_commands_sent": False,
               "interval_ms_p50_p95_max": (np.percentile(delta * 1000, [50, 95, 100]).tolist()
                                           if len(delta) else None)}

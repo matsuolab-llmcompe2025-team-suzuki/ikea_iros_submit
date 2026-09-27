@@ -8,10 +8,10 @@
 **更新状況（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
 ARM64 [CI run 36264063035](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36264063035)
 が build/import・重力補償 probe を通過した（build commit `56c69c5`）。digest は `manifest.yaml` に固定。
-手元の提出用 test 33 件、本体の boundary・Stage・操作・重力補償などの回帰 test 311 件が成功。
-この PC の GHCR 読取権限が不足しているため再 pull は未確認。公開の根拠は上記 CI の push 成功と digest 出力。
-§6 の測定結果は旧 `rebuild4` のもの。新 image の GB10 全 stage 起動・Thor 接続試験は未実施であり、
-CI の build/import 検査と手元の mock test だけでは実機動作確認済みと扱わない。
+GHCR認証後、digest固定でGB10へ取得し、4環境のGPU演算、全Stageのpreflight、全11構成の
+model forward、操作・故障注入を確認済み。詳細と追加検証の状況は
+[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照。
+§6の測定結果は旧`rebuild4`の履歴。GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
 
 ## 1. なぜ GB10 か
 
@@ -243,14 +243,17 @@ rebuild5 の実測記録は [GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) �
 |---|---|---|
 | image 同一性 | manifest digest、image ID、RAMEN_SOURCE.txt、CPU/GPU/driver/空き容量 | 確認済み。vendor 300 file の SHA-256 一致 |
 | 4 Python 環境 | check_envs.sh の成功終了、CUDA bf16 演算の有限値、各環境の版 | 4 環境で成功 |
-| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | cache 検査成功。外向き通信は未監査 |
+| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | cache検査成功。全Stage連続実行と11構成990callのstraceで外向きconnect 0件 |
 | 全 Stage | **0/1/2/3/4/5 を省略せず**既定の joint lane で起動。4 RGB・関節・Dex1 の入力記録 | 全 Stage の明示的 preflight 完了を確認 |
 | 実モデル forward | RAMEN-Ori、GR00T 53D、pick worker、DP、YOLO、VLM の実推論・有限出力・所要時間。validate_load_and_release だけでは合格にしない | 11 構成 x 90 call、VLM の起動時 self-check 成功 |
 | 代替経路 | all6_400k、pose lane、wrist clamp、walk-lowering option を個別記録 | Stage 2 all6/DP、Stage 5 all6/pose/clamp、Stage 0 converged の preflight 成功 |
 | joint の送信契約 | 実 socket で chunk を受信し、shape、有限値、hand 範囲、base height、joint 順序、時刻・周期を検査 | 模擬 socket の 16 行、nav=0、height=0.74、時刻単調性を確認。関節順序は回帰 test。PC2 の実時計は未確認 |
-| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | retry と Stage 2 rotate -> N -> pick 開始待ち -> Ctrl+C が成功。各試験で独立再起動 |
+| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | retryに加え、Stage 0→5の16区間を各30秒実行し、Enter/N/保持/正常終了を確認。各試験で独立再起動 |
+| 運営adapter | 指定revisionの公式回帰と提出packetの非作動再生 | 公式84件成功。全Stageの記録5,298packetの行を再生し、拒否・clamp 0、腕/Dex1/nav/高さの対応一致 |
+| client/transport消失 | 非ゼロnav送信後、全clientが消えた場合の停止挙動 | **自動停止を確認できない**。運営adapterが最後のnavを保持することを再現。Issue #14で運営確認が必要 |
 | 故障注入 | camera/state 途絶、worker 異常、未到達を区別し、停止時の nav=0、最後の arm/hand target 保持、判断待ちを記録 | 4 ケースで判断待ちを確認。未到達 mock は戻しも非収束。実 WBC の保持・歩行からの制動は未確認 |
-| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 既定 Stage 最大 42.69 GiB、最小空き 44.94 GiB。残留なし、ログ回収・instance 削除済み |
+| 長時間実行 | 同じ方策を継続実行し、異常・メモリ増加・正常停止を検査 | flipを600秒実行して正常終了。元packet 5,306件の運営adapter再生も成功 |
+| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 全Stage連続で最大49.46 GiB、最小空き31.99 GiB。10分soakはGPU 7.12 GiBで安定。残留なし、証拠回収・検証instance削除済み |
 
 ### 検証データの扱い
 
@@ -271,13 +274,26 @@ rebuild5 の実測記録は [GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) �
 `forward_matrix.py` は `policy_config.yaml` の既定・variant set と DP を順番に実推論する。
 `operator_probe.py` は Enter/R/N と camera/state/worker 故障を、loopback の
 `following_mock.py` と `wire_probe.py` で検査する。後者は物理 simulator ではない。
+`--case full`はStage 0→5の全16 policy区間を操作者のNで進める配線試験であり、
+VLMによる把持判定や物理的な組立完了を証明するものではない。
 
 ```bash
 # GB10 container の /app/ramen で実行。helper 一式を /root へ転送済みであること。
 pixi run --as-is -e runtime python /root/forward_matrix.py --output /root/runs/forwards
 pixi run --as-is -e runtime python /root/operator_probe.py --case retry --output /root/runs/retry
-# 他の case: next / camera / state / worker。port を共有するので同時起動しない。
+pixi run --as-is -e runtime python /root/operator_probe.py --case full --trace --dwell-seconds 30 --output /root/runs/full
+pixi run --as-is -e runtime python /root/operator_probe.py --case soak --trace --dwell-seconds 600 --output /root/runs/soak
+# 他の case: next / camera / state / worker。port/GPUを共有するので同時起動しない。
 ```
 
 model forward は合成画像での実行可能性検査であり、タスク成功率の評価ではない。
 `summarize.py` の `外向き通信: 未検査` は通信ゼロの証拠に数えない。
+Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace不在・空の記録を不合格にする。
+`strace`等の追加導入は`/install`の確認・承認後に隔離検証環境だけで行う。
+
+`wire_probe.py`は元packetを長さ付き`.wire`と、解析用`.npz`へ保存する。
+`organizer_replay.py --organizer <checkout> --capture <wire.wire> --output <result.json>`は
+固定revisionの運営公式fixtureを使用してWBC/Dex1のfake backendへ再入力する。ソケットは作らない。
+運営テスト依存とWBCの固定commit・LFS資産が必要（版は検証レポート参照）。
+実測姿勢をpacket先頭targetに設定し時刻だけ更新するため、実機追従誤差や実ホスト間の時計精度は検証しない。
+旧記録用`--rows-capture <wire.npz>`ではenvelopeを再構成するので、元wireそのものの試験とは区別する。

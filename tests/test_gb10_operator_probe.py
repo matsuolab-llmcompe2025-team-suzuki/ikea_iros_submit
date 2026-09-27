@@ -1,6 +1,15 @@
 import pytest
 
-from tools.gb10.operator_probe import owned_groot_worker
+from tools.gb10.operator_probe import owned_groot_worker, full_stage_plan
+
+
+def test_full_plan_covers_all_leg_rounds_and_flip():
+    plan = full_stage_plan()
+    assert list(plan) == [1, 2, 3, 4, 5]
+    assert sum(map(len, plan.values())) == 16
+    assert plan[1][0] == "pick_table_leg"
+    assert plan[5] == ["flip_table"]
+    assert all(plan[s] == plan[2] for s in (3, 4))
 
 
 def process(root, pid, children, executable, *args):

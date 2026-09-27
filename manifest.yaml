@@ -9,8 +9,8 @@
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# Historical GB10 measurements in VERIFY.md are for rebuild4, not this new image.
-# Rebuild5 requires a fresh GB10/Thor preflight and operator-controlled connection test.
+# Rebuild5 GB10 checks are recorded in GB10_REBUILD5_REPORT.md. Thor/G1 testing is still required.
+# Client/transport loss is NOT certified as a safe stop: see Issue #14 and INSTRUCTIONS.md.
 # The adapter mode is decoupled; on it our arms go by default on the joint
 # lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
 # sends (T,25) end-effector poses through the organizer IK instead.
@@ -51,8 +51,8 @@ runtime:
   network: >-
     none at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
     online check or analytics), the VLM runs with usage stats off and every outbound endpoint
-    pointed at a closed local port; weights are read from the mounted cache. Historical rebuild4
-    GB10 strace found no connect() other than loopback and Unix sockets; repeat for rebuild5
+    pointed at a closed local port; weights are read from the mounted cache. Rebuild5 GB10 strace
+    found no connect() outside loopback/Unix during continuous Stages 0-5, 11 model variants and a 600s soak
   # Mounted read-only as a Hugging Face cache (~90 GB). Prefetch and offline check:
   # tools/prefetch_weights.py (list derived from policy_config.yaml: defaults + variant_sets);
   # details in WEIGHTS.md.
@@ -69,10 +69,10 @@ runtime:
     - "Qwen/Qwen3-VL-8B-Instruct@main"
     # Candidate only (variant set all6_400k, selected with --policy-variant-set); not a default.
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546 (ckpt_step_400000.pt)"
-  # GPU memory with every model of the heaviest stage resident (Stage 2: VLM + 4 models,
-  # --gpu-models all from the image entry), measured on an arm64 GB10 with 128 GB unified
-  # memory on rebuild4; 45 GB stayed available. Re-measure rebuild5 at the connection test.
-  peak_memory_thor_gb: 43
+  # Planning estimate, NOT a Thor measurement/upper bound. Rebuild5 on 128-GB GB10,
+  # continuous Stages 0-5 with all experts resident: 49.46 GiB GPU-process peak and
+  # 31.99 GiB minimum MemAvailable. Rounded reserve below; re-measure on Thor.
+  peak_memory_thor_gb: 55
 
 conformance: >-
   docker run --rm --network host <image>

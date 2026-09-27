@@ -93,6 +93,29 @@ def test_absent_trace_is_reported_as_unchecked(tmp_path) -> None:
     assert "外向き connect: 0 件" not in result.stdout
 
 
+def test_required_trace_rejects_missing_or_empty_connections(tmp_path) -> None:
+    run = _run_dir(tmp_path, "")
+    for missing in (False, True):
+        if missing:
+            (run / "connect.log").unlink()
+        result = subprocess.run(
+            [sys.executable, str(GB10 / "summarize.py"), "--require-trace", str(run)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 1
+        assert "未検査" in result.stdout
+        assert "外向き connect: 0 件" not in result.stdout
+
+
+def test_required_trace_accepts_observed_loopback(tmp_path) -> None:
+    run = _run_dir(tmp_path, LOOPBACK_LINES)
+    result = subprocess.run(
+        [sys.executable, str(GB10 / "summarize.py"), "--require-trace", str(run)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout
+
+
 def _actuate_run(tmp_path: Path, log: str, result: str = "rc=0 secs=95 mode=actuate") -> Path:
     run = _run_dir(tmp_path, LOOPBACK_LINES)
     (run / "result.txt").write_text(result + "\n")

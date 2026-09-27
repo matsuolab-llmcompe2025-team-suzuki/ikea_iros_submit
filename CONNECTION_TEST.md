@@ -45,6 +45,7 @@ PC2 の中を読むときは、必ず運営に断ってからにします。
 | 2-4 | 運営 IK の URDF | PC2 で `md5sum ~/g1_bridge/robot/assets/g1_urdf/g1_29dof_with_hand.urdf` が `093c36ba3284c6cce5f2b62041626b79` | 違えば運営 IK の運動学が変わっている。pose lane で動かす前に運営に確かめる |
 | 2-5 | manifest に PC2 用の image が無くてよいか | 運営に聞く | — |
 | 2-6 | **WBC の腕の kp**（重力の垂れ補正の前提） | PC2 で `grep -A6 "^MOTOR_KP" ~/GR00T-WholeBodyControl/decoupled_wbc/control/main/teleop/configs/g1_29dof_gear_wbc.yaml`。腕の 2 行（4〜5 行目）が `100, 100, 40, 40, 20, 20, 20` | 違えば記録する。R2 の保持の確認（§4）で `--boundary-gravity-offset-scale` を決める |
+| 2-7 | **Thorの強制終了・通信断時に歩行を止める経路** | 運営と現地E-stop担当者に確認。adapter `497f3ab` は最後の非ゼロ歩行速度をkeepaliveで保持することを非作動試験で確認済み | 接続切れを自動停止として扱わない。無人で歩行させない。運営側の安全停止策を確認し、実機への故障注入は運営管理下でのみ行う |
 
 ## 3. 起動（`INSTRUCTIONS.md` §2 の Step 0〜5）と、各段で見る所
 
