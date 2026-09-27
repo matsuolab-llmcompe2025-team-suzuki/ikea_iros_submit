@@ -130,6 +130,7 @@ class HandPreMotionSkill(Skill):
         holding_contact_gap_rad: float = 0.10,
         release: bool = False,
         holding_min_opening_rad: float = 1.0,
+        hold_arm_target_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
     ) -> None:
         super().__init__()
         target = np.asarray(target_rad, dtype=np.float64)
@@ -165,6 +166,7 @@ class HandPreMotionSkill(Skill):
         self._holding_contact_gap_rad = float(holding_contact_gap_rad)
         self._release = bool(release)
         self._holding_min_opening_rad = float(holding_min_opening_rad)
+        self._hold_arm_target_provider = hold_arm_target_provider
         if self._release and self._allow_closing_contact:
             raise ValueError("release never closes, so it cannot accept closing contact")
         # release は _begin_ramp で手ごとの目標を決め直すので、設定値を残しておく
@@ -274,7 +276,16 @@ class HandPreMotionSkill(Skill):
             health_check()
         self._advance_control_time()
         if self._hold_arm is None:
-            self._hold_arm = _measured_arm_14(obs)
+            target = (
+                self._hold_arm_target_provider()
+                if self._hold_arm_target_provider is not None else None
+            )
+            self._hold_arm = (
+                _measured_arm_14(obs) if target is None
+                else np.asarray(target, dtype=np.float64).copy()
+            )
+            if self._hold_arm.shape != (14,) or not np.isfinite(self._hold_arm).all():
+                raise RuntimeError(f"{self.name} cannot hold an invalid arm target")
         measured = self._measured_hand(obs)
         if measured is not None and self._start_measured is None:
             self._begin_ramp(measured)

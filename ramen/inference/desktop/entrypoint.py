@@ -62,9 +62,11 @@ VLA / GR00T 系の実 model 差し込みは別 Epic。SampleVLASkill は drop-in
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -283,12 +285,16 @@ def _return_arms_and_open_hand(
     sleep_fn=time.sleep,
     measured_convergence_checker=None,
     open_only: bool = False,
+    policy_initial_arm: Optional["np.ndarray"] = None,
+    retreat_waypoints: Sequence["np.ndarray"] = (),
 ) -> None:
     """run の終わりに手を開き、腕を下ろしてから解放する (Issue #152)。
 
-    正常終了・Ctrl+C・安全停止のどれでも同じ処理を通す。arm_sdk の weight は 1 の
-    ままここを走り、終わってから `_safe_shutdown` が weight を 0 へ落とす。
-    途中でもう一度 Ctrl+C を押したら中断して即解放へ進む (危ないときは E-stop)。
+    正常終了・Ctrl+C では続けてこの処理を通す。安全停止・想定外の例外では、
+    操作者が Enter で選んだときだけ通す (`_await_return_decision`、Issue #172)。
+    arm_sdk の weight は 1 のままここを走り、終わってから `_safe_shutdown` が weight を
+    0 へ落とす。追加の Ctrl+C は、boundary では 1 s 後から「その場で保持して終える」、
+    SDK では突然の脱力を防ぐため無視する (呼び出し側の `_sigint_raises`)。
     """
     # lazy: runtime env only (numpy 以外は SDK 依存の module を引き込むため)
     import numpy as np
@@ -307,10 +313,33 @@ def _return_arms_and_open_hand(
 
     print(
         "[return] opening Dex1 only; no arm motion was commanded"
-        if open_only else "[return] opening Dex1 and lowering the arms",
+        if open_only else "[return] returning to policy frame zero, opening Dex1, then lowering",
         file=sys.stderr,
     )
     _event({"event": "return_started", "monotonic_ns": time.monotonic_ns()})
+
+    if not open_only and policy_initial_arm is not None:
+        restore = CollisionAwareArmPreMotionSkill(
+            tuple(np.asarray(policy_initial_arm, dtype=np.float64).tolist()),
+            skill_name="return_policy_initial_pose",
+            waypoint_profile="boundary_lift",
+            measured_convergence_checker=measured_convergence_checker,
+            published_target_provider=lambda: arm_actuator.read_last_published_targets()[0],
+            **(lowering_settings or {}),
+        )
+        restore.start({})
+        restore_started = time_fn()
+        while not restore.is_complete:
+            if time_fn() - restore_started > timeout_s:
+                raise TimeoutError("policy frame-zero return did not converge")
+            state = joint_state_source.get()
+            command = restore.step({"joint_state": state})
+            stopped = restore.failure_reason or restore.timeout_reason
+            if stopped is not None:
+                raise RuntimeError(f"policy frame-zero return failed: {stopped}")
+            arm_actuator.send_action(command.tolist())
+            sleep_fn(1.0 / hz)
+        _event({"event": "return_policy_initial_reached", "monotonic_ns": time.monotonic_ns()})
 
     # 1) 手を開く (掴んだままだと次の stage の初期状態を作れない)
     if hand_actuator is not None and dex1_state_source is not None:
@@ -327,7 +356,9 @@ def _return_arms_and_open_hand(
                 # emitted, so re-emit the held arm target on every ramp step.
                 read_last = getattr(arm_actuator, "read_last_published_targets", None)
                 if callable(read_last):
-                    arm_actuator.send_action(read_last()[0])  # type: ignore[attr-defined]
+                    held_arm = read_last()[0]
+                    if held_arm is not None:
+                        arm_actuator.send_action(held_arm)  # type: ignore[attr-defined]
                 sleep_fn(1.0 / hz)
 
     if open_only:
@@ -335,6 +366,34 @@ def _return_arms_and_open_hand(
             "event": "return_skipped_no_arm_motion",
             "monotonic_ns": time.monotonic_ns(),
         })
+        return
+
+    if retreat_waypoints:
+        # Reverse only the startup waypoints that were actually traversed.
+        # In particular, Ctrl+C halfway through pre-motion never drives on
+        # toward the unreached policy frame-zero pose.
+        started = time_fn()
+        for index, target in enumerate(retreat_waypoints, 1):
+            skill = CollisionAwareArmPreMotionSkill(
+                tuple(np.asarray(target, dtype=np.float64).tolist()),
+                skill_name=f"return_completed_waypoint_{index}",
+                waypoint_profile="direct",
+                time_fn=time_fn,
+                measured_convergence_checker=measured_convergence_checker,
+                **(lowering_settings or {}),
+            )
+            skill.start({})
+            while not skill.is_complete:
+                if time_fn() - started > timeout_s:
+                    raise TimeoutError("reverse startup route did not converge")
+                state = joint_state_source.get()
+                command = skill.step({"joint_state": state})
+                stopped = skill.failure_reason or skill.timeout_reason
+                if stopped is not None:
+                    raise RuntimeError(f"reverse startup route failed: {stopped}")
+                arm_actuator.send_action(command.tolist())
+                sleep_fn(1.0 / hz)
+        _event({"event": "return_complete", "monotonic_ns": time.monotonic_ns()})
         return
 
     # 2) 起動時の退避を逆にたどって下ろす
@@ -377,6 +436,106 @@ def _return_arms_and_open_hand(
     _event({"event": "return_complete", "monotonic_ns": time.monotonic_ns()})
 
 
+@contextlib.contextmanager
+def _sigint_raises(*, ignore_first_s: float = 0.0):
+    """この間だけ Ctrl+C を KeyboardInterrupt にする (出たら元の扱いに戻す)。
+
+    終了処理は Ctrl+C を無視して始まる (`main` の finally)。判断待ちと boundary の戻し
+    動作の間だけ効かせる。``ignore_first_s`` は run を止めた Ctrl+C の押し続け・二度押しで
+    すぐに戻し動作を止めないための猶予。
+    """
+    started = time.monotonic()
+
+    def _handler(signum, frame):  # noqa: ARG001 - signal handler signature
+        if time.monotonic() - started < ignore_first_s:
+            return
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGINT, _handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _await_return_decision(
+    console: Optional[object],
+    *,
+    stage: int,
+    reason: str,
+    boundary: bool,
+    event_fn=None,
+) -> bool:
+    """安全停止・想定外の終了のあと、戻す動作 (腕・手を動かす) の前に操作者の判断を待つ (Issue #172)。
+
+    カメラ・関節 state の途絶や故障では、把持中の脚や周りの状態を操作者が確かめるまで
+    腕も手も動かさない。待つ間、腕と Dex1 は最後の指令を保持する (boundary は運営 adapter の
+    keepalive、SDK は arm publisher)。歩行は呼び出し前に 0 にしてある。
+
+    Returns:
+        True = 戻す動作を行う (Enter)。False = その場で終わる (Ctrl+C)。
+        端末が使えないときは、boundary は動かさない (False: 運営 adapter が保持する)、
+        SDK は従来どおり戻す (True: その場で解放すると腕が脱力して下がるため)。
+    """
+
+    def _event(decision: str) -> None:
+        if event_fn is not None:
+            try:
+                event_fn({
+                    "event": "safety_stop_decision",
+                    "reason": reason,
+                    "decision": decision,
+                    "monotonic_ns": time.monotonic_ns(),
+                })
+            except Exception as log_error:  # noqa: BLE001 - never block the stop
+                print(f"[safety-stop] event log failed: {log_error!r}", file=sys.stderr)
+
+    in_place = (
+        "hold the last command and end (the organizer adapter keeps holding it)"
+        if boundary
+        else "controlled release in place (the arms go limp and lower)"
+    )
+    if console is None or not getattr(console, "running", False):
+        decision = "return" if not boundary else "hold_in_place"
+        print(
+            f"[safety-stop] {reason}; no operator terminal, so "
+            + ("the previous automatic return runs" if not boundary else in_place),
+            file=sys.stderr,
+        )
+        _event(f"{decision}_no_terminal")
+        return decision == "return"
+    print(
+        f"[safety-stop] {reason}\n"
+        "Arms and Dex1 hold the last command and walking is stopped. Check the robot, "
+        "the held table leg and the surroundings, then press Enter to return "
+        "(policy start pose -> open Dex1 -> lower the arms), or Ctrl+C to "
+        f"{in_place}. Use the E-stop for any dangerous motion.",
+        file=sys.stderr,
+    )
+    try:
+        from inference.desktop.operator_console import SAFETY_STOP_PHASE
+
+        with _sigint_raises():
+            console.wait_for(  # type: ignore[attr-defined]
+                "enter", stage=stage, phase=f"{SAFETY_STOP_PHASE}／保持中・判断待ち"
+            )
+    except KeyboardInterrupt:
+        print("[safety-stop] operator chose to end without the return motion", file=sys.stderr)
+        _event("hold_in_place")
+        return False
+    except EOFError:
+        print(
+            "[safety-stop] operator terminal closed; "
+            + ("the previous automatic return runs" if not boundary else in_place),
+            file=sys.stderr,
+        )
+        _event("return_terminal_closed" if not boundary else "hold_in_place_terminal_closed")
+        return not boundary
+    print("[safety-stop] operator confirmed the return motion", file=sys.stderr)
+    _event("return")
+    return True
+
+
 def _stop_base_before_return(actuator: object) -> None:
     """return の前に歩行速度を 0 にする。例外は出さない (後始末を止めないため)。"""
     try:
@@ -395,10 +554,12 @@ def _return_before_release(
     recorder: Optional[object] = None,
     measured_convergence_checker=None,
     open_only: bool = False,
+    policy_initial_arm: Optional["np.ndarray"] = None,
+    retreat_waypoints: Sequence["np.ndarray"] = (),
 ) -> None:
     """解放の直前に必ず通る後始末 (Issue #152)。何があっても例外を出さない。
 
-    2 回目の Ctrl+C は「戻すのをやめて即解放」の意味に取る。危ないときは E-stop。
+    戻しを実行できない異常では解放処理へ進む。危険時は E-stop を使用する。
     """
     lowered_pose = _walk_lowered_pose(skill_config)
     if lowered_pose is None:
@@ -422,6 +583,8 @@ def _return_before_release(
             recorder=recorder,
             measured_convergence_checker=measured_convergence_checker,
             open_only=open_only,
+            policy_initial_arm=policy_initial_arm,
+            retreat_waypoints=retreat_waypoints,
         )
     except KeyboardInterrupt:
         print("[return] interrupted; releasing from the current pose", file=sys.stderr)
@@ -1372,6 +1535,55 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--boundary-publish-period-s",
+        type=float,
+        default=0.1,
+        help=(
+            "--action-sink boundary で目標が変わったときに送る最短の間隔 [s] (既定 0.1)。"
+            "運営 adapter は chunk の 1 行目を実測から ±0.05 rad に切り詰めるので、30 Hz で"
+            "送ると重力で遅れる腕が下がり続ける (Issue #172)。0 = 毎 tick 送る (従来)"
+        ),
+    )
+    p.add_argument(
+        "--boundary-chunk-rows",
+        type=int,
+        default=16,
+        help=(
+            "--action-sink boundary で 1 回に並べる同じ目標の行数 (既定 16 = 運営 adapter の"
+            " --max-waypoints)。2 行目以降が目標まで届き、送らない間は adapter の keepalive が"
+            "目標を保持する。1 = 従来"
+        ),
+    )
+    p.add_argument(
+        "--boundary-hold-refresh-s",
+        type=float,
+        default=1.0,
+        help=(
+            "--action-sink boundary で目標が変わらない間に送り直す間隔 [s] (既定 1.0)。"
+            "0 = 毎 tick 送る (従来)"
+        ),
+    )
+    p.add_argument(
+        "--boundary-gravity-offset",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "--action-sink boundary の joint lane で、送る腕に重力の垂れ (重力トルク / 運営 WBC の kp)"
+            " を足す (既定 on)。運営 WBC は腕を重力補償なしの PD で動かすので、足さないと肘などが"
+            "約 0.06 rad 下がる。学習データとラボ (重力 FF) は実測 ≒ 指令 (Issue #172)。"
+            "値は skill_config.yaml の boundary_gravity_offset。pose lane では使わない"
+        ),
+    )
+    p.add_argument(
+        "--boundary-gravity-offset-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "--boundary-gravity-offset の倍率 (既定 1.0 = YAML の kp どおり)。会場の保持で測った"
+            "垂れに合わせる (check_boundary_hold.py が提案値を出す)。0..2"
+        ),
+    )
+    p.add_argument(
         "--wrist-roll-clamp",
         choices=("on", "off"),
         default="off",
@@ -1676,6 +1888,30 @@ def _insert_policy_start_gate_transition(
     return gate_name
 
 
+def _install_operator_policy_gates(
+    transitions: dict[str, list[str]], policies: Sequence[str]
+) -> Optional[str]:
+    """Require Enter after every verified frame-zero transition.
+
+    Stage 1 in a continuous run starts directly with pick, so it returns the
+    gate name to use as that Stage's initial skill.
+    """
+    initial_gate = None
+    for policy in policies:
+        gate = f"operator_gate_for_{policy}"
+        predecessors = [
+            name for name, targets in transitions.items() if targets == [policy]
+        ]
+        if len(predecessors) > 1:
+            raise RuntimeError(f"ambiguous operator gate predecessor for {policy}")
+        if predecessors:
+            transitions[predecessors[0]] = [gate]
+        else:
+            initial_gate = gate
+        transitions[gate] = [policy]
+    return initial_gate
+
+
 def load_verified_rule_pick_calibration(path: Path) -> dict:
     """Load a fail-closed physical camera/plane override."""
     payload = yaml.safe_load(path.read_text())
@@ -1840,6 +2076,125 @@ def _boundary_taskspace_arrival(args: argparse.Namespace) -> bool:
 HAND_OWNING_STAGES = frozenset({1, 2, 3, 4, 5})
 
 
+#: boundary 経路で関節 state を「新しい」とみなす上限 [ns] (orchestrator の安全停止と同じ 0.5 s)。
+BOUNDARY_STATE_FRESH_NS = 500_000_000
+
+
+def make_boundary_sender(
+    *,
+    joint_source: Any,
+    sink: Any,
+    hand_actuator: Any,
+    walk_actuator: Any,
+    last_published_arm,
+    fallback_hand2: Sequence[float] = (0.0, 0.0),
+    monotonic_ns=time.monotonic_ns,
+):
+    """腕 14-D を boundary sink に渡す sender を作る (`BoundaryArmActuator.configure` 用)。
+
+    返す関数は、目標を sink に渡せたら True (送る時刻は sink が決める)。関節 state が古い
+    間は新しい目標を出さない (壊れた EE を流さない)。ただし「歩行ゼロ + 最後の腕 target の
+    保持」だけは最後に届いた state で送る。送らないと運営 adapter の keepalive が最後の
+    歩行指令を送り続け、state が止まった瞬間 (安全停止) の停止指令が届かない (Issue #172)。
+    腰は常に実測値 (BOUNDARY_WAIST_NOTE)。
+    """
+    import numpy as np
+
+    from inference.desktop.lower_policy.actuators.boundary_sink import assemble_action19
+
+    last_good_body_q29: dict[str, Any] = {"q": None}
+
+    def _is_stop_hold(arms14) -> bool:
+        if np.any(np.asarray(walk_actuator.latest, dtype=np.float64) != 0.0):
+            return False
+        last = last_published_arm()
+        return last is not None and np.array_equal(
+            np.asarray(arms14, dtype=np.float64).reshape(-1),
+            np.asarray(last, dtype=np.float64).reshape(-1),
+        )
+
+    def _send(arms14) -> bool:
+        joint = joint_source.get()
+        received_ns = getattr(joint, "received_monotonic_ns", None)
+        body_q29 = None
+        if (
+            joint is not None
+            and received_ns is not None
+            and 0 <= monotonic_ns() - int(received_ns) <= BOUNDARY_STATE_FRESH_NS
+        ):
+            candidate = np.asarray(joint.position, dtype=np.float64)[:29]
+            if candidate.shape == (29,) and np.all(np.isfinite(candidate)):
+                body_q29 = candidate
+                last_good_body_q29["q"] = candidate.copy()
+        state_stale = body_q29 is None
+        if state_stale:
+            cached = last_good_body_q29["q"]
+            if cached is None or not _is_stop_hold(arms14):
+                return False
+            body_q29 = cached.copy()
+        action19 = assemble_action19(
+            None,
+            arms14,
+            getattr(hand_actuator, "latest", None),
+            measured_waist3=body_q29[12:15],
+            fallback_hand2=fallback_hand2,
+        )
+        sink.send_action(
+            action19,
+            body_q29,
+            navigate_cmd=walk_actuator.latest,
+            state_stale=state_stale,
+        )
+        return True
+
+    return _send
+
+
+def validate_boundary_publish_args(args: argparse.Namespace) -> None:
+    """`--boundary-publish-period-s` / `--boundary-chunk-rows` / `--boundary-hold-refresh-s`
+    を起動前に確かめる (センサや publisher を立てる前に止める)。"""
+    period = float(getattr(args, "boundary_publish_period_s", 0.0))
+    rows = getattr(args, "boundary_chunk_rows", 1)
+    refresh = float(getattr(args, "boundary_hold_refresh_s", 0.0))
+    if not (math.isfinite(period) and period >= 0.0):
+        raise ValueError(f"--boundary-publish-period-s must be >= 0, got {period}")
+    if not (math.isfinite(refresh) and refresh >= 0.0):
+        raise ValueError(f"--boundary-hold-refresh-s must be >= 0, got {refresh}")
+    if refresh and refresh < period:
+        raise ValueError(
+            "--boundary-hold-refresh-s must be 0 or >= --boundary-publish-period-s"
+        )
+    if not 1 <= int(rows) <= 64:
+        raise ValueError(f"--boundary-chunk-rows must be in [1, 64], got {rows}")
+    scale = float(getattr(args, "boundary_gravity_offset_scale", 1.0))
+    if not (math.isfinite(scale) and 0.0 <= scale <= 2.0):
+        raise ValueError(f"--boundary-gravity-offset-scale must be in [0, 2], got {scale}")
+
+
+def build_boundary_gravity_offset(args: argparse.Namespace, skill_config: dict):
+    """会場の joint lane の重力の垂れ補正を作る。使わないときは None (Issue #172)。
+
+    作れない (pinocchio / URDF / YAML の不備) ときは例外。起動の最初に呼び、指令を出す前に
+    止める (黙って補正なしで走らせない。切るなら `--boundary-gravity-offset off`)。
+    """
+    if getattr(args, "action_sink", "sdk") != "boundary":
+        return None
+    if getattr(args, "boundary_gravity_offset", "off") != "on":
+        return None
+    if getattr(args, "boundary_lane", "joint") != "joint":
+        print(
+            "[init] gravity sag offset applies to the joint lane only; the pose lane is "
+            "sent unchanged",
+            file=sys.stderr,
+        )
+        return None
+    from inference.desktop.lower_policy.actuators.boundary_sink import ArmGravitySagOffset
+
+    return ArmGravitySagOffset.from_config(
+        skill_config, scale=float(args.boundary_gravity_offset_scale)
+    )
+
+
 def resolve_include_hand_in_head(
     args: argparse.Namespace, selected_stages: Sequence[int]
 ) -> bool:
@@ -1878,6 +2233,10 @@ def main() -> None:
             "requires --synthetic-hand-state (the contract has no Dex1 state and "
             "the boundary lane must not subscribe to DDS)"
         )
+    try:
+        validate_boundary_publish_args(args)
+    except ValueError as exc:
+        sys.exit(f"Official boundary configuration rejected: {exc}")
     pick_mode_defaulted = resolve_production_pick_mode(args)
     rule_based_pick_active = args.rule_based_pick_table_leg
     phase3_active = args.stage is not None or args.phase3_full or rule_based_pick_active
@@ -1980,6 +2339,7 @@ def main() -> None:
     from inference.desktop.orchestrator import (
         DEFAULT_ENTER_CHECK,
         DEFAULT_TRANSITIONS,
+        LEARNED_STAGE_SKILLS,
         STAGE_HEAD_SKILL,
         STAGE_SKILL_SEQUENCES,
         TIMEOUT_ACTIONS,
@@ -2033,6 +2393,14 @@ def main() -> None:
         **(skill_cfg_raw.get("hand_pre_motion") or {}), "open_rad": opening
     }
     print(f"[init] Dex1 preparation/release opening={opening:g}rad ({args.action_sink})", file=sys.stderr)
+    try:
+        boundary_gravity_offset = build_boundary_gravity_offset(args, skill_cfg_raw)
+    except Exception as exc:  # noqa: BLE001 - 起動前に止める
+        sys.exit(
+            "Official boundary configuration rejected: gravity sag offset could not be "
+            f"built ({type(exc).__name__}: {exc}). Fix it, or pass "
+            "--boundary-gravity-offset off to run without it."
+        )
     skills_section: dict = skill_cfg_raw["skills"]
 
     from inference.desktop.lower_policy.initial_pose import initial_pose_from_config
@@ -2170,6 +2538,18 @@ def main() -> None:
             "[init] arm_actuator initialized (rt/lowstate synced、start() deferred)",
             file=sys.stderr,
         )
+
+    def _last_published_arm() -> Optional["np.ndarray"]:
+        """保持の skill が使う「最後に送った腕 target」。まだ無ければ None (実測で保持)。
+
+        実測を保持 target にすると、WBC は重力の分だけ遅れて止まる実測をさらに目標に
+        するので、保持の段 (手・保持・開始待ち) ごとに腕が下がっていく。
+        """
+        try:
+            target = arm_actuator.read_last_published_targets()[0]
+        except RuntimeError:
+            return None  # boundary: start 前は target が無い
+        return None if target is None else np.asarray(target, dtype=np.float64)
 
     # 2) Perception layer。重み・conf・imgsz は policy_config.yaml の `yolo` から
     #    (評価経路と同じ設定・学習の焼き込みと同じ重み、Issue #141 INF-10)。
@@ -2520,6 +2900,9 @@ def main() -> None:
     phase_transitions = None
     phase_enter_check = None
     policy_start_gate_stage: Optional[int] = None
+    operator_console = None
+    operator_retry_routes: dict[str, str] = {}
+    operator_retry_graph: dict[str, list[str]] = {}
     if rule_based_pick_active:
         rule_initial_pose = _effective_initial_pose("pick_table_leg")
         skill_registry["rule_pick_pre_motion"] = CollisionAwareArmPreMotionSkill(
@@ -2577,9 +2960,9 @@ def main() -> None:
         # ArmPreMotionSkill の final_pose に渡す。Phase 1 profile と同じ
         # measured lowered walk + post_walk_settle も再利用 (安全境界維持)。
         model_transition_skips = (
-            frozenset({("pick_table_leg", "insert_table_leg")})
-            if args.pick_leg_hybrid
-            else frozenset()
+            # N can be pressed before the hybrid has carried the leg to the
+            # insert pose.  Always run the measured, grip-preserving bridge.
+            frozenset()
         )
 
         def _stage_sequence(stage: int) -> list[str]:
@@ -2636,13 +3019,13 @@ def main() -> None:
                 hold_sec=args.setup_hold_sec,
                 include_hand=include_hand_in_head,
                 measured_convergence_checker=_boundary_convergence_checker(head_skill),
+                published_arm_target_provider=_last_published_arm,
             ):
                 skill_registry[head.name] = head
 
         # Insert a finite, measured transition before every subsequent model.
-        # The hybrid pick already performs and verifies pick->insert internally,
-        # so that one boundary is represented exactly once rather than moving
-        # the load-bearing arms out through the clearance route a second time.
+        # Manual N may interrupt hybrid pick before it reaches insert frame zero,
+        # so pick->insert must use the same measured bridge as other policies.
         for stage in selected_stages:
             for previous_skill, next_skill in model_transition_pairs_for_stage(
                 stage,
@@ -2657,9 +3040,7 @@ def main() -> None:
                     hand_actuator=_build_hand_actuator(),
                     hold_sec=args.setup_hold_sec,
                     include_hand=include_hand_in_head,
-                    published_arm_target_provider=lambda: (
-                        arm_actuator.read_last_published_targets()[0]
-                    ),
+                    published_arm_target_provider=_last_published_arm,
                     measured_convergence_checker=_boundary_convergence_checker(
                         next_skill
                     ),
@@ -2690,7 +3071,8 @@ def main() -> None:
                     existing = skill_registry.get(hold_name)
                     if existing is None:
                         skill_registry[hold_name] = HoldPoseSkill(
-                            args.setup_hold_sec, name=hold_name
+                            args.setup_hold_sec, name=hold_name,
+                            hold_arm_target_provider=_last_published_arm,
                         )
                     elif not isinstance(existing, HoldPoseSkill):
                         raise RuntimeError(
@@ -2741,50 +3123,153 @@ def main() -> None:
             )
         )
         # enter_check: stage の run は YOLO (上位 policy) で次の skill へ進まない。
-        # 進むのは完了と時間切れだけ。YOLO の検出は overlay 用に policy へ渡し続ける
+        # 本番は操作者の N だけで次Policyへ進む。YOLO の検出は overlay 用に渡し続ける
         # (orchestrator.stage_enter_check)。
         phase_enter_check = stage_enter_check()
 
-        # A separately selected Stage starts only after its frame-zero arm/hand pose
-        # has converged and the operator explicitly confirms it.  Keep Stage 0
-        # unchanged (walk + move to the first pick pose only), and do not insert
-        # gates at model boundaries inside a Stage.  The gate is itself a normal
-        # ticking Skill, so arm commands, boundary packets, camera freshness checks,
-        # and Dex1 holding continue while stdin is waiting.
+        # One console owns all N/R/Enter input for the actuated Stage.  Every
+        # policy, including the first one, has an Enter gate after its pose
+        # transition.  No learned-policy completion or timeout switches models.
         policy_start_gate_stage = _selected_policy_start_gate_stage(args)
-        if policy_start_gate_stage is not None:
+        from inference.desktop.operator_console import OperatorConsole
+
+        if args.actuate:
+            operator_console = OperatorConsole()
+            operator_console.stage = first_phase3_stage or 0
+        if selected_stages and operator_console is not None:
             from inference.desktop.lower_policy.skills.operator_gate import (
                 OperatorConfirmationHoldSkill,
             )
+            from inference.desktop.lower_policy.skills.hand_pre_motion import HandPreMotionSkill
+            from inference.desktop.lower_policy.skills.hold_pose import HoldPoseSkill
 
-            first_policy = STAGE_HEAD_SKILL[policy_start_gate_stage]
-            gate_name = f"operator_gate_for_{first_policy}"
-            if phase_transitions is not None:
-                _insert_policy_start_gate_transition(
-                    phase_transitions, first_policy=first_policy
+            selected_policies = {
+                name
+                for stage in selected_stages
+                for name in STAGE_SKILL_SEQUENCES[stage]
+                if name in LEARNED_STAGE_SKILLS
+            }
+            arm_settings = dict(skill_cfg_raw.get("arm_pre_motion") or {})
+            arm_settings.pop("boundary_lift_rad", None)
+            for policy in selected_policies:
+                interrupt_setter = getattr(
+                    skill_registry[policy], "set_operator_interrupt_pending", None
                 )
-            # 問いを出す時点で開始姿勢に届いたかを、準備動作と同じ判定で見る (pose lane は
-            # 手先、sdk・joint lane は関節角)。準備動作が時間切れで進んだときに「届いた」と
-            # 出さないため (GB10 の Stage 5 で見つけた、2026-09-25)。
-            skill_registry[gate_name] = OperatorConfirmationHoldSkill(
-                name=gate_name,
-                next_skill_name=first_policy,
-                arrival_check=_gate_arrival_check(
-                    _effective_initial_pose(first_policy).arm_position_rad,
-                    _boundary_convergence_checker(first_policy),
-                    float(
-                        (skill_cfg_raw.get("arm_pre_motion") or {}).get(
-                            "measured_tolerance_rad", 0.10
+                if callable(interrupt_setter):
+                    interrupt_setter(operator_console.has_pending)
+                gate = f"operator_gate_for_{policy}"
+                arrival = _gate_arrival_check(
+                    _effective_initial_pose(policy).arm_position_rad,
+                    _boundary_convergence_checker(policy),
+                    float(arm_settings.get("measured_tolerance_rad", 0.10)),
+                )
+                skill_registry[gate] = OperatorConfirmationHoldSkill(
+                    name=gate,
+                    next_skill_name=policy,
+                    input_fn=(
+                        # prompt = 到達したか・一番ずれた関節 (実測から gate が作る)
+                        lambda prompt, name=policy: operator_console.wait_for(
+                            "enter", stage=operator_console.stage,
+                            phase=f"{name}／開始待ち", detail=prompt,
                         )
                     ),
-                ),
+                    arrival_check=arrival,
+                    require_arrival=True,
+                    # 到達した指令を保持する (実測を保持すると重力の分だけ下がり、
+                    # 到達判定を満たせなくなる)。
+                    hold_arm_target_provider=_last_published_arm,
+                )
+                open_name = f"retry_open_{policy}"
+                wait_name = f"retry_wait_{policy}"
+                arm_name = f"retry_arm_{policy}"
+                hand_name = f"retry_hand_{policy}"
+                hold_name = f"retry_hold_{policy}"
+                operator_retry_routes[policy] = open_name
+                hand = _build_hand_actuator()
+                skill_registry[open_name] = HandPreMotionSkill.from_config(
+                    skill_cfg_raw, policy, target="open", hand_actuator=hand,
+                    name=open_name,
+                    hold_arm_target_provider=_last_published_arm,
+                )
+                skill_registry[wait_name] = OperatorConfirmationHoldSkill(
+                    name=wait_name,
+                    next_skill_name=arm_name,
+                    input_fn=(
+                        lambda _prompt, name=policy: operator_console.wait_for(
+                            "r", stage=operator_console.stage,
+                            phase=f"{name}／腕保持・ハンド全開"
+                        )
+                    ),
+                    hold_arm_target_provider=_last_published_arm,
+                )
+                skill_registry[arm_name] = CollisionAwareArmPreMotionSkill(
+                    tuple(_effective_initial_pose(policy).arm_position_rad.tolist()),
+                    skill_name=arm_name,
+                    waypoint_profile="boundary_lift",
+                    published_target_provider=lambda: (
+                        arm_actuator.read_last_published_targets()[0]
+                    ),
+                    measured_convergence_checker=_boundary_convergence_checker(policy),
+                    **arm_settings,
+                )
+                needs_hand_gate = bool(
+                    _effective_initial_pose(policy).requires_separate_hand_initialization
+                )
+                skill_registry[hand_name] = HandPreMotionSkill.from_config(
+                    skill_cfg_raw, policy,
+                    target="grasp" if needs_hand_gate else "pose",
+                    hand_actuator=hand, name=hand_name,
+                    hold_arm_target_provider=_last_published_arm,
+                )
+                skill_registry[hold_name] = HoldPoseSkill(
+                    args.setup_hold_sec, name=hold_name,
+                    hold_arm_target_provider=_last_published_arm,
+                )
+                if needs_hand_gate:
+                    first_enter = f"retry_hand_gate_{policy}"
+                    skill_registry[first_enter] = OperatorConfirmationHoldSkill(
+                        name=first_enter,
+                        next_skill_name=hand_name,
+                        input_fn=(
+                            lambda _prompt, name=policy: operator_console.wait_for(
+                                "enter", stage=operator_console.stage,
+                                phase=f"{name}／脚配置・ハンド初期幅待ち"
+                            )
+                        ),
+                        hold_arm_target_provider=_last_published_arm,
+                    )
+                else:
+                    first_enter = hand_name
+                operator_retry_graph.update({
+                    open_name: [wait_name], wait_name: [arm_name],
+                    arm_name: [first_enter], hand_name: [hold_name],
+                    hold_name: [gate],
+                })
+                if needs_hand_gate:
+                    operator_retry_graph[first_enter] = [hand_name]
+            if phase_transitions is not None:
+                phase_transitions.update(operator_retry_graph)
+                _install_operator_policy_gates(
+                    phase_transitions,
+                    [name for name in STAGE_SKILL_SEQUENCES[first_phase3_stage]
+                 if name in LEARNED_STAGE_SKILLS],
+                )
+        def _operator_stage_graph(stage: int, *, is_start: bool):
+            graph = build_stage_transitions(
+                stage,
+                is_start_stage=is_start,
+                include_hand=include_hand_in_head,
+                skip_model_transition_pairs=model_transition_skips,
             )
-            print(
-                f"[init] Stage {policy_start_gate_stage} policy-start gate: "
-                "initial pose -> "
-                f"Enter -> {first_policy}",
-                file=sys.stderr,
+            if operator_console is None:
+                return graph, None
+            graph.update(operator_retry_graph)
+            initial_gate = _install_operator_policy_gates(
+                graph,
+                [name for name in STAGE_SKILL_SEQUENCES[stage]
+                 if name in LEARNED_STAGE_SKILLS],
             )
+            return graph, initial_gate
         print(
             (
                 f"[init] Phase 3 continuous stages="
@@ -2815,7 +3300,7 @@ def main() -> None:
         # its eight-stage state machine.
         stage_hard_timeouts = {}
         stage_timeout_actions = {}
-    elif phase3_active:
+    elif phase3_active and operator_console is None:
         timeout_skill_names = (
             {
                 name
@@ -2840,12 +3325,7 @@ def main() -> None:
                     f"got {action!r}"
                 )
             stage_timeout_actions[skill_name] = action
-        # The hybrid is a finite multi-controller state machine, not the old
-        # learned pick expert.  Its validated wall-clock budget therefore owns
-        # the pick timeout.  What happens on timeout stays the YAML
-        # ``skills.pick_table_leg.on_timeout`` (advance): 次へ進む道は完了と
-        # 時間切れだけで、止めるのは人。insert へは腕の遷移 (collision-aware) を
-        # 通って入る。
+        # Hybrid phase deadlines are independent of the whole-skill deadline.
         if args.pick_leg_hybrid:
             assert hybrid_pick_cfg is not None
             stage_hard_timeouts["pick_table_leg"] = (
@@ -2863,6 +3343,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    motion_guard: dict[str, object] = {"initial": None}
     actuator_send_fn = arm_actuator.send_action
 
     # 6) initial_skill 決定。--stage 指定時は stage の先頭 skill、未指定なら setup。
@@ -2901,6 +3382,18 @@ def main() -> None:
     single_stage_residency: Optional[Any] = None
     shutdown_hand_actuator: Optional[object] = None
     return_checker = None
+    current_policy = None
+    previous_sigint_handler = None
+    arm_motion_published = False
+    last_arm = None
+    start_arm = None
+    retreat = ()
+    last_executed_policy: dict[str, Optional[str]] = {"name": None}
+    # run の終わり方 (Issue #172)。"completed" (正常終了) と "operator_stop" (Ctrl+C) 以外
+    # (安全停止・想定外の例外) では、戻す動作の前に操作者の判断を待つ。
+    run_end: dict[str, Optional[str]] = {"kind": None, "reason": None}
+    run_return = True
+    return_interrupt: Any = contextlib.nullcontext()
     try:
         # 7) Frame source (ROS2 CompressedImage を cyclonedds direct で subscribe)。
         #    Ros2FrameSource の init 内で SDK ChannelFactory 経由で listener を register。
@@ -2978,7 +3471,6 @@ def main() -> None:
         if args.action_sink == "boundary":
             from inference.desktop.lower_policy.actuators.boundary_sink import (
                 BoundaryActionSink,
-                assemble_action19,
             )
 
             # FK は渡さない = 運営 IK と同じ運動学 (ORGANIZER_IK_URDF_PATH、Issue #164)。
@@ -2993,6 +3485,13 @@ def main() -> None:
                 sender_clock_offset_fn=getattr(
                     sensors.head, "sender_clock_offset_s", None
                 ),
+                # 実測への向かい直しで腕が下がらない送り方 (Issue #172、
+                # boundary_sink.DEFAULT_PUBLISH_PERIOD_S の説明)
+                publish_period_s=args.boundary_publish_period_s,
+                chunk_rows=args.boundary_chunk_rows,
+                hold_refresh_s=args.boundary_hold_refresh_s,
+                # 重力の垂れ補正 (joint lane、Issue #172)。None なら足さない
+                gravity_offset=boundary_gravity_offset,
             )
             # WBC_RUNBOOK §1/§4 Step 5 の想定は「PC2 の client が :5556 を bind」。
             # Thor で動かすと bind 先が変わるので、運営側の設定が要ることを明示する。
@@ -3012,44 +3511,22 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-            def _send_to_boundary(arms14) -> bool:
-                """1 row を publish する。publish したら True。"""
-                joint = sensors.joint.get()
-                received_ns = getattr(joint, "received_monotonic_ns", None)
-                if (
-                    joint is None
-                    or received_ns is None
-                    or not (0 <= time.monotonic_ns() - int(received_ns) <= 500_000_000)
-                ):
-                    # 関節が取れない tick は publish しない (壊れた EE を流さない)。
-                    return False
-                body_q29 = np.asarray(joint.position, dtype=np.float64)[:29]
-                if body_q29.shape != (29,) or not np.all(np.isfinite(body_q29)):
-                    return False
-                action19 = assemble_action19(
-                    # 腰は常に実測値 (BOUNDARY_WAIST_NOTE)。
-                    None,
-                    arms14,
-                    getattr(_boundary_hand, "latest", None),
-                    measured_waist3=body_q29[12:15],
-                    fallback_hand2=(
-                        synthetic_hand_initial_rad
-                        if synthetic_hand_initial_rad is not None
-                        else (0.0, 0.0)
-                    ),
-                )
-                _boundary_sink.send_action(
-                    action19,
-                    body_q29,
-                    navigate_cmd=actuator.latest,
-                )
-                return True
+            _send_to_boundary = make_boundary_sender(
+                joint_source=sensors.joint,
+                sink=_boundary_sink,
+                hand_actuator=_boundary_hand,
+                walk_actuator=actuator,
+                last_published_arm=_last_published_arm,
+                fallback_hand2=(
+                    synthetic_hand_initial_rad
+                    if synthetic_hand_initial_rad is not None
+                    else (0.0, 0.0)
+                ),
+            )
 
             # 送信窓口は arm_actuator.send_action の 1 本だけ。orchestrator が
             # _send_to_boundary を直に呼ぶと「最後に送った target」が更新されず、
             # 歩行の再送・model 遷移・終了処理が起動時の姿勢を送っていた。
-            actuator_send_fn = arm_actuator.send_action
-
             def _measured_boundary_arms() -> Optional[np.ndarray]:
                 snapshot = sensors.joint.get()
                 if snapshot is None:
@@ -3150,12 +3627,15 @@ def main() -> None:
 
         def _make_tick_hook(residency):
             """tick ごとの hook: 記録 + GPU に置く model の入れ替え。"""
-            if recorder is None and residency is None:
+            if recorder is None and residency is None and not phase3_active:
                 return None
 
             def _hook(result, obs, skill) -> None:
+                name = getattr(skill, "name", None)
+                if name in LEARNED_STAGE_SKILLS:
+                    last_executed_policy["name"] = name
                 if residency is not None:
-                    residency.on_skill_started(getattr(skill, "name", None))
+                    residency.on_skill_started(name)
                 if recorder is not None:
                     record_policy_tick(
                         recorder,
@@ -3270,12 +3750,7 @@ def main() -> None:
             transitions=(
                 phase_transitions
                 if rule_based_pick_active
-                else build_stage_transitions(
-                    first_phase3_stage,
-                    is_start_stage=True,
-                    include_hand=include_hand_in_head,
-                    skip_model_transition_pairs=model_transition_skips,
-                )
+                else _operator_stage_graph(first_phase3_stage, is_start=True)[0]
                 if args.phase3_full
                 else phase_transitions
             ),
@@ -3286,6 +3761,16 @@ def main() -> None:
             timeout_action_by_skill=stage_timeout_actions,
             policy_filter=policy_filter,
             on_tick=_make_tick_hook(single_stage_residency),
+            operator_console=(operator_console if args.actuate else None),
+            operator_stage=first_phase3_stage,
+            operator_retry_routes=operator_retry_routes,
+            operator_hold_target=lambda: (
+                arm_actuator.read_last_published_targets()[0]
+            ),
+            operator_terminal_next=(
+                args.phase3_full
+                and first_phase3_stage < args.phase3_end_stage
+            ),
         )
 
         # 8b) --stage 指定時: n_legs_completed を stage 番号から init。
@@ -3374,6 +3859,18 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 return
+            if operator_console is not None and not sys.stdin.isatty():
+                raise RuntimeError(
+                    "N/R/Enter production controls require an interactive TTY; "
+                    "no robot publisher was started"
+                )
+            motion_guard["initial"] = np.asarray(
+                arm_actuator.read_arm_positions(), dtype=np.float64
+            ).copy()
+            if motion_guard["initial"].shape != (14,) or not np.isfinite(
+                motion_guard["initial"]
+            ).all():
+                raise RuntimeError("invalid live arm pose before operator gate")
             # Load only the first learned expert before arm_sdk ownership.  Any
             # later expert is loaded after its predecessor is closed, so Phase
             # 3 never requires multiple 13 GiB GR00T checkpoints on the GPU.
@@ -3529,8 +4026,12 @@ def main() -> None:
         # Default SIGINT handling raises KeyboardInterrupt.  Catching it below and
         # using this single finally block avoids duplicate stop commands.
         print("[run] starting orchestrator tick loop", file=sys.stderr)
+        if operator_console is not None:
+            operator_console.start()
         if args.phase3_full:
             for stage in range(args.phase3_start_stage, args.phase3_end_stage + 1):
+                if operator_console is not None:
+                    operator_console.stage = stage
                 if stage == 5:
                     # Stages 1..4 may have dispatched a waist target.  Stage 5
                     # explicitly leaves waist/legs to Regular Mode, so stale
@@ -3584,27 +4085,21 @@ def main() -> None:
                         # stage の最初の model は run_live の前に読む (1 tick 目が
                         # 読み込みを待たないように)。残りは裏で先読みする。
                         residency.prime()
-                stage_transitions = build_stage_transitions(
-                    stage,
-                    is_start_stage=(stage == args.phase3_start_stage),
-                    include_hand=include_hand_in_head,
-                    skip_model_transition_pairs=model_transition_skips,
+                stage_transitions, initial_gate = _operator_stage_graph(
+                    stage, is_start=(stage == args.phase3_start_stage)
                 )
-                if policy_start_gate_stage == stage:
-                    _insert_policy_start_gate_transition(
-                        stage_transitions,
-                        first_policy=STAGE_HEAD_SKILL[stage],
-                    )
                 stage_orch = Orchestrator(
                     perception,
                     cleaner,
                     dispatcher,
-                    initial_skill=build_stage_skill_sequence(
-                        stage,
-                        is_start_stage=(stage == args.phase3_start_stage),
-                        include_hand=include_hand_in_head,
-                        skip_model_transition_pairs=model_transition_skips,
-                    )[0],
+                    initial_skill=(
+                        initial_gate or build_stage_skill_sequence(
+                            stage,
+                            is_start_stage=(stage == args.phase3_start_stage),
+                            include_hand=include_hand_in_head,
+                            skip_model_transition_pairs=model_transition_skips,
+                        )[0]
+                    ),
                     joint_state_source=joint_state_source,
                     dex1_state_source=dex1_state_source,
                     wrist_left_source=wrist_left_source,
@@ -3618,6 +4113,13 @@ def main() -> None:
                     timeout_action_by_skill=stage_timeout_actions,
                     policy_filter=policy_filter,
                     on_tick=_make_tick_hook(residency),
+                    operator_console=operator_console,
+                    operator_stage=stage,
+                    operator_retry_routes=operator_retry_routes,
+                    operator_hold_target=lambda: (
+                        arm_actuator.read_last_published_targets()[0]
+                    ),
+                    operator_terminal_next=(stage < args.phase3_end_stage),
                 )
                 if stage >= 1:
                     stage_orch.state.n_legs_completed = stage - 1
@@ -3657,34 +4159,44 @@ def main() -> None:
                     else frozenset()
                 ),
             )
+        run_end["kind"] = "completed"
     except LiveSourceSafetyError as e:
         print(f"[safety-stop] {e}", file=sys.stderr)
+        run_end.update(kind="safety_stop", reason=str(e))
         if phase3_active and args.actuate and arm_actuator_started:
             # Do not turn a model-boundary failure into an immediate arm drop. Both
             # actuator publisher threads still own their last safe targets at
-            # this point.  Keep them alive until the operator has secured the
-            # table leg / arms, then let the one common finally block perform
-            # the controlled arm_sdk release.
+            # this point.  The common finally block stops walking, then waits for
+            # the operator's decision (_await_return_decision) before any arm or
+            # Dex1 motion.
             if recorder is not None:
                 recorder.write_event(
                     {
                         "event": "phase3_safety_hold",
                         "reason": str(e),
-                        "instruction": "operator_ack_before_controlled_release",
+                        "instruction": "operator_decision_before_return",
                         "monotonic_ns": time.monotonic_ns(),
                     }
                 )
             print(
-                "[Phase 3 HOLD] Last safe arm and Dex1 targets remain active. "
-                "Use E-stop immediately for dangerous motion. Otherwise the "
-                "common return (open Dex1 -> lower the arms) runs before the "
-                "controlled release.",
+                "[Phase 3 HOLD] Last safe arm and Dex1 targets remain active and "
+                "walking is stopped. Use E-stop immediately for dangerous motion. "
+                "The return motion waits for the operator (Enter = return, "
+                "Ctrl+C = end in place).",
                 file=sys.stderr,
             )
         raise SystemExit(2)
     except KeyboardInterrupt:
-        pass
+        run_end["kind"] = "operator_stop"
+    except BaseException as e:
+        # 想定外の例外も安全停止と同じく、戻す動作の前に操作者の判断を待つ。
+        run_end.update(kind="error", reason=f"{type(e).__name__}: {e}")
+        raise
     finally:
+        previous_sigint_handler = (
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if operator_console is not None else None
+        )
         # 正常終了・Ctrl+C・安全停止のどれでも、手を開いて腕を下ろしてから解放する
         # (Issue #152)。weight はまだ 1 なので、ここは指令が効く。
         #
@@ -3702,13 +4214,40 @@ def main() -> None:
                 # `navigate_cmd=actuator.latest` を運ぶので、歩行中に落ちると
                 # return の間 (最大 60s) 歩き続けていた。
                 _stop_base_before_return(actuator)
+                if args.action_sink == "boundary":
+                    arm_motion_published = bool(arm_actuator.has_motion_target)
+                else:
+                    last_arm, _ = arm_actuator.read_last_published_targets()
+                    start_arm = motion_guard["initial"]
+                    arm_motion_published = bool(
+                        last_arm is not None and start_arm is not None
+                        and np.max(np.abs(np.asarray(last_arm) - start_arm)) > 0.08
+                    )
+                current_policy = dispatcher.active_skill_name
+                if current_policy not in LEARNED_STAGE_SKILLS:
+                    # During an unfinished inter-policy move, retreat toward a
+                    # pose already reached by the previous policy, never the
+                    # unreached next model's frame zero.
+                    current_policy = last_executed_policy["name"]
+                retreat = getattr(
+                    skill_registry.get(
+                        f"arm_pre_motion_for_{STAGE_HEAD_SKILL[first_phase3_stage]}"
+                    ),
+                    "retreat_waypoints",
+                    (),
+                )
+                if (
+                    not retreat and arm_motion_published
+                    and current_policy is None and motion_guard["initial"] is not None
+                ):
+                    # Only a small startup hold/go-live command happened;
+                    # retreat directly to the measured start, not via banzai.
+                    retreat = (motion_guard["initial"],)
                 return_checker = None
                 if args.action_sink == "boundary":
                     try:
                         return_checker = _boundary_convergence_checker(
-                            STAGE_HEAD_SKILL[first_phase3_stage]
-                            if first_phase3_stage is not None
-                            else "pick_table_leg"
+                            current_policy or STAGE_HEAD_SKILL[first_phase3_stage]
                         )
                     except Exception as checker_error:  # noqa: BLE001
                         print(
@@ -3716,19 +4255,54 @@ def main() -> None:
                             f"{checker_error!r}",
                             file=sys.stderr,
                         )
-                _return_before_release(
-                    skill_config=skill_cfg_raw,
-                    arm_actuator=arm_actuator,
-                    joint_state_source=joint_state_source,
-                    hand_actuator=shutdown_hand_actuator,
-                    dex1_state_source=dex1_state_source,
-                    recorder=recorder,
-                    measured_convergence_checker=return_checker,
-                    open_only=(
-                        args.action_sink == "boundary"
-                        and not arm_actuator.has_motion_target
-                    ),
+                run_return = True
+                if run_end["kind"] not in ("completed", "operator_stop"):
+                    # 安全停止・想定外の例外: 把持中の脚や周りを操作者が確かめるまで
+                    # 腕も手も動かさない (Issue #172)。歩行は上で 0 にした。
+                    run_return = _await_return_decision(
+                        operator_console,
+                        stage=(
+                            operator_console.stage
+                            if operator_console is not None
+                            else (first_phase3_stage or 0)
+                        ),
+                        reason=run_end["reason"] or "run ended unexpectedly",
+                        boundary=(args.action_sink == "boundary"),
+                        event_fn=(
+                            recorder.write_event if recorder is not None else None
+                        ),
+                    )
+                # boundary では戻し動作中の Ctrl+C で「その場で保持して終える」ことができる
+                # (解放しても腕は落ちない: 運営 adapter が最後の指令を保持する)。SDK は解放で
+                # 腕が脱力するので、従来どおり戻し動作中の Ctrl+C は無視する。
+                return_interrupt = (
+                    _sigint_raises(ignore_first_s=1.0)
+                    if args.action_sink == "boundary" and operator_console is not None
+                    else contextlib.nullcontext()
                 )
+                if run_return:
+                    with return_interrupt:
+                        _return_before_release(
+                            skill_config=skill_cfg_raw,
+                            arm_actuator=arm_actuator,
+                            joint_state_source=joint_state_source,
+                            hand_actuator=shutdown_hand_actuator,
+                            dex1_state_source=dex1_state_source,
+                            recorder=recorder,
+                            measured_convergence_checker=return_checker,
+                            policy_initial_arm=(
+                                _effective_initial_pose(current_policy).arm_position_rad
+                                if current_policy is not None else None
+                            ),
+                            open_only=not arm_motion_published,
+                            retreat_waypoints=retreat,
+                        )
+                else:
+                    print(
+                        "[return] skipped by the operator; ending with the last "
+                        "command held",
+                        file=sys.stderr,
+                    )
         finally:
             try:
                 _release_robot_outputs(
@@ -3769,6 +4343,10 @@ def main() -> None:
                         *([_boundary_sink] if _boundary_sink is not None else []),
                     ],
                 )
+                if operator_console is not None:
+                    operator_console.close()
+                if previous_sigint_handler is not None:
+                    signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 #: 解放の後の後始末 (model 解放・録画の終了・policy worker の停止) 1 件の上限 [s]。

@@ -635,11 +635,15 @@ def build_vla_skill(
         f"ckpt={variant.policy_config.ckpt_ref})",
         file=sys.stderr,
     )
+    teacher_range_mode = (
+        "observe_only" if extra.get("teacher_range_observe_only")
+        else "on" if teacher_range is not None else "off"
+    )
     print(
         f"[assembly] {skill_name}: dispatch_waist={dispatch_waist} "
         f"skill_id={'class' if variant.policy_config.skill_id is None else variant.policy_config.skill_id} "
         f"prompt={variant.policy_config.language_prompt!r} "
-        f"teacher_range={'on' if teacher_range is not None else 'off'} "
+        f"teacher_range={teacher_range_mode} "
         f"progress_monitor={'on' if progress_monitor is not None else 'off'}",
         file=sys.stderr,
     )
@@ -693,6 +697,7 @@ def build_head_procedure(
     hold_sec: float,
     include_hand: bool,
     measured_convergence_checker: Optional[Callable] = None,
+    published_arm_target_provider: Optional[Callable[[], Any]] = None,
 ) -> list:
     """頭の手順の skill 列を作る (Issue #141 D2)。評価と本番の両方がこれを使う。
 
@@ -709,6 +714,9 @@ def build_head_procedure(
         hold_sec: 最後に開始姿勢で保持する秒数。
         include_hand: Dex1 を実際に動かすか (`--use-real-hand`)。False なら手の skill を
             入れない (mock の手は測定値が動かないので、到達を待てない)。
+        published_arm_target_provider: 最後に送った腕 target を返す callable。手の段と
+            保持の段はこれを保持する (None を返したら実測)。実測を保持 target にすると、
+            重力で遅れて止まる実測がさらに目標になり、段ごとに腕が下がる (Issue #172)。
     """
     from inference.desktop.lower_policy.skills.collision_aware_pre_motion import (
         CollisionAwareArmPreMotionSkill,
@@ -741,6 +749,7 @@ def build_head_procedure(
                 target="open",
                 hand_actuator=hand_actuator,
                 name=f"hand_open_{skill_name}",
+                hold_arm_target_provider=published_arm_target_provider,
             )
         )
     arm_settings = dict(skill_config.get("arm_pre_motion") or {})
@@ -778,9 +787,16 @@ def build_head_procedure(
                 target="grasp" if grasp else "pose",
                 hand_actuator=hand_actuator,
                 name=names[-2],
+                hold_arm_target_provider=published_arm_target_provider,
             )
         )
-    skills.append(HoldPoseSkill(hold_sec, name=names[-1]))
+    skills.append(
+        HoldPoseSkill(
+            hold_sec,
+            name=names[-1],
+            hold_arm_target_provider=published_arm_target_provider,
+        )
+    )
     built = [skill.name for skill in skills]
     if built != names:
         raise RuntimeError(f"head procedure name mismatch: {built} != {names}")
@@ -847,6 +863,7 @@ def build_model_transition_procedure(
                 target="release",
                 hand_actuator=hand_actuator,
                 name=names[0],
+                hold_arm_target_provider=published_arm_target_provider,
             )
         )
     # 境界は「肩 pitch を少し上げて、次の開始姿勢へ直接」(Issue #152)。歩行の後に
@@ -877,9 +894,16 @@ def build_model_transition_procedure(
                 target="grasp" if grasp else "pose",
                 hand_actuator=hand_actuator,
                 name=f"hand_transition_{previous_skill}_to_{next_skill}",
+                hold_arm_target_provider=published_arm_target_provider,
             )
         )
-    skills.append(HoldPoseSkill(hold_sec, name=names[-1]))
+    skills.append(
+        HoldPoseSkill(
+            hold_sec,
+            name=names[-1],
+            hold_arm_target_provider=published_arm_target_provider,
+        )
+    )
     built = [skill.name for skill in skills]
     if built != names:
         raise RuntimeError(f"model transition name mismatch: {built} != {names}")

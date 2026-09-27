@@ -1,9 +1,7 @@
 """開始姿勢のまま N 秒待つ skill (Issue #141 束 1-8 / D2)。
 
 頭の手順 (手を開く → 腕の pre-motion → 手を開始の開度へ → **N 秒保持**) の最後。
-本番は stage の境界の Enter を無くして自然に進むので、その代わりに「開始姿勢に着いて
-から少し待つ」時間をここで作る (ユーザー決定 2026-09-14)。N は起動引数で指定する
-(評価は Enter があるので既定 0 秒、本番は 3 秒)。
+本番ではこの有限の準備保持後にも必ず Enter gate を通す。N は起動引数で指定する。
 
 腕は今の測定値を保持するだけで、手にも腰にも指令を出さない。
 """
@@ -38,6 +36,7 @@ class HoldPoseSkill(Skill):
         completion_error_fn: Optional[Callable[[], Optional[str]]] = None,
         completion_description: str = "external readiness gate",
         completion_timeout_s: Optional[float] = None,
+        hold_arm_target_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
     ) -> None:
         super().__init__()
         if hold_sec < 0.0:
@@ -52,6 +51,7 @@ class HoldPoseSkill(Skill):
         self._completion_timeout_s = (
             None if completion_timeout_s is None else float(completion_timeout_s)
         )
+        self._hold_arm_target_provider = hold_arm_target_provider
         if self._completion_timeout_s is not None and self._completion_timeout_s <= 0.0:
             raise ValueError("completion_timeout_s must be > 0")
         self._hold_arm: Optional[np.ndarray] = None
@@ -97,11 +97,17 @@ class HoldPoseSkill(Skill):
             state = obs.get("joint_state")
             if state is None:
                 raise RuntimeError(f"{self.name} requires a live joint state to hold")
-            self._hold_arm = arm_positions_from_joint_state(
-                tuple(state.name),
-                np.asarray(state.position, dtype=np.float64),
-                self.name,
+            target = (
+                self._hold_arm_target_provider()
+                if self._hold_arm_target_provider is not None else None
             )
+            self._hold_arm = (
+                arm_positions_from_joint_state(
+                    tuple(state.name), np.asarray(state.position, dtype=np.float64), self.name
+                ) if target is None else np.asarray(target, dtype=np.float64).copy()
+            )
+            if self._hold_arm.shape != (14,) or not np.isfinite(self._hold_arm).all():
+                raise RuntimeError(f"{self.name} cannot hold an invalid arm target")
             self._started_at = self._time_fn()
             print(f"[hold] {self.name}: holding for {self._hold_sec:g}s", file=sys.stderr)
         elapsed = self._time_fn() - self._started_at

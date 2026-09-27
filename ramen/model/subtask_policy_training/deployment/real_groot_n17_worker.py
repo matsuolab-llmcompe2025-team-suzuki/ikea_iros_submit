@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-repo-id", default=MODEL_REPO_ID)
     parser.add_argument("--model-revision", default=MODEL_REVISION)
     parser.add_argument("--task", default=TASK_TEXT)
+    parser.add_argument(
+        "--model-kind", choices=("joint_absolute", "ee_relative"),
+        default="joint_absolute",
+    )
     return parser.parse_args()
 
 
@@ -60,7 +64,10 @@ def _decode_rgb(jpeg: bytes, role: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
 
 
-def _feature_config(checkpoint: Path) -> Any:
+def _feature_config(
+    checkpoint: Path, *, state_dim: int = MODEL_STATE_DIM,
+    action_dim: int = MODEL_ACTION_DIM,
+) -> Any:
     from lerobot.configs import FeatureType, PolicyFeature
     from lerobot.policies.groot.configuration_groot import GrootConfig
 
@@ -69,7 +76,7 @@ def _feature_config(checkpoint: Path) -> Any:
         for key in CAMERA_KEYS
     }
     inputs["observation.state"] = PolicyFeature(
-        type=FeatureType.STATE, shape=(MODEL_STATE_DIM,)
+        type=FeatureType.STATE, shape=(state_dim,)
     )
     return GrootConfig(
         base_model_path=str(checkpoint),
@@ -79,7 +86,7 @@ def _feature_config(checkpoint: Path) -> Any:
         input_features=inputs,
         output_features={
             "action": PolicyFeature(
-                type=FeatureType.ACTION, shape=(MODEL_ACTION_DIM,)
+                type=FeatureType.ACTION, shape=(action_dim,)
             )
         },
         action_decode_transform="none",
@@ -97,7 +104,13 @@ def _feature_config(checkpoint: Path) -> Any:
     )
 
 
-def _validate_processor(preprocessor: Any, postprocessor: Any) -> None:
+def _validate_processor(
+    preprocessor: Any, postprocessor: Any, *,
+    state_keys: tuple[str, ...] = ("robot_q", "hand"),
+    action_keys: tuple[str, ...] = ("robot_q", "hand"),
+    action_dim: int = MODEL_ACTION_DIM,
+    require_relative_eef: bool = False,
+) -> None:
     from lerobot.policies.groot.processor_groot import (
         GrootN17ActionDecodeStep,
         GrootN17PackInputsStep,
@@ -121,19 +134,27 @@ def _validate_processor(preprocessor: Any, postprocessor: Any) -> None:
         raise ValueError(
             f"processor valid horizon changed: {pack.valid_action_horizon}"
         )
-    if decode.env_action_dim != MODEL_ACTION_DIM:
+    if decode.env_action_dim != action_dim:
         raise ValueError(f"processor decoded action dim changed: {decode.env_action_dim}")
     modality = decode.modality_config or {}
-    if tuple((modality.get("state") or {}).get("modality_keys") or ()) != (
-        "robot_q",
-        "hand",
-    ):
+    if tuple((modality.get("state") or {}).get("modality_keys") or ()) != state_keys:
         raise ValueError("processor state group order changed")
-    if tuple((modality.get("action") or {}).get("modality_keys") or ()) != (
-        "robot_q",
-        "hand",
-    ):
+    if tuple((modality.get("action") or {}).get("modality_keys") or ()) != action_keys:
         raise ValueError("processor action group order changed")
+    if require_relative_eef:
+        if not decode.use_relative_action:
+            raise ValueError("relative EEF model requires official relative action decode")
+        configs = (modality.get("action") or {}).get("action_configs") or ()
+        if len(configs) != 3 or any(
+            str(configs[i].get("rep", "")).upper() != "RELATIVE"
+            or str(configs[i].get("type", "")).upper() != "EEF"
+            or str(configs[i].get("format", "")).upper() != "XYZ_ROT6D"
+            or configs[i].get("state_key") != action_keys[i]
+            for i in (0, 1)
+        ):
+            raise ValueError("relative EEF processor action contract changed")
+        if str(configs[2].get("rep", "")).upper() != "ABSOLUTE":
+            raise ValueError("Dex1 action must be absolute")
 
 
 def _make_inference_policy(config: Any) -> Any:
@@ -289,6 +310,7 @@ class Runtime:
         model_repo_id: str = MODEL_REPO_ID,
         model_revision: str = MODEL_REVISION,
         task: str = TASK_TEXT,
+        model_kind: str = "joint_absolute",
     ) -> None:
         if importlib.metadata.version("lerobot") != LEROBOT_VERSION:
             raise RuntimeError(f"physical GR00T inference requires lerobot=={LEROBOT_VERSION}")
@@ -296,17 +318,34 @@ class Runtime:
             make_groot_pre_post_processors_from_pretrained,
         )
 
-        self.contract = validate_checkpoint_metadata(
-            checkpoint,
-            model_repo_id=model_repo_id,
-            model_revision=model_revision,
-            task=task,
-        )
+        if model_kind == "ee_relative":
+            from inference.desktop.upper_policy.groot_pick_leg_ee_rel_contract import (
+                validate_ee_relative_checkpoint_metadata,
+            )
+            self.contract = validate_ee_relative_checkpoint_metadata(
+                checkpoint, model_repo_id=model_repo_id,
+                model_revision=model_revision, task=task,
+            )
+            self.state_dim, self.action_dim = 56, 20
+            state_keys = ("left_ee", "right_ee", "hand", "robot_q")
+            action_keys = ("left_ee", "right_ee", "hand")
+        elif model_kind == "joint_absolute":
+            self.contract = validate_checkpoint_metadata(
+                checkpoint, model_repo_id=model_repo_id,
+                model_revision=model_revision, task=task,
+            )
+            self.state_dim, self.action_dim = MODEL_STATE_DIM, MODEL_ACTION_DIM
+            state_keys = ("robot_q", "hand")
+            action_keys = ("robot_q", "hand")
+        else:
+            raise ValueError(f"unknown model kind: {model_kind}")
         self.task = task
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for physical GR00T inference")
-        config = _feature_config(checkpoint)
+        config = _feature_config(
+            checkpoint, state_dim=self.state_dim, action_dim=self.action_dim,
+        )
         config.device = str(self.device)
         with redirect_stdout(sys.stderr):
             self.model = _make_inference_policy(config)
@@ -325,12 +364,17 @@ class Runtime:
                 )
             )
             print("[groot-worker] official processors ready", file=sys.stderr, flush=True)
-        _validate_processor(self.preprocessor, self.postprocessor)
+        _validate_processor(
+            self.preprocessor, self.postprocessor,
+            state_keys=state_keys, action_keys=action_keys,
+            action_dim=self.action_dim,
+            require_relative_eef=model_kind == "ee_relative",
+        )
 
     def predict(self, request: dict[str, Any]) -> tuple[np.ndarray, float]:
         state = np.asarray(request.get("state"), dtype=np.float32)
-        if state.shape != (MODEL_STATE_DIM,) or not np.isfinite(state).all():
-            raise ValueError(f"state must be finite [{MODEL_STATE_DIM}]")
+        if state.shape != (self.state_dim,) or not np.isfinite(state).all():
+            raise ValueError(f"state must be finite [{self.state_dim}]")
         cameras = request.get("cameras")
         if not isinstance(cameras, dict) or set(cameras) != set(CAMERA_KEYS):
             raise ValueError(f"camera keys must be exactly {CAMERA_KEYS}")
@@ -356,10 +400,10 @@ class Runtime:
             result.ndim != 3
             or result.shape[0] != 1
             or result.shape[1] < MODEL_ACTION_HORIZON
-            or result.shape[2] != MODEL_ACTION_DIM
+            or result.shape[2] != self.action_dim
         ):
             raise RuntimeError(
-                "decoded GR00T action must be [1,>=16,38], "
+                f"decoded GR00T action must be [1,>=16,{self.action_dim}], "
                 f"got {result.shape}"
             )
         result = result[0, :MODEL_ACTION_HORIZON]
@@ -379,6 +423,7 @@ def main() -> int:
         model_repo_id=args.model_repo_id,
         model_revision=args.model_revision,
         task=args.task,
+        model_kind=args.model_kind,
     )
     send_message(
         sys.stdout.buffer,

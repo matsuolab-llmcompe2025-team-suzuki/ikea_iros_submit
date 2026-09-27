@@ -63,8 +63,10 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
   cd <USB>/hf_cache && find ./hub -type f ! -path './hub/.locks/*' -print0 | sort -z | xargs -0 shasum -a 256 > ../SHA256SUMS
   ```
 - [ ] **Thor の image**（無圧縮。Thor に zstd が無くても `docker load` だけで入る）
+  `<IMAGE>` は manifest の digest で pull した image を指定する。load では registry digest が失われる場合があるため、image ID も保存する。
   ```bash
   docker save -o <USB>/ikea-thor_<TAG>.tar <IMAGE>
+  docker image inspect <IMAGE> --format '{{.Id}}' > <USB>/IMAGE_ID.txt
   cd <USB> && shasum -a 256 ikea-thor_<TAG>.tar > SHA256SUMS.image
   ```
 - [ ] （任意）運営 package（`iacevaltest/iros_g1_orin_package`、手順の根拠）
@@ -79,7 +81,9 @@ USB は Thor に mount して使う（exFAT は Linux 5.7 以降なら標準で�
    docker images --digests | grep ikea-thor                 # manifest.yaml の images.thor の digest があれば load 不要
    cd <USB> && sha256sum -c SHA256SUMS.image                # 無いときだけ。USB の中身が壊れていないか
    docker load -i <USB>/ikea-thor_<TAG>.tar
+   test "$(docker image inspect <IMAGE> --format '{{.Id}}')" = "$(cat <USB>/IMAGE_ID.txt)"
    ```
+   load 後の `<IMAGE>` は読み込んだ tag または image ID を使う。`INSTRUCTIONS.md` の run コマンドも同じ参照へ置き換える。
 2. **重み**（image を使って、ネット無しで確かめる）
    ```bash
    docker run --rm -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \

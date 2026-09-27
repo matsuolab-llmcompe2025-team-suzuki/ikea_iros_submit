@@ -72,6 +72,135 @@ BODY_DOF = 29
 #: 会場の boundary で使える lane (`BoundaryActionSink(lane=...)` / `--boundary-lane`)
 BOUNDARY_LANES = ("pose", "joint")
 
+# 送る間隔と 1 回の行数 (Issue #172)。
+#
+# 運営 adapter は chunk の 1 行目を**実測の腕から ±max_joint_vel/chunk_hz** (既定 1.0/20 =
+# 0.05 rad) に切り詰め、残りの行は 1 行ごとに同じ幅だけ進める (`wbc_driver.py:_step_clamp`)。
+# 行は受け取った時刻から 1/chunk_hz (50 ms) おきに並ぶ。運営の実測では、負荷のかかった
+# 腕は指令から 0.05〜0.07 rad 遅れて止まる (CONTRACT.md の goto 節)。
+#
+# 1 tick ごと (30 Hz) に 1 行を送ると、毎回 1 行目 (実測 + 0.05) に向かい直すので、
+# 遅れが 0.05 を超えた腕は指令ごと下がっていく (運営の `_handle_joint` で模擬: 遅れ
+# 0.06 rad で 6 s に -0.74 rad)。行を増やしても 30 Hz のままでは 2 行目に届く前に次が来る。
+#
+# そこで (1) 目標が変わったときだけ、最短でも `publish_period_s` おきに送る、(2) 同じ目標を
+# `chunk_rows` 行並べて、WBC が 2 行目以降 (目標) まで進めるようにする、(3) 目標が
+# 変わらない間は送らない (adapter の keepalive が最後の行 = 目標を保持し、実測へ向かい
+# 直さない)。取りこぼしに備えて `hold_refresh_s` おきには送り直す。歩行指令が変わったとき
+# (止めるとき) は間隔を待たずにすぐ送る。
+#
+# 既定 (1 行・毎回) は従来どおり。会場の起動 (`entrypoint`) は CLI の既定で新しい送り方にする。
+DEFAULT_PUBLISH_PERIOD_S = 0.0
+DEFAULT_CHUNK_ROWS = 1
+DEFAULT_HOLD_REFRESH_S = 0.0
+# 30 Hz の tick は 33.3 ms おきなので、100 ms の間隔が浮動小数で 1 tick ずれないようにする。
+_PUBLISH_PERIOD_TOLERANCE_S = 0.005
+
+# 重力の垂れ補正で URDF の端ちょうどまで押さない幅 [rad]。運営 adapter は端の 1e-3 内側へ
+# 寄せ、0.01 を超える寄せを「範囲外の指令」として数えて log に出す。
+_GRAVITY_OFFSET_LIMIT_MARGIN_RAD = 0.005
+
+
+class ArmGravitySagOffset:
+    """運営 WBC (PD だけ、重力補償なし) で腕が重力で下がる分を、送る関節角に足す (Issue #172)。
+
+    PD の関節は ``Kp (q_cmd − q) = τ_g(q)`` で止まるので、``q_cmd = q_target + τ_g(q_target)/Kp``
+    を送れば実測 ≒ q_target になる。トルクで見るとラボ (SDK 経路) の重力 FF
+    (``lowcmd.tau = τ_g``) と同じで、学習データ (Dataset B、実測 ≒ 指令) の条件にも揃う。
+    背景と値の出どころは ``skill_config.yaml`` の ``boundary_gravity_offset``。
+
+    Args:
+        torque_fn: 腕 14-D → 重力を支えるトルク 14-D [Nm] (``OfficialG1ArmGravityCompensator.torque_nm``)。
+        wbc_arm_kp: 運営 WBC の腕の kp 14-D (左 7 + 右 7)。
+        scale: 会場で測った垂れに合わせる倍率 (1.0 = kp どおり)。
+        max_offset_rad: 1 関節の補正の上限。
+    """
+
+    def __init__(
+        self,
+        torque_fn: Callable[[np.ndarray], np.ndarray],
+        wbc_arm_kp: Sequence[float],
+        *,
+        scale: float = 1.0,
+        max_offset_rad: float = 0.12,
+    ) -> None:
+        kp = np.asarray(wbc_arm_kp, dtype=np.float64).reshape(-1)
+        if kp.shape != (14,) or not np.all(np.isfinite(kp)) or np.any(kp <= 0.0):
+            raise ValueError(f"wbc_arm_kp must be 14 positive values, got {kp}")
+        scale = float(scale)
+        if not (np.isfinite(scale) and scale >= 0.0):
+            raise ValueError(f"gravity offset scale must be finite and >= 0, got {scale}")
+        max_offset_rad = float(max_offset_rad)
+        if not (np.isfinite(max_offset_rad) and max_offset_rad > 0.0):
+            raise ValueError(f"max_offset_rad must be > 0, got {max_offset_rad}")
+        from inference.desktop.lower_policy.actuators.g1_arm_sdk import (
+            G1_ARM_POSITION_LOWER_RAD,
+            G1_ARM_POSITION_UPPER_RAD,
+        )
+
+        self._torque_fn = torque_fn
+        self._kp = kp
+        self._scale = scale
+        self._max_offset_rad = max_offset_rad
+        self._lower = G1_ARM_POSITION_LOWER_RAD + _GRAVITY_OFFSET_LIMIT_MARGIN_RAD
+        self._upper = G1_ARM_POSITION_UPPER_RAD - _GRAVITY_OFFSET_LIMIT_MARGIN_RAD
+
+    @classmethod
+    def from_config(cls, skill_config: dict, *, scale: float = 1.0) -> "ArmGravitySagOffset":
+        """``skill_config.yaml`` の ``boundary_gravity_offset`` と、ラボの重力 FF と同じ model から作る。"""
+        section = skill_config.get("boundary_gravity_offset")
+        if not isinstance(section, dict):
+            raise ValueError("skill_config.boundary_gravity_offset is missing")
+        unknown = sorted(set(section) - {"wbc_arm_kp", "max_offset_rad"})
+        if unknown:
+            raise ValueError(f"boundary_gravity_offset has unknown keys: {unknown}")
+        kp7 = np.asarray(section.get("wbc_arm_kp"), dtype=np.float64).reshape(-1)
+        if kp7.shape != (7,):
+            raise ValueError(
+                "boundary_gravity_offset.wbc_arm_kp must list 7 values "
+                "(shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw; both arms)"
+            )
+        from inference.desktop.lower_policy.gravity_compensation import (
+            OfficialG1ArmGravityCompensator,
+        )
+
+        model = OfficialG1ArmGravityCompensator.from_default_urdf()
+        return cls(
+            model.torque_nm,
+            np.concatenate([kp7, kp7]),
+            scale=scale,
+            max_offset_rad=float(section.get("max_offset_rad", 0.12)),
+        )
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    def describe(self) -> str:
+        return (
+            f"kp={self._kp[:7].tolist()} (both arms) scale={self._scale:g} "
+            f"max={self._max_offset_rad:g}rad"
+        )
+
+    def apply(self, arms14: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+        """(送る腕 14-D, 実際に足した量 14-D)。
+
+        補正で URDF の範囲の外へ出る分は削る。policy の値が既に範囲の外の関節には足さない
+        (範囲外の意図は、従来どおり運営 adapter が寄せて数える)。
+        """
+        arms = np.asarray(arms14, dtype=np.float64).reshape(-1)
+        if arms.shape != (14,) or not np.all(np.isfinite(arms)):
+            raise ValueError("gravity offset input must be finite arms[14]")
+        torque = np.asarray(self._torque_fn(arms), dtype=np.float64).reshape(-1)
+        if torque.shape != (14,) or not np.all(np.isfinite(torque)):
+            raise RuntimeError("gravity model returned an invalid torque vector")
+        offset = np.clip(
+            self._scale * torque / self._kp, -self._max_offset_rad, self._max_offset_rad
+        )
+        inside = (arms >= self._lower) & (arms <= self._upper)
+        command = np.where(inside, np.clip(arms + offset, self._lower, self._upper), arms)
+        return command, command - arms
+
 # EE の計算に使う腰角を更新する閾値 [rad] (Issue #164)。
 #
 # 運営 IK (`wbc_adapter/ik.py` の `PinkArmIK.solve`) は、目標が前回と完全に同じ
@@ -430,6 +559,13 @@ class BoundaryActionSink:
             `issued_at` を PC2 の時計と比べて 1.0 s より古い chunk を捨てるので、
             Thor で動かすときは送信時刻を PC2 の時計に揃える (Issue #161、C2-01)。
             None を返す間 (まだカメラが来ていない) は今までどおりこの host の時計。
+        publish_period_s: 目標が変わったときに送る最短の間隔 [s]。0 なら毎回送る
+            (従来)。理由は `DEFAULT_PUBLISH_PERIOD_S` の説明。
+        chunk_rows: 1 回に並べる同じ行の数 (1..64、adapter が実行するのは 16 行まで)。
+        hold_refresh_s: 目標が変わらない間に送り直す間隔 [s]。0 なら毎回送る (従来)。
+        clock: 間隔を測る単調時計 (test 用)。
+        gravity_offset: joint lane で送る腕に重力の垂れの分を足す (`ArmGravitySagOffset`)。
+            None なら足さない (従来)。pose lane では使えない。
     """
 
     def __init__(
@@ -443,9 +579,28 @@ class BoundaryActionSink:
         ee_frame_transform: Optional[np.ndarray] = None,
         log_fn: Any = None,
         sender_clock_offset_fn: Optional[Callable[[], Optional[float]]] = None,
+        publish_period_s: float = DEFAULT_PUBLISH_PERIOD_S,
+        chunk_rows: int = DEFAULT_CHUNK_ROWS,
+        hold_refresh_s: float = DEFAULT_HOLD_REFRESH_S,
+        clock: Callable[[], float] = time.monotonic,
+        gravity_offset: Optional[ArmGravitySagOffset] = None,
     ) -> None:
         if lane not in BOUNDARY_LANES:
             raise ValueError(f"lane must be one of {BOUNDARY_LANES}, got {lane!r}")
+        if gravity_offset is not None and lane != "joint":
+            raise ValueError("the gravity sag offset applies to the joint lane only")
+        publish_period_s = float(publish_period_s)
+        hold_refresh_s = float(hold_refresh_s)
+        if not (np.isfinite(publish_period_s) and publish_period_s >= 0.0):
+            raise ValueError(f"publish_period_s must be finite and >= 0, got {publish_period_s}")
+        if not (np.isfinite(hold_refresh_s) and hold_refresh_s >= 0.0):
+            raise ValueError(f"hold_refresh_s must be finite and >= 0, got {hold_refresh_s}")
+        if hold_refresh_s and hold_refresh_s < publish_period_s:
+            raise ValueError("hold_refresh_s must be 0 or >= publish_period_s")
+        if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int):
+            raise ValueError(f"chunk_rows must be an int, got {chunk_rows!r}")
+        if not 1 <= chunk_rows <= 64:
+            raise ValueError(f"chunk_rows must be in [1, 64] (contract T <= 64), got {chunk_rows}")
         if lane == "pose":
             if fk is None:
                 from inference.desktop.perception.g1_urdf_fk import (
@@ -474,6 +629,15 @@ class BoundaryActionSink:
         self._sender_clock_offset_fn = sender_clock_offset_fn
         self._sink = sink_class(port=port, host=host)
         self._sent = 0
+        self._publish_period_s = publish_period_s
+        self._chunk_rows = chunk_rows
+        self._hold_refresh_s = hold_refresh_s
+        self._clock = clock
+        # 最後に publish した 1 行と時刻 (送るかどうかの判定に使う)
+        self._last_row: Optional[np.ndarray] = None
+        self._last_publish_at: Optional[float] = None
+        self._gravity_offset = gravity_offset
+        self._gravity_offset_error_logged = False
         # EE の計算に使っている腰角 (EE_WAIST_REFRESH_RAD 以上動いたときだけ更新)。
         self._ee_waist: Optional[np.ndarray] = None
         # 運営 IK の可動域へ寄せた回数 (clamp_arms_to_organizer_ik)。
@@ -494,6 +658,22 @@ class BoundaryActionSink:
                 ),
                 file=sys.stderr,
             )
+        if lane == "joint":
+            print(
+                "[boundary] gravity sag offset: "
+                + ("off" if gravity_offset is None else f"on ({gravity_offset.describe()})"),
+                file=sys.stderr,
+            )
+        print(
+            f"[boundary] publish: {chunk_rows} row(s) per chunk, "
+            + (
+                f"on change at most every {publish_period_s:g}s, "
+                f"hold refresh every {hold_refresh_s:g}s"
+                if publish_period_s or hold_refresh_s
+                else "every call"
+            ),
+            file=sys.stderr,
+        )
 
     @property
     def lane(self) -> str:
@@ -509,8 +689,22 @@ class BoundaryActionSink:
         body_q29: Sequence[float],
         *,
         navigate_cmd: Sequence[float] = (0.0, 0.0, 0.0),
-    ) -> None:
-        """1 tick 分の 19-D action を (1,25) (pose) か (1,22) (joint) chunk として publish する。"""
+        force: bool = False,
+        state_stale: bool = False,
+    ) -> bool:
+        """1 tick 分の 19-D action を (T,25) (pose) か (T,22) (joint) chunk として出す。
+
+        同じ行を `chunk_rows` 行並べ、`_publish_reason` が送ると決めたときだけ publish する
+        (理由は `DEFAULT_PUBLISH_PERIOD_S` の説明)。送らなかった目標も捨てたわけではなく、
+        次に送るときの判定は最後に**送った**行と比べるので、間隔が来たら送られる。
+
+        Args:
+            force: 間隔・変化に関係なく送る。
+            state_stale: `body_q29` が最後に届いた古い実測 (記録にだけ残す)。
+
+        Returns:
+            この呼び出しで publish したか。
+        """
 
         navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
         if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
@@ -519,6 +713,13 @@ class BoundaryActionSink:
             chunk, record = self._joint_chunk(action19, body_q29, navigation)
         else:
             chunk, record = self._pose_chunk(action19, body_q29, navigation)
+        row = np.asarray(chunk[0], dtype=np.float64)
+        now = float(self._clock())
+        reason = "force" if force else self._publish_reason(row, navigation, now)
+        if reason is None:
+            return False
+        if self._chunk_rows > 1:
+            chunk = np.repeat(np.asarray(chunk)[:1], self._chunk_rows, axis=0)
         # 送信時刻を運営 adapter の時計 (PC2) に揃える。推定がまだ無ければ
         # sink の既定 (この host の time.time()) のまま。
         offset = (
@@ -533,11 +734,19 @@ class BoundaryActionSink:
         else:
             self._sink.send_chunk(chunk, issued_at=issued_at)
         self._sent += 1
+        self._last_row = row.copy()
+        self._last_publish_at = now
         if self._log_fn is not None:
             self._log_fn(
                 {
                     "seq": self._sent,
                     **record,
+                    "chunk_rows": int(np.asarray(chunk).shape[0]),
+                    "publish_reason": reason,
+                    # この host の単調時計 (保持中の実測の流れを後で時間で見る:
+                    # evaluate/model_evaluation/tools/check_boundary_hold.py)
+                    "monotonic_ns": time.monotonic_ns(),
+                    "state_stale": bool(state_stale),
                     # None = この host の時計で付けた (送信側の時計の差がまだ無い)。
                     "issued_at": issued_at,
                     "sender_clock_offset_s": offset,
@@ -550,6 +759,25 @@ class BoundaryActionSink:
                     ).tolist(),
                 }
             )
+        return True
+
+    def _publish_reason(
+        self, row: np.ndarray, navigation: np.ndarray, now: float
+    ) -> Optional[str]:
+        """この行を今送るなら理由、送らないなら None。"""
+        if self._last_row is None or self._last_publish_at is None:
+            return "first"
+        since = now - self._last_publish_at
+        # 歩行指令 ((T,25)/(T,22) とも [18:21]) の変化、特に停止は待たずに送る。
+        if not np.array_equal(self._last_row[18:21], navigation):
+            return "navigate_changed"
+        if not np.array_equal(self._last_row, row):
+            if since >= self._publish_period_s - _PUBLISH_PERIOD_TOLERANCE_S:
+                return "changed"
+            return None
+        if since >= self._hold_refresh_s - _PUBLISH_PERIOD_TOLERANCE_S:
+            return "hold_refresh"
+        return None
 
     def _pose_chunk(
         self,
@@ -606,14 +834,43 @@ class BoundaryActionSink:
         action38 = assemble_action38(
             np.asarray(action19, dtype=np.float64).reshape(-1).copy(), body_q29
         )
+        arms = slice(7 + 15, 7 + 29)  # root7 + body29 の腕 14-D
+        intent = action38[arms].copy()
+        offset = np.zeros(14, dtype=np.float64)
+        offset_error: Optional[str] = None
+        if self._gravity_offset is not None:
+            try:
+                command, offset = self._gravity_offset.apply(intent)
+                action38[arms] = command
+            except Exception as exc:  # noqa: BLE001 - 補正が出せなくても従来の値で送る
+                offset = np.zeros(14, dtype=np.float64)
+                offset_error = f"{type(exc).__name__}: {exc}"
+                if not self._gravity_offset_error_logged:
+                    self._gravity_offset_error_logged = True
+                    print(
+                        f"[boundary] gravity sag offset failed ({offset_error}); "
+                        "publishing the policy's joint angles without it",
+                        file=sys.stderr,
+                    )
         row = action38_to_joint_row(action38, navigate_cmd=navigation)
-        return row[None, :], {
+        record = {
             "event": "boundary_joint",
             # hand 列は「掴んだか」の一次証拠。-1=open / +1=closed。
             "left_hand": row[0:2].tolist(),
             "right_hand": row[2:4].tolist(),
             "joint_22": row.tolist(),
         }
+        if self._gravity_offset is not None:
+            # joint_22 の腕 = arms_intent + gravity_offset_rad。保持中の「送った腕 − 実測」と
+            # 補正量の比が、会場の kp に合った倍率 (check_boundary_hold.py が出す)。
+            record.update({
+                "arms_intent": intent.tolist(),
+                "gravity_offset_rad": offset.tolist(),
+                "gravity_offset_scale": self._gravity_offset.scale,
+            })
+            if offset_error is not None:
+                record["gravity_offset_error"] = offset_error
+        return row[None, :], record
 
     def _stabilize_waist(self, action19: Sequence[float]) -> np.ndarray:
         """腰角 [0:3] を、`EE_WAIST_REFRESH_RAD` 以上動くまで前回の値に据え置く。

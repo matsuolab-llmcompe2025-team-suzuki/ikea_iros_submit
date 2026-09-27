@@ -169,15 +169,14 @@ class Phase3RuleCommand:
     complete: bool
     failure_reason: str | None
     arm_target: np.ndarray | None
-    # 段の締め切りまでに目標へ届かなかった (故障ではない)。pick を終えて次へ進む。
+    # 旧APIとの互換フィールド。本番操作では時間切れによる強制遷移を行わない。
     timeout_reason: str | None = None
 
 
 class Phase3RuleController:
     """Observation-driven post-carry FSM.
 
-    段の時間切れは ``timeout_reason`` で返し、pick を終えて次の skill へ進ませる
-    (次へ進む道は完了と時間切れだけ、止めるのは人)。
+    本番操作では実測到達でのみ次の段へ進み、時間切れによる強制遷移は行わない。
     """
 
     def __init__(
@@ -314,7 +313,6 @@ class Phase3RuleController:
             self._check_supporting_grasp(hand_state, previous_hand_command)
         if self._failure_reason is not None:
             return self._command(now)
-        timing = self.cfg.timings[self._stage]
         elapsed = now - self._stage_t0
         arm = _finite_vector(arm_state, 14, "phase3 arm state")
         velocity = (
@@ -342,21 +340,6 @@ class Phase3RuleController:
         ):
             self._capture_grasp_hold(hand_state)
             self._advance(now, left, right, arm)
-        elif elapsed > timing.timeout_sec:
-            detail = self._timeout_detail(
-                left,
-                right,
-                hand_state,
-                previous_hand_command,
-                arm,
-                velocity,
-                previous_arm,
-                insert_target_ee,
-            )
-            self._timeout_reason = (
-                f"phase3 rule stage {self._stage.value!r} timed out after "
-                f"{elapsed:.2f}s{detail}"
-            )
         return self._command(now)
 
     def _capture_grasp_hold(self, hand_state: np.ndarray) -> None:

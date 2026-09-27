@@ -103,6 +103,26 @@ hand_pre_motion:
   # 学習データの開度基準 4.5 rad は初期把持幅・policy 出力専用で、全開目標ではない。
   open_rad: 5.4
 
+# 会場 (boundary の joint lane) の腕の重力の垂れ補正 (Issue #172)。
+#   運営 WBC は腕を PD だけで動かす (重力補償なし。実機経路は常に tau=0 を送る:
+#   GR00T-WholeBodyControl `decoupled_wbc/control/envs/g1/g1_env.py` の queue_action)。
+#   負荷のかかった関節は指令から「重力トルク / kp」だけ下がって止まり、各 policy の
+#   開始姿勢で 0.056〜0.068 rad (主に肘)。学習データ (Dataset B の静止 frame で
+#   desired − current の中央値 |≤0.011| rad) とラボ (SDK 経路の重力 FF) では実測 ≒ 指令
+#   なので、送る関節角に「重力トルク / kp」を足して揃える (トルクで見るとラボの
+#   重力 FF と同じ)。重力トルクはラボの FF と同じ model (Dex1 込みの URDF)。
+#   起動の `--boundary-gravity-offset off` で切れる。`--boundary-gravity-offset-scale` は
+#   会場で測った垂れに合わせる倍率 (evaluate/model_evaluation/tools/check_boundary_hold.py
+#   が提案値を出す)。
+boundary_gravity_offset:
+  # 運営 WBC の腕の MOTOR_KP (左右同じ。shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw)。
+  # GR00T-WholeBodyControl b042411 `decoupled_wbc/control/main/teleop/configs/
+  # g1_29dof_gear_wbc.yaml`。会場の PC2 の同じファイルと照合すること。
+  wbc_arm_kp: [100, 100, 40, 40, 20, 20, 20]
+  # 1 関節の補正の上限 [rad]。開始姿勢の予測は最大 0.068、可動域全体 (2 万姿勢の探索) でも
+  # 腕だけの重さでは最大 0.078。scale を 1.5 まで上げても収まる幅にする。
+  max_offset_rad: 0.12
+
 skills:
   # SetupSkill: entrypoint 起動直後に腕を安全 clearance 姿勢へ持っていく (Issue #81)。
   # orchestrator の initial skill として dispatch され、指定 dwell 経過後に
@@ -235,11 +255,9 @@ skills:
       sustain_frames: 6
       stale_timeout_s: 1.0
     # 教師 (compute_skill_timeout.py、HARA task 5 1401ep) の p95 は 7.7 s。
-    # #137 の単体評価は 30 s 窓に合わせて 30 にしていたが、大会は stage ごとに
-    # 3 分なので、回り切らない rotate に 30 s を使うと後続の pick / insert /
-    # rotate_leg の機会が消える。p95 のすぐ上で切って次へ進める (ユーザー決定
-    # 2026-09-22)。単体評価で長く見たいときは run_skill の --max-seconds で上書きする。
-    max_seconds_hard: 10
+    # 本番の回転に 30 s まで許容する (2026-09-26 ユーザー指定)。Stage 2〜4 は
+    # 後続の pick / insert / rotate_leg の時間も必要なので、会場の残り時間を監視する。
+    max_seconds_hard: 30
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
     on_timeout: advance
@@ -500,8 +518,9 @@ skills:
     # Physical flip-table policies own arms14 + Dex1 only.  Regular Mode owns
     # waist/legs and must not receive the checkpoint's observed waist slots.
     dispatch_waist: false
-    # baseline near-success は約45s。終盤動作と安定化のため60sまで許容する。
-    max_seconds_hard: 60
+    # baseline near-success は約45s。本番では 180s まで許容する
+    # (2026-09-26 ユーザー指定)。会場の 3 分/run には初期化・終了動作も含まれ得る。
+    max_seconds_hard: 180
     # 時間切れの動き (Issue #141 束 1-13 / D4)。advance = 次の skill へ進む (既定)、
     # stop = そこで止める。秒数は上の max_seconds_hard。
     on_timeout: advance
@@ -559,8 +578,16 @@ skills:
     # Explicit comparisons with n17_4 must restore that artifact's own
     # flip_table_4 pose/range instead of inheriting the Phase 3 baseline.
     variant_profiles:
+      # The original near-success runner used G1EefForwardKinematics with
+      # TOOL_TRANSLATION_M=(0.05, 0, 0) on both wrist_yaw_link frames.
+      # This changes observation.state EEF positions only; joint targets,
+      # Dex1 commands, teacher range and Regular ownership are unchanged.
+      groot_flip_table_n17_2_legacy_fk:
+        wrist_tool_offset:
+          left: [0.05, 0.0, 0.0]
+          right: [0.05, 0.0, 0.0]
       groot_flip_table_n17_4:
-        max_seconds_hard: 37
+        max_seconds_hard: 180
         on_timeout: advance
         teacher_joint_range:
           margin_rad: 0.02

@@ -5,6 +5,14 @@
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
+**更新状況（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
+ARM64 [CI run 36264063035](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36264063035)
+が build/import・重力補償 probe を通過した（build commit `56c69c5`）。digest は `manifest.yaml` に固定。
+GHCR認証後、digest固定でGB10へ取得し、4環境のGPU演算、全Stageのpreflight、全11構成の
+model forward、操作・故障注入を確認済み。詳細と追加検証の状況は
+[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照。
+§6の測定結果は旧`rebuild4`の履歴。GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
+
 ## 1. なぜ GB10 か
 
 - 提出 image は **arm64**（Thor 用）。RunPod の GPU は全部 x86 なので、image が動かない（2026-09-24 に確認）。
@@ -22,7 +30,7 @@
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
 | `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
 | 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
-| `--actuate` の経路: Enter 1 → go-live 待ち（指令の publish・実測の関節の読み取り）→ Ctrl+C の後始末 | go-live の先（模擬の PC2 は指令に従わないので go-live は成立しない） |
+| `--actuate` の経路: Enter 1 → go-live 待ち → 安全停止の判断待ち / Ctrl+C → 後始末 | 実機が指令へ追従すること（mock の sin 波で go-live が誤成立する場合がある） |
 | conformance | |
 
 4-6 の run 以外は `--actuate` を付けないので、指令は 1 通も出ない（起動確認だけで終わる）。4-6 の run も、
@@ -126,15 +134,17 @@ strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は 
 ### 4-6 `--actuate` の経路
 
 `ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）が
-出てからその秒数だけ待って、python に Ctrl+C（SIGINT）を送る。外向きの接続は 4-5 で見たので strace は付けない。
+出てからその秒数だけ待つ。安全停止で「判断待ち」なら Enter で戻し動作を承認し、それ以外は
+自分の擬似端末へ Ctrl+C を送る。外向きの接続は 4-5 で見たので strace は付けない。
+**この自動承認は mock 専用。実機で run_stage.sh を使わない。**
 
 模擬の PC2 の関節は指令と関係なく sin 波で動くので、go-live 待ちは「ついてきた」と成立してしまい、その先の
 準備動作（腕を動かす）は指令に従わないので時間切れになる。見るのは、そこまでに指令の経路（実測の関節の読み取り・
 到達の誤差（joint lane は関節角の `joint_error`、pose lane は運営 IK と同じ URDF での手先の `ee_pos_error`）・
 publish・後始末）がコードの誤り無しに動くこと。
-- Stage 5: 開始姿勢（時間切れ）→ Enter 2 の問いで Ctrl+C → 後始末（腕を下ろせず諦める）→ rc=0。
-  Enter 2 の問いが `[gate] WARNING: … initial arm pose is NOT reached (…)` であること（本体 `9849a17` 以降）
-- Stage 0: 腕を下ろす準備動作が時間切れ → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
+- Stage 1〜5: 開始姿勢（時間切れ）→ 安全停止・判断待ち → Enter 承認 → 後始末 → rc=2。
+  `[safety-stop] operator transition … did not reach its target` と判断待ち・承認の両 log があること。
+- Stage 0: 腕を下ろす準備動作が時間切れ → 判断待ち → Enter 承認 → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
   `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
 - `actuate5_pose_clamp`: `[boundary] wrist_roll clamp: on …`。`actuate0_converged`: `[init] walk latch check = converged (cli)`
   （模擬の PC2 では下ろす動きが収束しないので、終わり方は Stage 0 と同じ設計どおりの停止）
@@ -165,7 +175,8 @@ curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/a
   候補（`stage*_all6`）と DP（`stage2_dp`）も同じ
 - `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、log にコードの誤り（`NameError` など。
   後始末は例外を握って `[return] failed: …` と出すので、名前で見る）が無い。終わり方は Ctrl+C（rc 0 か 130）か
-  4-6 の設計どおりの停止（`RuntimeError: … did not converge`、rc=1）。それ以外の例外は不合格
+  4-6 の設計どおりの停止（Stage 0 の rc=1、Stage 1〜5 の安全停止 rc=2）。
+  安全停止では判断待ちと操作者の応答が必須。それ以外の例外は不合格
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
@@ -221,3 +232,69 @@ GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後�
 重み 3 分・stage の起動 30〜40 分（4-5・4-6 の全部）で、合わせて 45 分〜1 時間。host によっては回線の従量料金が
 時間料金より大きい（2026-09-26 のハンガリーの host は約 45 分で $3.0。スペインの host は約 1.1 時間で $0.99）。
 借りる前に offer の `inet_down_cost`（1 GB あたり）を見る。2026-09-25 の初回は $0.90（不具合の調査を含む）。
+
+## 8. rebuild5 の拡張検証と提出判断
+
+rebuild5 の実測記録は [GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) を参照。
+実機なしのソフトウェア検証を完了し、2026-09-27にユーザーからmainへのマージ承認を受けた。
+通信断時の歩行速度保持（Issue #14）はユーザー指示により今回の修正・マージ対象外とする。
+未解決の既知事項と会場確認項目は残す。マージ承認を全故障ケースの合格や実機安全性の保証として扱わない。
+
+| 項目 | 必須証拠 | rebuild5 状態 |
+|---|---|---|
+| image 同一性 | manifest digest、image ID、RAMEN_SOURCE.txt、CPU/GPU/driver/空き容量 | 確認済み。vendor 300 file の SHA-256 一致 |
+| 4 Python 環境 | check_envs.sh の成功終了、CUDA bf16 演算の有限値、各環境の版 | 4 環境で成功 |
+| 重みと offline | 全既定・候補・DP の cache 検査、実行時の外向き接続 0 件 | cache検査成功。全Stage連続実行と11構成990callのstraceで外向きconnect 0件 |
+| 全 Stage | **0/1/2/3/4/5 を省略せず**既定の joint lane で起動。4 RGB・関節・Dex1 の入力記録 | 全 Stage の明示的 preflight 完了を確認 |
+| 実モデル forward | RAMEN-Ori、GR00T 53D、pick worker、DP、YOLO、VLM の実推論・有限出力・所要時間。validate_load_and_release だけでは合格にしない | 11 構成 x 90 call、VLM の起動時 self-check 成功 |
+| 代替経路 | all6_400k、pose lane、wrist clamp、walk-lowering option を個別記録 | Stage 2 all6/DP、Stage 5 all6/pose/clamp、Stage 0 converged の preflight 成功 |
+| joint の送信契約 | 実 socket で chunk を受信し、shape、有限値、hand 範囲、base height、joint 順序、時刻・周期を検査 | 模擬 socket の 16 行、nav=0、height=0.74、時刻単調性を確認。関節順序は回帰 test。PC2 の実時計は未確認 |
+| 操作遷移 | 対話端末で Enter/N/R、retry、保持、Ctrl+C、再起動を検査 | retryに加え、Stage 0→5の16区間を各30秒実行し、Enter/N/保持/正常終了を確認。各試験で独立再起動 |
+| 運営adapter | 指定revisionの公式回帰と提出packetの非作動再生 | 公式84件成功。全Stageの記録5,298packetの行を再生し、拒否・clamp 0、腕/Dex1/nav/高さの対応一致 |
+| client/transport消失 | 非ゼロnav送信後、全clientが消えた場合の停止挙動 | **自動停止を確認できない**。運営adapterが最後のnavを保持することを再現。Issue #14で運営確認が必要 |
+| 故障注入 | camera/state 途絶、worker 異常、未到達を区別し、停止時の nav=0、最後の arm/hand target 保持、判断待ちを記録 | 4 ケースで判断待ちを確認。未到達 mock は戻しも非収束。実 WBC の保持・歩行からの制動は未確認 |
+| 長時間実行 | 同じ方策を継続実行し、異常・メモリ増加・正常停止を検査 | flipを600秒実行して正常終了。元packet 5,306件の運営adapter再生も成功 |
+| 負荷と後始末 | 最大 GPU 使用量、最小 MemAvailable、終了後の worker/VLM/socket 残留なし | 全Stage連続で最大49.46 GiB、最小空き31.99 GiB。10分soakはGPU 7.12 GiBで安定。残留なし、証拠回収・検証instance削除済み |
+
+### 検証データの扱い
+
+- 各 run に image/source の識別子、コマンド、開始・終了時刻、終了コード、全ログ、合否理由を保存する。
+- 合成画像や指令追従 mock は配線・実行系の検査に限る。タスク成功や本物の WBC の安定性の証拠にしない。
+- 関節を sin 波で動かす標準 mock の go-live 成立は追従確認の証拠ではない。model load、実推論、操作遷移を別々に判定する。
+- 外部ホストへロボット指令は送らない。自動 Enter/actuate は実機と隔離した検証用環境のみで行う。
+- 問題を修正して image 入力が変わった場合は再ビルドし、新 digest で必要試験を再実施する。
+- GB10 の sm_121 では Thor の sm_110、実カメラ、DDS、WBC、実機接触を保証できない。未確認事項を明記して接続試験へ渡す。
+
+手元の検証ツール回帰: `tests/test_gb10_envs.py` の 5 件が成功。
+従来の check_envs.sh は command substitution の失敗を echo が隠していたが、各環境の失敗を非ゼロ終了として返すよう修正済み。
+これは **GB10 での GPU 実測ではない**。
+
+### 追加の検証ツール
+
+`tools/gb10/` は image に含めず、隔離した GB10 container へ別途転送する。
+`forward_matrix.py` は `policy_config.yaml` の既定・variant set と DP を順番に実推論する。
+`operator_probe.py` は Enter/R/N と camera/state/worker 故障を、loopback の
+`following_mock.py` と `wire_probe.py` で検査する。後者は物理 simulator ではない。
+`--case full`はStage 0→5の全16 policy区間を操作者のNで進める配線試験であり、
+VLMによる把持判定や物理的な組立完了を証明するものではない。
+
+```bash
+# GB10 container の /app/ramen で実行。helper 一式を /root へ転送済みであること。
+pixi run --as-is -e runtime python /root/forward_matrix.py --output /root/runs/forwards
+pixi run --as-is -e runtime python /root/operator_probe.py --case retry --output /root/runs/retry
+pixi run --as-is -e runtime python /root/operator_probe.py --case full --trace --dwell-seconds 30 --output /root/runs/full
+pixi run --as-is -e runtime python /root/operator_probe.py --case soak --trace --dwell-seconds 600 --output /root/runs/soak
+# 他の case: next / camera / state / worker。port/GPUを共有するので同時起動しない。
+```
+
+model forward は合成画像での実行可能性検査であり、タスク成功率の評価ではない。
+`summarize.py` の `外向き通信: 未検査` は通信ゼロの証拠に数えない。
+Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace不在・空の記録を不合格にする。
+`strace`等の追加導入は`/install`の確認・承認後に隔離検証環境だけで行う。
+
+`wire_probe.py`は元packetを長さ付き`.wire`と、解析用`.npz`へ保存する。
+`organizer_replay.py --organizer <checkout> --capture <wire.wire> --output <result.json>`は
+固定revisionの運営公式fixtureを使用してWBC/Dex1のfake backendへ再入力する。ソケットは作らない。
+運営テスト依存とWBCの固定commit・LFS資産が必要（版は検証レポート参照）。
+実測姿勢をpacket先頭targetに設定し時刻だけ更新するため、実機追従誤差や実ホスト間の時計精度は検証しない。
+旧記録用`--rows-capture <wire.npz>`ではenvelopeを再構成するので、元wireそのものの試験とは区別する。

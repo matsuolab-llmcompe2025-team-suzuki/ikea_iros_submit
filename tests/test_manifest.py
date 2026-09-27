@@ -17,6 +17,8 @@ REGISTRY = "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor"
 
 def _thor() -> dict:
     manifest = yaml.safe_load((SUBMIT_ROOT / "manifest.yaml").read_text())
+    assert manifest["lane"] == "joint"
+    assert "--lane decoupled" in manifest["organizer_stack_on_pc2"]["adapter_go_live"]
     return manifest["images"]["thor"]
 
 
@@ -33,6 +35,7 @@ def test_the_manifest_names_a_released_image() -> None:
 def test_the_venue_procedure_pulls_and_runs_the_manifest_digest() -> None:
     instructions = (SUBMIT_ROOT / "INSTRUCTIONS.md").read_text()
     assert "<DIGEST>" not in instructions
+    assert "__REBUILD" not in instructions
     pinned = re.findall(rf"{re.escape(REGISTRY)}@(sha256:[0-9a-f]+)", instructions)
     assert len(pinned) >= 2, pinned  # docker pull と docker run
     assert set(pinned) == {_thor()["digest"]}

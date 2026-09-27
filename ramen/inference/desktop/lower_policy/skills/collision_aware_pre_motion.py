@@ -838,6 +838,20 @@ class CollisionAwareArmPreMotionSkill(Skill):
         return tuple(waypoint.name for waypoint in self._waypoints)
 
     @property
+    def retreat_waypoints(self) -> tuple[np.ndarray, ...]:
+        """Already traversed startup targets, reversed, ending at its measured start.
+
+        The current unfinished target is deliberately omitted.  A Ctrl+C in
+        pre-motion must never continue toward a pose that was not reached.
+        """
+        if self._initial is None:
+            return ()
+        completed = self._targets[:-1] if self._complete else self._targets[:self._stage_index]
+        return tuple(target.copy() for target in reversed(completed)) + (
+            self._initial.copy(),
+        )
+
+    @property
     def failure_reason(self) -> str | None:
         return self._failure_reason
 

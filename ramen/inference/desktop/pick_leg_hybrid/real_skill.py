@@ -7,8 +7,8 @@ therefore keeps the same phase logic, but converts phase-2 Cartesian waypoints
 to 14 arm joints with the repository's tested G1 IK and then applies the same
 motion limiter used by every other real VLA skill.
 
-It never sends waist or leg targets.  VLM failure is fail-closed: phase 1 keeps
-running and cannot transition to phase 2.
+It never sends waist or leg targets. In the interactive Stage route, a missed
+VLM boundary does not force a phase transition; the operator may retry or stop.
 """
 
 from __future__ import annotations
@@ -276,7 +276,8 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
         )
         self._phase3_complete = False
         self._phase3_failure_reason: str | None = None
-        # 持ち替えの段が締め切りまでに届かなかった (故障ではない)。pick を終えて次へ。
+        # A rule-stage timeout is reported to the orchestrator so the next
+        # skill can start after the existing inter-skill pre-motion.
         self._phase3_timeout_reason: str | None = None
         self._phase3_ik_failing = False
         self._boundary = GraspBoundaryDetector(
@@ -314,7 +315,7 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
 
     @property
     def timeout_reason(self) -> str | None:
-        """持ち替えの段の時間切れ。orchestrator は時間切れとして次へ進む。"""
+        """Rule-stage timeout reported separately from verified completion."""
         return self._phase3_timeout_reason
 
     def _on_start(self, params: dict) -> None:
@@ -452,6 +453,7 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
         self._push_vlm_frame(obs)
 
         if phase is Phase.APPROACH_GRASP:
+            now = self._time_seconds(obs)
             hand_state_obj = obs.get("hand_state")
             hand_state = np.asarray(
                 getattr(hand_state_obj, "position_rad", hand_state_obj), dtype=np.float64
@@ -509,8 +511,17 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
                     file=sys.stderr,
                 )
             if decision.fire:
+                if self.last_action is not None:
+                    metadata = dict(self.last_action.metadata)
+                    metadata["hybrid_phase_transition"] = "approach_grasp_to_carry"
+                    metadata["hybrid_phase_transition_reason"] = "vlm_confirmed"
+                    self.last_action = PolicyAction(
+                        action_chunk=self.last_action.action_chunk,
+                        latency_ms=self.last_action.latency_ms,
+                        metadata=metadata,
+                    )
                 left, right = self._measured_ee(obs)
-                self._phase2.start(self._time_seconds(obs), left, right)
+                self._phase2.start(now, left, right)
                 self._hybrid_state.advance()
                 self._action_queue.clear()
                 self._action_queue_next_index = 0
@@ -578,6 +589,8 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
             target19 = self._motion_limiter.apply(
                 target=target19, measured=self._measured_19d(obs)
             )
+        if self._operator_interrupt_pending():
+            return self._last_safe_arm.copy()
         self._hand_actuator.send_action(target19[HAND_SLICE].tolist())
         arm = target19[ARMS_SLICE].astype(np.float64, copy=True)
         self._last_safe_arm = arm.copy()
@@ -597,7 +610,34 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
         )
 
         actual_left, actual_right = self._measured_ee(obs)
-        if not failures and self._phase2.reached(actual_left, actual_right):
+        # A nearby pose before the planned carry duration is not completion.
+        # On measured-Dex1 rigs also verify the supporting right grasp is
+        # still present before any transition to the left-hand handover.
+        hand_state_obj = obs.get("hand_state")
+        hand_state = np.asarray(
+            getattr(hand_state_obj, "position_rad", hand_state_obj), dtype=np.float64
+        )
+        right_grasp_ready = bool(
+            not self._hand_measured(obs)
+            or is_grasping(
+                hand_state, target19[HAND_SLICE], RIGHT, self._hybrid_cfg.interlock
+            )
+        )
+        reached = bool(
+            not failures
+            and right_grasp_ready
+            and self._phase2.progress(now) >= 1.0
+            and self._phase2.reached(actual_left, actual_right)
+        )
+        if reached:
+            metadata = dict(self.last_action.metadata)
+            metadata["hybrid_phase_transition"] = "carry_to_handover"
+            metadata["hybrid_phase_transition_reason"] = "measured_goal_reached"
+            self.last_action = PolicyAction(
+                action_chunk=self.last_action.action_chunk,
+                latency_ms=self.last_action.latency_ms,
+                metadata=metadata,
+            )
             self._hybrid_state.advance()
             # Discard the pre-MP chunk/temporal state, but retain the same loaded worker.
             # MotionLimiter は reset しない: 区間 3 は区間 2 の最後の指令から続ける。reset すると
@@ -704,8 +744,8 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
                 )
 
         # IK が解けないのは故障ではない (目標が腕の届く範囲の外)。直前の安全な腕
-        # target を保ったまま毎 tick 解き直し、段の締め切りで時間切れになれば次へ
-        # 進む。解けない tick は metadata の hybrid_ik_failures に残る。
+        # target を保ったまま毎 tick 解き直す。時間切れでは次へ進めない。
+        # 解けない tick は metadata の hybrid_ik_failures に残る。
         if failures and not self._phase3_ik_failing:
             print(
                 f"[hybrid] phase3 rule IK cannot reach the {command.stage.value} "
@@ -738,6 +778,8 @@ class RealPickLegHybridVlaSkill(PickTableLegVlaSkill):
             target19 = self._motion_limiter.apply(
                 target=target19, measured=measured19
             )
+        if self._operator_interrupt_pending():
+            return self._last_safe_arm.copy()
         self._hand_actuator.send_action(target19[HAND_SLICE].tolist())
         arm = target19[ARMS_SLICE].astype(np.float64, copy=True)
         self._last_safe_arm = arm.copy()

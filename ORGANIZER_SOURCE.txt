@@ -9,7 +9,7 @@ paths         : mocks/ conformance.py requirements.txt
 [package]
 source_repo   : https://github.com/iacevaltest/iros_g1_orin_package.git
 source_ref    : main
-source_commit : 609f61d1224a1e952eb5f265664bf491b1b1f77b
-committed_at  : 2026-09-24T22:53:07-05:00
-subject       : Merge pull request #2 from iacevaltest/claude/wbc-arm-init-joint-control-i9pw61
+source_commit : 497f3ab93e5baa706311daebd31c7a9798258450
+committed_at  : 2026-09-24T23:27:33-05:00
+subject       : Merge pull request #4 from iacevaltest/fix/head-camera-calibration-yaml
 paths         : boundary/

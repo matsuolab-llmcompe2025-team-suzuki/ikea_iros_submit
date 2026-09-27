@@ -237,6 +237,10 @@ def build_state_from_raw(raw: RawRobotState) -> np.ndarray:
 class _PickLegsWorkerClient:
     """Python 3.10 DDS runtime → isolated Python 3.12 GR00T worker."""
 
+    STATE_DIM = STATE_DIM
+    RAW_ACTION_DIM = ACTION_DIM
+    MODEL_KIND = "joint_absolute"
+
     def __init__(self, cfg: PolicyConfig) -> None:
         from inference.desktop.upper_policy.worker_protocol import (
             receive_message,
@@ -269,6 +273,8 @@ class _PickLegsWorkerClient:
             model_revision,
             "--task",
             DEFAULT_LANGUAGE_PROMPT,
+            "--model-kind",
+            self.MODEL_KIND,
         ]
         print(
             "[groot-pick] starting isolated low-memory Python 3.12 worker",
@@ -291,9 +297,9 @@ class _PickLegsWorkerClient:
             if not isinstance(ready, dict) or ready.get("type") != "ready":
                 raise RuntimeError(f"pick-leg worker did not become ready: {ready!r}")
             contract = ready.get("contract") or {}
-            if int(contract.get("state_dim", -1)) != STATE_DIM:
+            if int(contract.get("state_dim", -1)) != self.STATE_DIM:
                 raise RuntimeError(f"pick-leg worker state contract changed: {contract}")
-            if int(contract.get("decoded_action_dim", -1)) != ACTION_DIM:
+            if int(contract.get("decoded_action_dim", -1)) != self.RAW_ACTION_DIM:
                 raise RuntimeError(f"pick-leg worker action contract changed: {contract}")
             if int(contract.get("lower_body_command_dimensions", -1)) != 0:
                 raise RuntimeError("pick-leg worker may command the lower body")
@@ -410,8 +416,13 @@ class _PickLegsWorkerClient:
                 or int(response.get("request_id", -1)) != self._request_id:
             raise RuntimeError(f"unexpected pick-leg worker response: {response!r}")
         raw = np.asarray(response.get("actions"), dtype=np.float32)
-        if raw.ndim != 2 or raw.shape[1] != ACTION_DIM or not np.isfinite(raw).all():
+        if raw.ndim != 2 or raw.shape[1] != self.RAW_ACTION_DIM or not np.isfinite(raw).all():
             raise RuntimeError(f"invalid pick-leg action shape/value: {raw.shape}")
+        return self._decode_actions(raw, obs, float(response.get("inference_ms", 0.0)))
+
+    def _decode_actions(
+        self, raw: np.ndarray, obs: Observation, latency_ms: float,
+    ) -> PolicyAction:
         # 38D = root7 + body29 + hands2.  Only waist3 + arms14 + hands2 enter
         # the shared VlaSkill contract; dispatch flags still keep Regular Mode
         # as the sole lower-body/waist owner when requested.
@@ -420,7 +431,7 @@ class _PickLegsWorkerClient:
         )
         return PolicyAction(
             action_chunk=action,
-            latency_ms=float(response.get("inference_ms", 0.0)),
+            latency_ms=latency_ms,
             metadata={
                 "mode": "none",
                 "chunk_len": int(action.shape[0]),
