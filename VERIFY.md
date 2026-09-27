@@ -5,10 +5,16 @@
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
-**更新状況（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
+**更新状況:** 本体 `c73c922` の `20260927-insert-dp100k-01` を GHCR へ公開済み。
+[Arm64 CI run 36318545130](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36318545130)
+はビルド・pushに成功。新しいinsert Diffusion版のGB10・Thor/G1確認は**未実施**。
+以下のGB10実測は、insert GR00Tを使っていた**旧**rebuild5の履歴であり、新版の検証結果ではない。
+
+**旧版の検証（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
 ARM64 [CI run 36264063035](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36264063035)
-が build/import・重力補償 probe を通過した（build commit `56c69c5`）。digest は `manifest.yaml` に固定。
-GHCR認証後、digest固定でGB10へ取得し、4環境のGPU演算、全Stageのpreflight、全11構成の
+が build/import・重力補償 probe を通過した（build commit `56c69c5`）。旧版のdigestは
+[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照（現在の`manifest.yaml`は新版）。
+旧版をGHCR認証後にGB10へ取得し、4環境のGPU演算、全Stageのpreflight、全11構成の
 model forward、操作・故障注入を確認済み。詳細と追加検証の状況は
 [GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照。
 §6の測定結果は旧`rebuild4`の履歴。GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。

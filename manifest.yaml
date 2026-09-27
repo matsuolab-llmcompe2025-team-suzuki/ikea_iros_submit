@@ -9,7 +9,8 @@
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# Rebuild5 GB10 checks are recorded in GB10_REBUILD5_REPORT.md. Thor/G1 testing is still required.
+# The previous rebuild5 GB10 checks are recorded in GB10_REBUILD5_REPORT.md.
+# This insert-Diffusion image has passed the arm64 CI build, but not a new GB10/Thor/G1 test.
 # Client/transport loss is NOT certified as a safe stop: see Issue #14 and INSTRUCTIONS.md.
 # The adapter mode is decoupled; on it our arms go by default on the joint
 # lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
@@ -21,8 +22,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260927-rebuild5"
-    digest: "sha256:b58c2cd594955a092a7481a21f866577127c40f178748c64b9216d250a24939f"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260927-insert-dp100k-01"
+    digest: "sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
     run: >-
