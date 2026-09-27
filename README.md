@@ -1,5 +1,10 @@
 # Team RAMEN — IKEA IROS 提出物
 
+提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。image は検証済みの
+`20260927-rebuild5` を digest 固定で使用してください。重みの取得は [WEIGHTS.md](WEIGHTS.md)、
+会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、検証結果は
+[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md) を参照してください。
+
 ## Team RAMEN の部分と直す場所
 
 **推論のコードの正本は本体（`iros_2026_ramen`）。** この repo の `ramen/` は本体の 1 commit の写しで、
