@@ -208,6 +208,15 @@ POLICY_TYPE=diffusion \
 ./scripts/train_lerobot.sh
 ```
 
+To opt into lossless raw PNG frame caching, set `FRAME_CACHE_IMAGE_FORMAT=png`
+and `LEROBOT_FRAME_CACHE_ENABLE=true`. The shared launcher uses a separate
+`frame_cache_png/` directory and retains the source MP4s. For a precomputed
+cache, also set `FRAME_CACHE_ROOT_OVERRIDE=/path/to/frame_cache_png`,
+`FRAME_CACHE_PRECOMPUTE=false`, `FRAME_CACHE_NUM_VARIANTS=1`, and
+`FRAME_CACHE_STRICT=true`. Existing JPEG defaults and baked-overlay caches
+are unchanged. See the [generation and training guide](../../data/bitrobot_lerobot_subtask_datasets/docs/png_frame_cache.md)
+for completeness checks, compression/worker options, and limitations.
+
 Flow Matching behavior-cloning baseline for `flip_table`:
 
 ```bash

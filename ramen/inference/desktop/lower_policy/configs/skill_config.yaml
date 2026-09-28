@@ -39,9 +39,20 @@ motion_limits_default:
   hand_velocity_rad_s: 6.0
   hand_acceleration_rad_s2: 30.0
 
-# 頭の手順で腕を開始姿勢へ動かすときの共通値 (Issue #141 束 1-8 / D2)。
-#   衝突を避ける経路 (肩を後ろ → 横に開く → 前へ → 開始姿勢) を、速度・加速度を抑えて辿る。
-#   値は Issue #128 Phase 3 で実機確認した CollisionAwareArmPreMotionSkill の既定値。
+# Venue joint lane: one-shot official goto, not the SDK acceleration limiter.
+# The organizer uses chunk_hz=20 and a hard 15 s trajectory limit.
+boundary_preparation:
+  max_speed_rad_s: 0.3
+  max_goto_duration_s: 15.0
+  adapter_hz: 20.0
+  arrival_error_rad: 0.10
+  arrival_speed_rad_s: 0.05
+  arrival_dwell_s: 0.3
+  settle_grace_s: 5.0
+  state_max_age_s: 0.5
+  diagnostic_period_s: 1.0
+
+# SDK/pose lane follower; waypoint geometry is shared with venue joint goto.
 arm_pre_motion:
   velocity_limit_rad_s: 0.5
   acceleration_limit_rad_s2: 1.0
@@ -337,7 +348,7 @@ skills:
 
   # insert_table_leg: issue-70 の INSERT_LEG_OPTIMAL_FRAME0 転写。
   #   dataset: Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal (1510 ep)。
-  #   Model: groot_insert_leg_200k (200k step)。
+  #   本番既定 Model: insert_table_leg_diffusion_optimal_100k (100k step)。
   #   requires_separate_hand_initialization=true (leg が hand に入った状態が start、
   #   operator が起動前に物理的に leg を配置する必要あり)。
   insert_table_leg:

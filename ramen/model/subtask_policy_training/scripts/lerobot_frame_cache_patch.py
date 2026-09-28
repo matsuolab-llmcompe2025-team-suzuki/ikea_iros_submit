@@ -1,4 +1,4 @@
-"""LeRobot ``decode_video_frames`` の JPG frame cache monkey-patch (Issue #122)。
+"""LeRobot ``decode_video_frames`` の JPG/PNG frame cache monkey-patch。
 
 # 目的
 H.264 圧縮 mp4 の random access decode は per-frame 30-100ms かかり train iter の
@@ -10,8 +10,8 @@ decode を 10-30x 高速化する。
 - **0.6.0** (GR00T が pip install する PyPI 版): `decode_video_frames(path, ts, tol, backend=None,
   return_uint8=False, is_depth=False)`
 
-追加引数を ``**extra_kwargs`` で受け、特別 mode (``return_uint8``/``is_depth``) の時は
-fallback (元関数を呼ぶ) で挙動不変を保証。default RGB float32 mode でのみ cache を効かせる。
+追加引数を ``**extra_kwargs`` で受け、RGB float32 / uint8 を cache から返す。
+``is_depth`` の時は fallback (元関数を呼ぶ) で挙動不変を保証。
 
 # 使い方
 - 環境変数 ``LEROBOT_FRAME_CACHE_ENABLE=true`` を set
@@ -26,6 +26,12 @@ fallback (元関数を呼ぶ) で挙動不変を保証。default RGB float32 mod
             _frame_count.txt
             frame_000000.jpg
             ...
+
+PNG (Issue #168): explicit override root (通常 `<lerobot_root>/frame_cache_png`) の
+metadata `image_format="png"` なら `frame_XXXXXX.png` を読む。format 未記載は legacy
+JPG。PNG は raw (num_variants=1) のみ。`FRAME_CACHE_IMAGE_FORMAT` を明示した場合は
+metadata の形式と一致することを要求し、異なる形式の cache には fall through しない。
+PNG metadata は `complete=true` が必須。未完成 cache と破損 PNG は whole-call miss。
 
 # Fallback 段階
 1. env var 未設定 or false → 元関数
@@ -65,6 +71,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import random
 import threading
@@ -86,6 +93,8 @@ ENV_NUM_VARIANTS = "FRAME_CACHE_NUM_VARIANTS"
 # `<override_root>/<cam>/<chunk>/<file>/` に redirect する。
 # 空文字列 or 未設定 = 従来挙動 (video_path 由来)、backward compat 完全保持。
 ENV_ROOT_OVERRIDE = "FRAME_CACHE_ROOT_OVERRIDE"
+# Optional expectation only: absent means infer from the selected root's metadata.
+ENV_IMAGE_FORMAT = "FRAME_CACHE_IMAGE_FORMAT"
 # Issue #139: true で cache miss 時に mp4 decode へ落とさず RuntimeError にする。
 # 「学習中に video を読まない」を保証したい run (ACT / DP) 用。既定 off で従来挙動。
 ENV_STRICT = "FRAME_CACHE_STRICT"
@@ -239,6 +248,11 @@ def _get_root_override() -> Path | None:
     return Path(v.strip())
 
 
+def _get_expected_image_format() -> str | None:
+    value = os.environ.get(ENV_IMAGE_FORMAT, "").strip().lower()
+    return value or None
+
+
 def _derive_override_cache_dir(video_path: Path, override_root: Path) -> Path | None:
     """override_root 下に `<cam>/<chunk>/<file>/` subdir を join した path を return。
 
@@ -297,6 +311,16 @@ def _cache_dir_for_video_path(video_path: Path) -> Path | None:
             cd = _derive_override_cache_dir(cand, override_root)
             if cd is not None and cd.is_dir():
                 return cd
+        # An explicitly selected PNG cache is authoritative: an absent camera/file
+        # must not silently select a legacy JPEG directory from the source root.
+        # Keep historical missing-override fallback for legacy JPEG overrides.
+        meta = _cache_metadata(override_root)
+        if (
+            _get_expected_image_format() == "png"
+            or (meta is not None and meta.get("image_format", "jpg") != "jpg")
+            or (meta is None and (override_root / CACHE_META_NAME).is_file())
+        ):
+            return None
 
     # 通常 path 導出 (backward compat、override 無しの挙動)
     for cand in candidates:
@@ -307,6 +331,16 @@ def _cache_dir_for_video_path(video_path: Path) -> Path | None:
 
 
 @lru_cache(maxsize=None)
+def _cache_metadata(cache_root: Path) -> dict[str, Any] | None:
+    """Read selected-root metadata once; missing/malformed metadata is a cache miss."""
+    try:
+        meta = json.loads((cache_root / CACHE_META_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+@lru_cache(maxsize=None)
 def _cache_fps(cache_root: Path) -> float | None:
     """`<cache_root>/_cache_meta.json` から fps を読む (LRU cache、per cache root)。"""
     meta_path = cache_root / CACHE_META_NAME
@@ -314,10 +348,14 @@ def _cache_fps(cache_root: Path) -> float | None:
         return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
         return None
     fps = meta.get("fps")
-    if not isinstance(fps, (int, float)):
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)):
+        return None
+    if not math.isfinite(fps) or fps <= 0:
         return None
     return float(fps)
 
@@ -369,7 +407,20 @@ def _read_jpg_as_frame_tensor(
     return_uint8: bool = False,
     hook_context: tuple[Path, int] | None = None,
 ) -> torch.Tensor:
-    """JPG → torch.Tensor。default = RGB float32 CHW [0, 1] (元 decode_video_frames 出力に一致)、
+    """Backward-compatible JPEG entry point for the shared image/hook pipeline."""
+    return _read_image_as_frame_tensor(jpg_path, return_uint8, hook_context)
+
+
+class _PngDecodeError(RuntimeError):
+    """Image-load failure only; hook errors must not trigger cache fallback."""
+
+
+def _read_image_as_frame_tensor(
+    image_path: Path,
+    return_uint8: bool = False,
+    hook_context: tuple[Path, int] | None = None,
+) -> torch.Tensor:
+    """JPG/PNG → torch.Tensor。default = RGB float32 CHW [0, 1] (元 decode_video_frames 出力に一致)、
     ``return_uint8=True`` 時は uint8 CHW をそのまま返す
     (torchcodec の ``return_uint8=True`` 出力形式に一致、GR00T factory が要求)。
 
@@ -380,9 +431,16 @@ def _read_jpg_as_frame_tensor(
     # cv2 の import は一部 platform で libgl race するため lazy (multiprocess fork 前に触らない)
     import cv2  # noqa: PLC0415
 
-    img_bgr = cv2.imread(str(jpg_path), cv2.IMREAD_COLOR)
+    try:
+        img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    except cv2.error as error:
+        if image_path.suffix == ".png":
+            raise _PngDecodeError(f"cv2.imread failed for {image_path}: {error}") from error
+        raise  # Preserve the legacy JPEG failure behavior.
     if img_bgr is None:
-        raise RuntimeError(f"cv2.imread failed for {jpg_path}")
+        if image_path.suffix == ".png":
+            raise _PngDecodeError(f"cv2.imread failed for {image_path}")
+        raise RuntimeError(f"cv2.imread failed for {image_path}")
     if hook_context is not None and _post_decode_hooks:
         video_path, frame_idx = hook_context
         for hook in _post_decode_hooks:
@@ -422,8 +480,8 @@ def cached_decode_video_frames(
 ) -> torch.Tensor:
     """LeRobot ``decode_video_frames`` の drop-in replacement (0.5.1 + 0.6.0 両対応)。
 
-    Cache hit した frame は JPG から O(1) load、miss や special mode は 元関数に fallback。
-    Default (RGB float32 [0,1] CHW) mode でのみ cache を効かせる。
+    Cache hit した frame は JPG/PNG から O(1) load、miss や special mode は元関数に fallback。
+    RGB float32 [0,1] CHW / uint8 CHW の両方を扱う。
     """
     if _original_decode is None:
         raise RuntimeError("lerobot_frame_cache_patch.apply_patch() has not been called")
@@ -437,13 +495,38 @@ def cached_decode_video_frames(
     if extra_kwargs.get("is_depth"):
         return _fallback(video_path, timestamps, tolerance_s, backend, extra_kwargs, "depth frames")
 
+    expected_format = _get_expected_image_format()
+    if expected_format not in (None, "jpg", "png"):
+        return _fallback(
+            video_path, timestamps, tolerance_s, backend, extra_kwargs,
+            f"unsupported {ENV_IMAGE_FORMAT}={expected_format!r}",
+        )
+
     cache_dir = _cache_dir_for_video_path(Path(video_path))
     if cache_dir is None:
         return _fallback(video_path, timestamps, tolerance_s, backend, extra_kwargs, "no cache dir")
     cache_root = _resolve_cache_root(cache_dir)
+    meta = _cache_metadata(cache_root)
+    if meta is None:
+        return _fallback(video_path, timestamps, tolerance_s, backend, extra_kwargs, "no cache meta")
+    image_format = meta.get("image_format", "jpg")
+    if image_format not in ("jpg", "png"):
+        return _fallback(
+            video_path, timestamps, tolerance_s, backend, extra_kwargs,
+            f"unsupported cache image_format={image_format!r}",
+        )
+    if expected_format is not None and image_format != expected_format:
+        return _fallback(
+            video_path, timestamps, tolerance_s, backend, extra_kwargs,
+            f"cache image_format={image_format!r} does not match requested {expected_format!r}",
+        )
+    if image_format == "png" and meta.get("complete") is not True:
+        return _fallback(
+            video_path, timestamps, tolerance_s, backend, extra_kwargs, "PNG cache is incomplete",
+        )
     fps = _cache_fps(cache_root)
     if fps is None:
-        return _fallback(video_path, timestamps, tolerance_s, backend, extra_kwargs, "no cache meta")
+        return _fallback(video_path, timestamps, tolerance_s, backend, extra_kwargs, "invalid cache fps")
 
     return_uint8 = bool(extra_kwargs.get("return_uint8", False))
     # Issue #122 D-3: post-decode hook (OBB overlay) が register 済なら
@@ -459,21 +542,55 @@ def cached_decode_video_frames(
         _, num_variants = reg_lookup
     else:
         num_variants = _get_num_variants()
+    if image_format == "png" and num_variants > 1:
+        return _fallback(
+            video_path, timestamps, tolerance_s, backend, extra_kwargs,
+            "PNG cache supports raw frames only (num_variants must be 1)",
+        )
     frames: list[torch.Tensor] = []
     for ts in timestamps:
+        if image_format == "png":
+            # The generator validates zero-start CFR timestamps. A nearby rounded
+            # index is not a hit unless its actual timestamp satisfies LeRobot's
+            # tolerance (e.g. an off-grid request must not return a wrong frame).
+            timestamp = float(ts)
+            tolerance = float(tolerance_s)
+            if (
+                not math.isfinite(timestamp)
+                or not math.isfinite(timestamp * fps)
+                or not math.isfinite(tolerance)
+                or tolerance < 0
+                or abs(timestamp - round(timestamp * fps) / fps) > tolerance
+            ):
+                return _fallback(
+                    video_path, timestamps, tolerance_s, backend, extra_kwargs,
+                    f"PNG timestamp {ts!r} outside cache grid tolerance {tolerance_s!r}",
+                )
         frame_idx = int(round(float(ts) * fps))
-        jpg_path = _resolve_variant_jpg_path(cache_dir, frame_idx, num_variants)
-        if not jpg_path.is_file():
+        image_path = (
+            cache_dir / f"frame_{frame_idx:06d}.png"
+            if image_format == "png"
+            else _resolve_variant_jpg_path(cache_dir, frame_idx, num_variants)
+        )
+        if not image_path.is_file():
             # partial cache miss → whole call fallback (mixed 結果を返さない)
             return _fallback(
-                video_path, timestamps, tolerance_s, backend, extra_kwargs, f"missing {jpg_path}"
+                video_path, timestamps, tolerance_s, backend, extra_kwargs, f"missing {image_path}"
             )
         hook_context = (Path(video_path), frame_idx) if pass_hook_context else None
-        frames.append(
-            _read_jpg_as_frame_tensor(
-                jpg_path, return_uint8=return_uint8, hook_context=hook_context
+        reader = _read_image_as_frame_tensor if image_format == "png" else _read_jpg_as_frame_tensor
+        try:
+            frame = reader(image_path, return_uint8=return_uint8, hook_context=hook_context)
+        except _PngDecodeError as error:
+            # Only the image-load stage wraps errors in this internal type. A
+            # failing user hook (including cv2.error) must still surface as-is.
+            if image_format != "png":
+                raise
+            return _fallback(
+                video_path, timestamps, tolerance_s, backend, extra_kwargs,
+                f"PNG decode failure: {error}",
             )
-        )
+        frames.append(frame)
     return torch.stack(frames, dim=0)
 
 
@@ -649,6 +766,7 @@ def reset_for_test() -> None:
         _patch_applied = False
         _original_decode = None
         _cache_fps.cache_clear()
+        _cache_metadata.cache_clear()
 
 
 if __name__ == "__main__":

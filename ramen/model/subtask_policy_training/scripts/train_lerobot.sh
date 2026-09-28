@@ -261,6 +261,40 @@ fi
 # LEROBOT_FRAME_CACHE_ENABLE=true が未 export なら wrapper は元 decode に full fallback
 # = 挙動不変。default true (無効化したいなら LEROBOT_FRAME_CACHE_ENABLE=false で override)。
 export LEROBOT_FRAME_CACHE_ENABLE="${LEROBOT_FRAME_CACHE_ENABLE:-true}"
+# Issue #168: PNG is opt-in; leave JPEG defaults and external baked caches alone.
+# Do not export a default format: metadata still selects the format when a
+# caller supplies only FRAME_CACHE_ROOT_OVERRIDE for an already-built cache.
+frame_cache_image_format="${FRAME_CACHE_IMAGE_FORMAT:-jpg}"
+if [[ "$frame_cache_image_format" != jpg && "$frame_cache_image_format" != png ]]; then
+  echo "FRAME_CACHE_IMAGE_FORMAT must be jpg or png, got: $frame_cache_image_format" >&2
+  exit 2
+fi
+frame_cache_target="${merged_source_root:-$TRAINING_VIEW_ROOT}"
+precompute_cmd=(
+  python "$ROOT_DIR/../../data/bitrobot_lerobot_subtask_datasets/scripts/precompute_frame_cache.py"
+  --lerobot-root "$frame_cache_target"
+)
+if [[ "$LEROBOT_FRAME_CACHE_ENABLE" == true && "$frame_cache_image_format" == png ]]; then
+  png_compression="${FRAME_CACHE_PNG_COMPRESSION:-1}"
+  if [[ ! "$png_compression" =~ ^[0-9]$ ]]; then
+    echo "FRAME_CACHE_PNG_COMPRESSION must be an integer in [0, 9]" >&2
+    exit 2
+  fi
+  export FRAME_CACHE_ROOT_OVERRIDE="${FRAME_CACHE_ROOT_OVERRIDE:-$frame_cache_target/frame_cache_png}"
+  precompute_cmd+=(
+    --image-format png --png-compression "$png_compression"
+    --cache-root "$FRAME_CACHE_ROOT_OVERRIDE" --keep-source-mp4
+  )
+  echo "frame_cache_image_format: png"
+  echo "frame_cache_root_override: $FRAME_CACHE_ROOT_OVERRIDE"
+fi
+if [[ -n "${FRAME_CACHE_JOBS:-}" ]]; then
+  if [[ ! "$FRAME_CACHE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FRAME_CACHE_JOBS must be a positive integer" >&2
+    exit 2
+  fi
+  precompute_cmd+=(--jobs "$FRAME_CACHE_JOBS")
+fi
 # cwd=$ROOT_DIR から module 起動できるよう repo root を追加し、GR00T processor
 # overlay など既存の PYTHONPATH は保持する。
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -365,14 +399,9 @@ if [[ "${DRY_RUN:-false}" == "true" ]]; then
   fi
   # Issue #122: dry-run 時も frame_cache precompute command を表示 (実 run 時に走る想定)
   if [[ "${LEROBOT_FRAME_CACHE_ENABLE}" == "true" && "${FRAME_CACHE_PRECOMPUTE:-true}" == "true" ]]; then
-    if [[ -n "$merged_source_root" ]]; then
-      dry_frame_cache_target="$merged_source_root"
-    else
-      dry_frame_cache_target="$TRAINING_VIEW_ROOT"
-    fi
-    printf "precompute_frame_cache: python %q --lerobot-root %q\n" \
-      "$ROOT_DIR/../../data/bitrobot_lerobot_subtask_datasets/scripts/precompute_frame_cache.py" \
-      "$dry_frame_cache_target"
+    printf "precompute_frame_cache:"
+    printf " %q" "${precompute_cmd[@]}"
+    printf "\n"
   fi
   printf "command (LEROBOT_FRAME_CACHE_ENABLE=%s, OBB_OVERLAY_ENABLE=%s):" \
     "$LEROBOT_FRAME_CACHE_ENABLE" "$OBB_OVERLAY_ENABLE_VAL"
@@ -404,24 +433,13 @@ if [[ "${#prepare_training_view_cmd[@]}" -gt 0 ]]; then
   "${prepare_training_view_cmd[@]}"
 fi
 
-# Issue #122: JPG frame cache 事前展開 (LEROBOT_FRAME_CACHE_ENABLE=true 前提)。
+# Issue #122 / #168: frame cache 事前展開 (LEROBOT_FRAME_CACHE_ENABLE=true 前提)。
 # Cache は元 mp4 の場所 (multi-repo なら $merged_source_root、single-repo なら
 # $TRAINING_VIEW_ROOT の symlinked videos) に置く → policy_type 越しに共有可能。
-# precompute script が settings hash 検証 + per-mp4 verify + auto mp4 drop を実施。
-# 24 core 並列で 200k frames × 3 cam ≒ 5-10 min。skip したい場合は
-# FRAME_CACHE_PRECOMPUTE=false で明示。
+# JPG retains its legacy auto-drop behavior; opt-in PNG always keeps videos.
+# FRAME_CACHE_PRECOMPUTE=false reuses an existing cache without generating one.
 if [[ "${LEROBOT_FRAME_CACHE_ENABLE}" == "true" && "${FRAME_CACHE_PRECOMPUTE:-true}" == "true" ]]; then
-  # Cache target: multi-repo → merged_source (policy 越し共有可能)、single-repo → training view
-  if [[ -n "$merged_source_root" ]]; then
-    frame_cache_target="$merged_source_root"
-  else
-    frame_cache_target="$TRAINING_VIEW_ROOT"
-  fi
   echo "[frame_cache] target root: $frame_cache_target (共有 cache = policy_type 越しに再利用可能)"
-  precompute_cmd=(
-    python "$ROOT_DIR/../../data/bitrobot_lerobot_subtask_datasets/scripts/precompute_frame_cache.py"
-    --lerobot-root "$frame_cache_target"
-  )
   "${precompute_cmd[@]}"
 fi
 

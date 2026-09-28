@@ -111,6 +111,9 @@ class OperatorConsole:
             if self._fd is not None:
                 termios.tcflush(self._fd, termios.TCIFLUSH)
         labels = {"n": "N 次へ", "r": "R やり直し", "enter": "Enter 開始"}
+        if phase.startswith("準備／"):
+            labels["r"] = "R この経由点を再試行"
+            labels["enter"] = "Enter 到達確認・準備を続行"
         stop_label = "Ctrl+C 終了"
         if phase.endswith("腕保持・ハンド全開"):
             labels["r"] = "R 初期姿勢へ"

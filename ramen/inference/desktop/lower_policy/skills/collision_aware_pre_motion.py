@@ -205,6 +205,18 @@ class MeasuredArmWalkHoldSkill(Skill):
         self._lowering: "CollisionAwareArmPreMotionSkill | None" = None
         self._started_at: float | None = None
         self._latched_at: float | None = None
+        self._boundary_preparation_args: dict | None = None
+
+    def configure_boundary_preparation(self, **kwargs) -> None:
+        self._boundary_preparation_args = kwargs
+
+    @property
+    def owns_operator_view(self) -> bool:
+        return self._lowering is not None and self._lowering.owns_operator_view
+
+    def cancel_boundary_preparation(self) -> None:
+        if self._lowering is not None:
+            self._lowering.cancel_boundary_preparation()
 
     def _on_start(self, params: dict) -> None:
         self._hold = None
@@ -213,7 +225,8 @@ class MeasuredArmWalkHoldSkill(Skill):
         self._latched_at = None
 
     def _on_stop(self) -> None:
-        pass
+        if self._lowering is not None:
+            self._lowering.stop()
 
     def _latch(self, measured: np.ndarray) -> np.ndarray:
         violation = lowered_walk_pose_violation(measured)
@@ -264,6 +277,8 @@ class MeasuredArmWalkHoldSkill(Skill):
                 time_fn=self._time_fn,
                 **self._lowering_settings,
             )
+            if self._boundary_preparation_args is not None:
+                self._lowering.configure_boundary_preparation(**self._boundary_preparation_args)
             self._lowering.start({})
         command = self._lowering.step(obs)
         # 歩く前の腕の退避は安全のための手順なので、時間切れでも歩かずに止める。
@@ -273,6 +288,7 @@ class MeasuredArmWalkHoldSkill(Skill):
                 f"lowering the arms before the walk failed: {stopped}"
             )
         if self._lowering.is_complete:
+            self._lowering.stop()
             return self._latch(measured)
         return command
 
@@ -406,7 +422,7 @@ class ArmWaypoint:
     # 「今の姿勢のまま少しだけ持ち上げる」を、絶対値を知らずに書くために使う。
     offset_from_initial: tuple[tuple[int, float], ...] = ()
 
-    def resolve(self, initial: np.ndarray) -> np.ndarray:
+    def resolve(self, initial: np.ndarray, *, venue: bool = False) -> np.ndarray:
         target = np.asarray(self.target, dtype=np.float64).copy()
         if target.shape != (14,) or not np.isfinite(target).all():
             raise ValueError(f"waypoint {self.name!r} must be finite 14-D")
@@ -424,8 +440,12 @@ class ArmWaypoint:
         for index, delta in self.offset_from_initial:
             target[index] = initial[index] + delta
             from_measured[index] = True
-        if np.any(np.abs(target[~from_measured]) > 1.5):
+        if not venue and np.any(np.abs(target[~from_measured]) > 1.5):
             raise ValueError(f"waypoint {self.name!r} exceeds the 1.5rad smoke limit")
+        if venue:
+            if np.any(target < G1_ARM_POSITION_LOWER_RAD) or np.any(target > G1_ARM_POSITION_UPPER_RAD):
+                raise ValueError(f"waypoint {self.name!r} exceeds the G1 URDF joint limits")
+            return target
         # 自前経路の arm actuator (G1ArmActuator.send_action) と同じ URDF の限界に
         # 収める。大会経路には運営 IK の手前にこの clip が無いので、ここで揃える。
         return np.clip(target, G1_ARM_POSITION_LOWER_RAD, G1_ARM_POSITION_UPPER_RAD)
@@ -804,10 +824,29 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._stable_samples = 0
         self._complete = False
         self._failure_reason: str | None = None
-        # 締め切りまでに目標へ届かなかった (故障ではない)。orchestrator は次へ進む。
+        # SDK/pose follower timeout; operator stages enter safety hold, not the next policy.
         self._timeout_reason: str | None = None
+        self._boundary_preparation = None
+
+    def configure_boundary_preparation(self, **kwargs) -> None:
+        """Opt into the venue-only sender without changing the SDK follower."""
+        from .boundary_preparation import BoundaryPreparation
+
+        if self.is_active:
+            raise RuntimeError("cannot change preparation backend while active")
+        self._boundary_preparation = BoundaryPreparation(self._waypoints, **kwargs)
+
+    @property
+    def owns_operator_view(self) -> bool:
+        return self._boundary_preparation is not None
+
+    def cancel_boundary_preparation(self) -> None:
+        if self._boundary_preparation is not None:
+            self._boundary_preparation.cancel()
 
     def _on_start(self, params: dict) -> None:
+        if self._boundary_preparation is not None:
+            self._boundary_preparation.reset()
         self._initial = None
         self._targets = ()
         self._command = None
@@ -823,10 +862,12 @@ class CollisionAwareArmPreMotionSkill(Skill):
         self._timeout_reason = None
 
     def _on_stop(self) -> None:
-        pass
+        self.cancel_boundary_preparation()
 
     @property
     def is_complete(self) -> bool:
+        if self._boundary_preparation is not None:
+            return self._boundary_preparation.complete
         return self._complete
 
     @property
@@ -844,6 +885,8 @@ class CollisionAwareArmPreMotionSkill(Skill):
         The current unfinished target is deliberately omitted.  A Ctrl+C in
         pre-motion must never continue toward a pose that was not reached.
         """
+        if self._boundary_preparation is not None:
+            return self._boundary_preparation.retreat_waypoints
         if self._initial is None:
             return ()
         completed = self._targets[:-1] if self._complete else self._targets[:self._stage_index]
@@ -857,10 +900,13 @@ class CollisionAwareArmPreMotionSkill(Skill):
 
     @property
     def timeout_reason(self) -> str | None:
-        """締め切りまでに収束しなかった理由。orchestrator は時間切れとして次へ進む。"""
+        """SDK/pose timeout reason; venue goto uses recoverable holding instead."""
         return self._timeout_reason
 
-    def step(self, obs: dict) -> np.ndarray:
+    def step(self, obs: dict) -> np.ndarray | None:
+        if self._boundary_preparation is not None:
+            self._boundary_preparation.step(obs)
+            return None
         measured = _measured_arm(obs)
         measured_velocity = _measured_arm_velocity(obs)
         now = self._time_fn()
