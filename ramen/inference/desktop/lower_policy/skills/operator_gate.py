@@ -177,8 +177,9 @@ class OperatorConfirmationHoldSkill(Skill):
                 ):
                     break
                 detail = (
-                    "no live arm state"
-                    if latest is None else self._arrival_check(latest)[1]
+                    "no fresh, stationary arm state"
+                    if latest is None or self._arrival_check is None
+                    else self._arrival_check(latest)[1]
                 )
                 print(
                     f"[gate] initial pose not reached ({detail}); Enter ignored",
@@ -186,7 +187,7 @@ class OperatorConfirmationHoldSkill(Skill):
                 )
                 # 次の問いは今の実測で作り直す (どの関節がどれだけ離れているかを出す)
                 prompt = self._prompt(latest if latest is not None else self._hold_arm)
-        except (EOFError, OSError) as exc:
+        except Exception as exc:  # Surface reader failures instead of leaving a silent gate.
             with self._lock:
                 if generation != self._generation:
                     return

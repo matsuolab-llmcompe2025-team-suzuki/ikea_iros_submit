@@ -180,6 +180,8 @@ def main():
             key(b"r")
             wait_for(skill + "／腕保持・ハンド全開")
             key(b"r")
+            wait_for(skill + "／脚配置・ハンド初期幅待ち")
+            key(b"\n")
             wait_for(skill + "／開始待ち")
             key(b"\n")
             wait_for("フェーズ：flip")

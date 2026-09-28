@@ -35,6 +35,21 @@ def decode_joint(message: bytes) -> tuple[np.ndarray, float]:
     return rows.copy(), issued_at
 
 
+def decode_goto(message: bytes):
+    if not message.startswith(b"goto"):
+        raise ValueError("Expected goto topic")
+    payload = msgpack.unpackb(message[4:], raw=False)
+    arms = np.r_[payload["left_arm"], payload["right_arm"]].astype(float)
+    speed, stamp = float(payload["max_speed"]), float(payload["issued_at"])
+    if arms.shape != (14,) or not np.isfinite(arms).all():
+        raise ValueError("Invalid goto arms")
+    if not (0.01 <= speed <= 0.3 and np.isfinite(stamp) and stamp > 0):
+        raise ValueError("Invalid preparation goto speed/timestamp")
+    if "hands" in payload:
+        raise ValueError("Preparation goto must preserve the preceding hand command")
+    return arms, speed, stamp
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -56,6 +71,7 @@ def main() -> None:
     socket.setsockopt(zmq.LINGER, 0)
     socket.connect("tcp://127.0.0.1:5556")
     rows, issued, received, lengths, errors = [], [], [], [], []
+    gotos = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw = args.output.with_suffix(".wire").open("wb")
     start = time.monotonic()
@@ -67,6 +83,11 @@ def main() -> None:
             raw.write(struct.pack("!I", len(message)))
             raw.write(message)
             try:
+                if message.startswith(b"goto"):
+                    arms, speed, stamp = decode_goto(message)
+                    gotos.append({"arms": arms.tolist(), "speed": speed, "issued_at": stamp,
+                                  "received_monotonic": time.monotonic()})
+                    continue
                 chunk, stamp = decode_joint(message)
             except (ValueError, KeyError, TypeError) as exc:
                 errors.append(str(exc))
@@ -83,7 +104,7 @@ def main() -> None:
                         rows=np.concatenate(rows) if rows else np.empty((0, 22)),
                         issued_at=issued, received_monotonic=received, chunk_lengths=lengths)
     delta = np.diff(received)
-    result = {"passed": bool(rows) and not errors, "messages": len(rows), "errors": errors,
+    result = {"passed": bool(rows or gotos) and not errors, "messages": len(rows), "gotos": gotos, "errors": errors,
               "raw_capture": args.output.with_suffix(".wire").name,
               "endpoint": "tcp://127.0.0.1:5556", "physical_commands_sent": False,
               "interval_ms_p50_p95_max": (np.percentile(delta * 1000, [50, 95, 100]).tolist()
