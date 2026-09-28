@@ -8,17 +8,17 @@
   `manifest.yaml` は test で食い違いを止める）。同じ file を使う slot は 1 行にまとまる。
 - 取るときも確かめるときも、**image の中で** script を動かす（runtime と同じ huggingface_hub で、cache の形が実行時と一致する）。
 
-## 1. 一覧（2026-09-25、合計 約 90 GB）
+## 1. 一覧（2026-09-29、合計 約 80 GB）
 
 | # | 使う所 | repo | revision | 取る範囲 | 大きさ |
 |---|---|---|---|---|---|
 | 1 | 台を回す（Stage 2〜4） | `Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout` | `b19c777` | `ckpt_step_100000.pt` だけ | 3.5 GB |
 | 2 | 1 の画像 backbone | `robbyant/lingbot-vision-vit-base` | main | 全部 | 0.3 GB |
 | 3 | pick（hybrid の区間 1、Stage 1〜4） | `Team-RAMEN/groot-n1.7-pick-legs-ver1` | `b63d9c4` | `checkpoint-40000/` の実行時の file（optimizer 13 GB は取らない） | 12.6 GB |
-| 4 | insert（Stage 1〜4） | `Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_gr00t_200k` | `0f0927b` | 全部 | 13.8 GB |
+| 4 | insert（Stage 1〜4、Diffusion 100k） | `Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion` | `6c9911b` | 全部 | 1.18 GB |
 | 5 | 締め付け（Stage 1〜4） | `Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k` | `51e306f` | 全部 | 13.8 GB |
 | 6 | flip（Stage 5） | `Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints` | `1a408d8` | `checkpoints/020000/pretrained_model/` だけ（無いと約 102 GB） | 12.6 GB |
-| 7 | 4〜6 の base model | `nvidia/GR00T-N1.7-3B` | `2fc962b` | 全部 | 6.9 GB |
+| 7 | 5〜6 の base model | `nvidia/GR00T-N1.7-3B` | `2fc962b` | 全部 | 6.9 GB |
 | 8 | GR00T の backbone（tokenizer・前処理） | `nvidia/Cosmos-Reason2-2B` | main | 全部。**gated** | 4.9 GB |
 | 9 | YOLO（overlay） | `Team-RAMEN/IROS2026_RAMEN_Hara_yoloobb_upperpolicy` | `8221d0a` | `runs/m_lowaug_v11b/weights/best_20260818.pt` | 0.04 GB |
 | 10 | VLM（hybrid pick の区間 1→2、Stage 1〜4） | `Qwen/Qwen3-VL-8B-Instruct` | main | 全部 | 17.5 GB |
@@ -26,7 +26,7 @@
 
 - Stage 0（歩く）は学習済み model を使わない。`ramen_ori_default` は `--phase1-11-arm-only` 専用なので入れない。
 - 11 は既定では使わない（切り替え方は `INSTRUCTIONS.md` の Step 4）。set `ramen_ori` の insert は 1 と同じ file なので行は増えない。
-- 7 の revision は 4〜6 の ckpt の `config.json` の `base_model_revision`（今は 3 つとも既定の `2fc962b`）。
+- 7 の revision は 5〜6 の ckpt の `config.json` の `base_model_revision`（ともに既定の `2fc962b`）。4 は GR00T ではなく Diffusion。
 - main で取るもの（2・8・10）は、実行時も main を引く（ネット無しで引くために `refs/main` も一緒に入る）。
 
 ## 2. 取り方（ネットのある所で）
@@ -45,11 +45,11 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
 
 ## 3. USB に入れる物（チェックリスト）
 
-**exFAT**（4 GB を超える file があるので FAT32 は不可）。重み 約 90 GB + image（無圧縮）。
+**exFAT**（4 GB を超える file があるので FAT32 は不可）。重み 約 80 GB + image（無圧縮）。旧候補の cache を残す場合はその分も必要。
 2026-09-24 に 250 GB の USB へ重み（1〜10）と `SHA256SUMS` を入れ、USB の上で `--check` が `all present` になることを確かめた。
 一覧に行が増えたら、下の取るコマンドをもう一度流す（既にある file は取り直さない）→ `SHA256SUMS` を作り直す → `--check`。
 
-- [ ] **重み**（約 90 GB）。USB の上に HF cache を**直接**作る（tar は要らない）
+- [ ] **重み**（約 80 GB）。USB の上に HF cache を**直接**作る（tar は要らない）
   ```bash
   HF_HOME=<USB>/hf_cache HF_HUB_OFFLINE=0 HF_HUB_DISABLE_SYMLINKS=1 HF_XET_CHUNK_CACHE_SIZE_BYTES=0 \
     python tools/prefetch_weights.py        # HF_TOKEN は 2 と同じく環境変数で。huggingface_hub は runtime と同じ 1.20.1

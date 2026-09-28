@@ -14,8 +14,8 @@
 # 出ていれば Enter (戻し動作) を送り、出ていなければ自分の擬似端末へ Ctrl+C を送る。
 # 指令の経路 (boundary の publish・実測の関節の読み取り) が落ちずに動くことと、後始末
 # (手を開いて腕を下ろす) までを通す。模擬の PC2 の関節は指令と関係なく sin 波で動くので、
-# go-live 待ちは成立し、その先の準備動作は時間切れになる (本体 858e107 以降、Stage 1〜5 は
-# 安全停止 → 判断待ち。Stage 0 は腕を下ろせず設計どおり止まり、同じく判断待ち)。
+# go-live 待ち以後の到達を検証する試験ではない。到達・遅延到達・再試行の検証には
+# operator_probe.py と公式 adapter を使う追従 fixture を使用する。
 # 起動口は --actuate のとき対話端末を要るので、pty_run.py で擬似端末の上で動かす (会場の -it と同じ)。
 # result.txt に mode=actuate を書く (summarize.py の判定)。
 #
@@ -60,7 +60,7 @@ MEM_PID=$!
   done ) > "${OUT}/gpu.log" &
 GPU_PID=$!
 
-TRACE=(strace -f -qq -e trace=connect,execve -o "${OUT}/connect.log")
+TRACE=(strace --seccomp-bpf -f -qq -e trace=connect,execve -o "${OUT}/connect.log")
 if [[ -n "${NOSTRACE:-}" ]]; then
   TRACE=()
 fi

@@ -55,7 +55,7 @@ def owned_groot_worker(root_pid, proc_root=Path("/proc")):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=("retry", "camera", "state", "worker", "next", "full", "soak", "stage"), required=True)
+    parser.add_argument("--case", choices=("retry", "camera", "gate-camera", "retry-camera", "state", "worker", "next", "full", "soak", "stage"), required=True)
     parser.add_argument("--stage", type=int, choices=range(6))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dwell-seconds", type=float, default=30)
@@ -102,9 +102,11 @@ def main():
         processes.append(proc)
         return proc
 
-    def wait_for(marker, timeout=180):
+    def wait_for(marker, timeout=180, *, retry_enter=False):
         nonlocal position
         deadline = time.monotonic() + timeout
+        retry_position = position
+        retries = 0
         while time.monotonic() < deadline:
             text = log_path.read_text(errors="replace")
             found = text.find(marker, position)
@@ -114,6 +116,18 @@ def main():
                 return
             if venue.poll() is not None:
                 raise RuntimeError(f"Venue exited {venue.returncode} before {marker!r}")
+            if retry_enter:
+                if "安全停止／保持中・判断待ち" in text[position:]:
+                    raise RuntimeError("Safety stop while awaiting policy start")
+                rejected = text.find("Enter ignored", retry_position)
+                if rejected >= 0:
+                    retries += 1
+                    if retries > 5:
+                        raise RuntimeError("Five fresh Enter retries did not satisfy the start gate")
+                    retry_position = rejected + len("Enter ignored")
+                    events.append({"retry_enter": retries, "reason": "gate rejected previous Enter",
+                                   "at": time.monotonic()})
+                    key(b"\n")
             time.sleep(0.2)
         raise TimeoutError(f"No {marker!r} within {timeout}s")
 
@@ -140,7 +154,8 @@ def main():
         selected_stage = args.stage if args.case == "stage" else 2 if args.case == "next" else 5
         stage_args = (["--phase3-full", "--phase3-start-stage", "0", "--phase3-end-stage", "5"]
                       if args.case == "full" else ["--stage", str(selected_stage)])
-        traced = (["strace", "-f", "-qq", "-e", "trace=connect,execve", "-o",
+        # Avoid ptrace stops on unrelated CUDA syscalls while auditing every connect.
+        traced = (["strace", "--seccomp-bpf", "-f", "-qq", "-e", "trace=connect,execve", "-o",
                    str(args.output / "connect.log")] if args.trace else [])
         venue = launch([sys.executable, str(here / "pty_run.py"), *traced,
                         "/usr/local/bin/ramen-venue", *stage_args, "--actuate"], "run.log", stdin=subprocess.PIPE,
@@ -161,7 +176,7 @@ def main():
                 for index, skill in enumerate(skills):
                     wait_for(skill + "／開始待ち")
                     key(b"\n")
-                    wait_for("フェーズ：" + labels[skill])
+                    wait_for("フェーズ：" + labels[skill], retry_enter=True)
                     deadline = time.monotonic() + args.dwell_seconds
                     while time.monotonic() < deadline:
                         if venue.poll() is not None:
@@ -176,8 +191,13 @@ def main():
         else:
             skill = "rotate_table_base" if args.case == "next" else "flip_table"
             wait_for(skill + "／開始待ち")
-            key(b"\n")
-            wait_for("フェーズ：テーブル回転" if args.case == "next" else "フェーズ：flip")
+            if args.case != "gate-camera":
+                key(b"\n")
+                wait_for("フェーズ：テーブル回転" if args.case == "next" else "フェーズ：flip",
+                         retry_enter=True)
+            if args.case == "retry-camera":
+                key(b"r")
+                wait_for(skill + "／腕保持・ハンド全開")
             time.sleep(1)
         if args.case == "soak":
             deadline = time.monotonic() + args.dwell_seconds
@@ -194,11 +214,9 @@ def main():
             key(b"r")
             wait_for(skill + "／腕保持・ハンド全開")
             key(b"r")
-            wait_for(skill + "／脚配置・ハンド初期幅待ち")
-            key(b"\n")
             wait_for(skill + "／開始待ち")
             key(b"\n")
-            wait_for("フェーズ：flip")
+            wait_for("フェーズ：flip", retry_enter=True)
             time.sleep(2)
             key(b"\x03")
         elif args.case == "next":
@@ -210,7 +228,7 @@ def main():
                 worker_pid = owned_groot_worker(venue.pid)
                 os.kill(worker_pid, signal.SIGKILL)
             else:
-                fault = signal.SIGUSR1 if args.case == "camera" else signal.SIGUSR2
+                fault = signal.SIGUSR1 if args.case in ("camera", "gate-camera", "retry-camera") else signal.SIGUSR2
                 mock.send_signal(fault)
             events.append({"fault": args.case, "at": time.monotonic()})
             wait_for("安全停止／保持中・判断待ち", 15)
@@ -249,6 +267,8 @@ def main():
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
         if CODE_ERRORS.search(log_text) or "[return] failed:" in log_text or "[return] lowering failed:" in log_text:
             error = error or "Application or return-path error in run.log"
+        if args.case == "gate-camera" and "operator confirmed start of flip_table" in log_text:
+            error = error or "Obsolete start gate consumed the safety decision Enter"
         network = None
         if args.trace:
             trace_path = args.output / "connect.log"
