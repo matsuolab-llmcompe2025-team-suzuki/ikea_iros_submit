@@ -15,7 +15,7 @@
 | 1 | 台を回す（Stage 2〜4） | `Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout` | `b19c777` | `ckpt_step_100000.pt` だけ | 3.5 GB |
 | 2 | 1 の画像 backbone | `robbyant/lingbot-vision-vit-base` | main | 全部 | 0.3 GB |
 | 3 | pick（hybrid の区間 1、Stage 1〜4） | `Team-RAMEN/groot-n1.7-pick-legs-ver1` | `b63d9c4` | `checkpoint-40000/` の実行時の file（optimizer 13 GB は取らない） | 12.6 GB |
-| 4 | insert（Stage 1〜4、Diffusion 100k） | `Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion` | `6c9911b` | 全部 | 1.18 GB |
+| 4 | insert（Stage 1〜4、Diffusion 100k） | `Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion` | `6c9911b` | `checkpoints/` 以外の最終モデル | 1.18 GB |
 | 5 | 締め付け（Stage 1〜4） | `Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k` | `51e306f` | 全部 | 13.8 GB |
 | 6 | flip（Stage 5） | `Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints` | `1a408d8` | `checkpoints/020000/pretrained_model/` だけ（無いと約 102 GB） | 12.6 GB |
 | 7 | 5〜6 の base model | `nvidia/GR00T-N1.7-3B` | `2fc962b` | 全部 | 6.9 GB |

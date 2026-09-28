@@ -218,6 +218,12 @@ latency measurements.
 The source PR targets `develop`; neither it nor the submission branch has been
 merged. Subsequent changes to runtime files require a new image and validation.
 
+Before opening the submission PR, `main` at `c376a36` was incorporated into the
+issue branch. Its insert-Diffusion default is already present in the tested
+source. Documentation was reconciled to the tested image, and `sync_ramen.sh`
+regenerated the same `10b8d73` tree; no runtime/image change is introduced by this
+integration. The separate main image `c98c80c7...` is not the tested image above.
+
 ## Boundaries
 
 - No real tracking, clearance, contact, balance or task-success guarantee.

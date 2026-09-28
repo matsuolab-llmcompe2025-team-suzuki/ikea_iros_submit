@@ -21,6 +21,7 @@ ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835f
 - Image build input: `c56fc693fa6231529a9b38c7fa0f3e6f1c766596`.
 - Tested organizer interface: `497f3ab93e5baa706311daebd31c7a9798258450`.
 - Private GHCR read access is required. Do not put credentials in this repository.
+- [Arm64 build and push](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36479757032) succeeded. GB10 results and untested conditions are recorded below; physical Thor/G1 motion is not verified.
 - Merge-time documentation updates do not change the tested image or its build inputs.
 
 ## Preparation And Operation
