@@ -256,6 +256,11 @@ class OperatorConfirmationHoldSkill(Skill):
         if self._confirmed.is_set() and not self._live_arrival():
             self._confirmed.clear()
             self._reader_started = False
+            print(
+                "[gate] arrival/fresh stationary state changed before transition; "
+                "Enter ignored. Wait for the pose to settle, then press Enter again.",
+                file=sys.stderr,
+            )
         return self._confirmed.is_set()
 
     @property

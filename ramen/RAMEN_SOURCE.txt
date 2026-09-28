@@ -1,4 +1,4 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 1fd8955400fb0195c74d4ca4c97aa487d1d6da65
-subject: #181 fix:cancel_obsolete_operator_confirmations
+commit: 10b8d736609595bde30c929ddb73ef2f4751c0f1
+subject: #181 fix:explain_revoked_start_confirmation
