@@ -6,6 +6,7 @@ All sockets stay on 127.0.0.1. No SDK, DDS or robot connection is created.
 """
 
 import json
+import os
 import signal
 import sys
 import time
@@ -89,16 +90,28 @@ def main():
     from inference.desktop.lower_policy.actuators.boundary_sink import ArmGravitySagOffset
 
     config = yaml.safe_load(Path("/app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml").read_text())
-    follower = ScheduledFollower(ArmGravitySagOffset.from_config(config))
+    gravity = ArmGravitySagOffset.from_config(config)
+    organizer = os.environ.get("RAMEN_TEST_ORGANIZER")
+    if organizer:
+        from official_follower import OfficialFollower
+        follower = OfficialFollower(organizer, gravity)
+    else:
+        follower = ScheduledFollower(gravity)
     hands = np.full(2, 4.5)
     hand_target = hands.copy()
     start = last_state = last_camera = time.monotonic()
     messages = 0
+    print("mock ready on loopback", flush=True)
     try:
         while not stop:
             now = time.monotonic()
             if actions.poll(1):
                 message = actions.recv()
+                if organizer:
+                    follower.packet(message)
+                    hand_target = follower.hand_target.copy()
+                    messages += 1
+                    continue
                 if message.startswith(b"goto"):
                     target, speed, _ = decode_goto(message)
                     follower.goto(target, speed, now)
@@ -140,6 +153,8 @@ def main():
         for socket in (cameras, states, actions):
             socket.close()
         context.term()
+        if organizer:
+            print(json.dumps(follower.report()), flush=True)
         print(json.dumps({"messages": messages, "physical_commands_sent": False}), flush=True)
 
 
