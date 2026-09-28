@@ -81,6 +81,7 @@ class OperatorConfirmationHoldSkill(Skill):
         name: str,
         next_skill_name: str,
         input_fn: Callable[[str], str] = input,
+        cancellable_input_fn: Optional[Callable[[str, threading.Event], str]] = None,
         discard_pending_input_fn: Callable[[], None] = discard_pending_stdin,
         arrival_check: Optional[ArrivalCheck] = None,
         require_arrival: bool = False,
@@ -90,6 +91,8 @@ class OperatorConfirmationHoldSkill(Skill):
         self.name = name
         self._next_skill_name = str(next_skill_name)
         self._input_fn = input_fn
+        self._cancellable_input_fn = cancellable_input_fn
+        self._input_cancel = threading.Event()
         self._discard_pending_input_fn = discard_pending_input_fn
         self._arrival_check = arrival_check
         self._require_arrival = bool(require_arrival)
@@ -124,15 +127,19 @@ class OperatorConfirmationHoldSkill(Skill):
         )
 
     def _on_start(self, params: dict) -> None:
-        self._generation += 1
-        self._hold_arm = None
-        self._latest_arm = None
-        self._confirmed.clear()
-        self._reader_started = False
-        self._failure_reason = None
+        with self._lock:
+            self._input_cancel.set()
+            self._input_cancel = threading.Event()
+            self._generation += 1
+            self._hold_arm = None
+            self._latest_arm = None
+            self._confirmed.clear()
+            self._reader_started = False
+            self._failure_reason = None
 
     def _on_stop(self) -> None:
         with self._lock:
+            self._input_cancel.set()
             self._generation += 1
             self._confirmed.clear()
 
@@ -160,25 +167,33 @@ class OperatorConfirmationHoldSkill(Skill):
             + instruction
         )
 
-    def _read_confirmation(self, prompt: str, generation: int) -> None:
+    def _read_confirmation(self, prompt: str, generation: int, cancel_event=None) -> None:
+        cancel_event = self._input_cancel if cancel_event is None else cancel_event
         try:
             # 姿勢に着く前に押された Enter で policy を始めない。
-            self._discard_pending_input_fn()
+            if self._cancellable_input_fn is None:
+                self._discard_pending_input_fn()
             while True:
-                self._input_fn(prompt)
+                if cancel_event.is_set():
+                    return
+                if self._cancellable_input_fn is None:
+                    self._input_fn(prompt)
+                else:
+                    self._cancellable_input_fn(prompt, cancel_event)
                 with self._lock:
                     if generation != self._generation:
                         return
                     latest = None if self._latest_arm is None else self._latest_arm.copy()
+                live_arrived = self._live_arrival()
                 if (
-                    self._live_arrival() and (not self._require_arrival
+                    live_arrived and (not self._require_arrival
                     or self._arrival_check is None
                     or (latest is not None and self._arrival_check(latest)[0]))
                 ):
                     break
                 detail = (
                     "no fresh, stationary arm state"
-                    if latest is None or self._arrival_check is None
+                    if not live_arrived or latest is None or self._arrival_check is None
                     else self._arrival_check(latest)[1]
                 )
                 print(
@@ -230,7 +245,7 @@ class OperatorConfirmationHoldSkill(Skill):
             self._reader_started = True
             threading.Thread(
                 target=self._read_confirmation,
-                args=(self._prompt(self._latest_arm), self._generation),
+                args=(self._prompt(self._latest_arm), self._generation, self._input_cancel),
                 name=f"{self.name}-stdin",
                 daemon=True,
             ).start()

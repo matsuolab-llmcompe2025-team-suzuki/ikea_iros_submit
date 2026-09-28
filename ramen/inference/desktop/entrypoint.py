@@ -2171,6 +2171,14 @@ def _cancel_boundary_preparations(registry):
     cancel_boundary_preparations(registry)
 
 
+def _cancel_operator_confirmations(registry):
+    from inference.desktop.lower_policy.skills.operator_gate import OperatorConfirmationHoldSkill
+
+    for skill in registry.values():
+        if isinstance(skill, OperatorConfirmationHoldSkill):
+            skill.stop()
+
+
 def validate_boundary_publish_args(args: argparse.Namespace) -> None:
     """`--boundary-publish-period-s` / `--boundary-chunk-rows` / `--boundary-hold-refresh-s`
     を起動前に確かめる (センサや publisher を立てる前に止める)。"""
@@ -3191,11 +3199,11 @@ def main() -> None:
                 skill_registry[gate] = OperatorConfirmationHoldSkill(
                     name=gate,
                     next_skill_name=policy,
-                    input_fn=(
+                    cancellable_input_fn=(
                         # prompt = 到達したか・一番ずれた関節 (実測から gate が作る)
-                        lambda prompt, name=policy: operator_console.wait_for(
+                        lambda prompt, cancel, name=policy: operator_console.wait_for(
                             "enter", stage=operator_console.stage,
-                            phase=f"{name}／開始待ち", detail=prompt,
+                            phase=f"{name}／開始待ち", detail=prompt, cancel_event=cancel,
                         )
                     ),
                     arrival_check=arrival,
@@ -3219,10 +3227,10 @@ def main() -> None:
                 skill_registry[wait_name] = OperatorConfirmationHoldSkill(
                     name=wait_name,
                     next_skill_name=arm_name,
-                    input_fn=(
-                        lambda _prompt, name=policy: operator_console.wait_for(
+                    cancellable_input_fn=(
+                        lambda _prompt, cancel, name=policy: operator_console.wait_for(
                             "r", stage=operator_console.stage,
-                            phase=f"{name}／腕保持・ハンド全開"
+                            phase=f"{name}／腕保持・ハンド全開", cancel_event=cancel,
                         )
                     ),
                     hold_arm_target_provider=_last_published_arm,
@@ -3255,10 +3263,10 @@ def main() -> None:
                     skill_registry[first_enter] = OperatorConfirmationHoldSkill(
                         name=first_enter,
                         next_skill_name=hand_name,
-                        input_fn=(
-                            lambda _prompt, name=policy: operator_console.wait_for(
+                        cancellable_input_fn=(
+                            lambda _prompt, cancel, name=policy: operator_console.wait_for(
                                 "enter", stage=operator_console.stage,
-                                phase=f"{name}／脚配置・ハンド初期幅待ち"
+                                phase=f"{name}／脚配置・ハンド初期幅待ち", cancel_event=cancel,
                             )
                         ),
                         hold_arm_target_provider=_last_published_arm,
@@ -4263,6 +4271,7 @@ def main() -> None:
                 if args.action_sink == "boundary"
                 else _real_hand_instance
             )
+            _cancel_operator_confirmations(skill_registry)
             _cancel_boundary_preparations(skill_registry)
             if phase3_active and args.actuate and arm_actuator_started:
                 # 腕を下ろす前に歩行を止める。boundary では毎 row が
