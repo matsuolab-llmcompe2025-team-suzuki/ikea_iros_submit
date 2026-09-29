@@ -1,5 +1,5 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: ad709459510c9ba792edcbd84cc7820c84bcbbec
-subject: #184 fix:rebuild_the_guard_socket_after_a_failed_reply
+commit: 1cd5fdf4d37b29edbccc5a0f0434f6d379d1a469
+subject: Merge pull request #185 from matsuolab-llmcompe2025-team-suzuki/issue/184-opt-in-pc2-state-guard
 state: published

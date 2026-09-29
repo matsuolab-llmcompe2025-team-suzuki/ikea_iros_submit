@@ -111,7 +111,8 @@ class BoundaryJointStateSource:
         self._latest: Optional[JointStateData] = None
         self._latest_gripper: Optional[tuple[np.ndarray, int]] = None
         self._previous_position: Optional[np.ndarray] = None
-        self._previous_received_ns: Optional[int] = None
+        self._previous_measured_ns: Optional[int] = None
+        self._sample_offset_ns: Optional[int] = None
         self._lock = threading.Lock()
         self._closed = False
         self._thread = threading.Thread(
@@ -145,20 +146,32 @@ class BoundaryJointStateSource:
             position = np.asarray(state.body_q, dtype=np.float64).copy()
             base_quat = np.asarray(state.base_quat, dtype=np.float64).copy()
             now_ns = time.monotonic_ns()
-            received_ns = getattr(state, "source_received_ns", now_ns)
-            if getattr(self, "_guarded", False) and (
-                not hasattr(state, "source_received_ns")
-                or not 0 <= now_ns - received_ns <= MAX_SOURCE_AGE_S * 1e9
-                or (self._previous_received_ns is not None and received_ns <= self._previous_received_ns)
-            ):
-                continue
+            # received_ns: freshness. measured_ns: sample spacing (velocity, dwell).
+            received_ns = measured_ns = now_ns
+            if getattr(self, "_guarded", False):
+                received_ns = getattr(state, "source_received_ns", None)
+                sample_ns = getattr(state, "source_sample_ns", None)
+                if (
+                    received_ns is None or sample_ns is None
+                    or not 0 <= now_ns - received_ns <= MAX_SOURCE_AGE_S * 1e9
+                ):
+                    continue
+                # The freshness stamp is a lower bound (request time - source age), so a
+                # reply delayed in transit is early by that delay: its spacing is not the
+                # sample spacing. Measure on the guard's sample clock (one PC2 monotonic
+                # clock), anchored once to ours; only differences are used.
+                if self._sample_offset_ns is None:
+                    self._sample_offset_ns = received_ns - sample_ns
+                measured_ns = sample_ns + self._sample_offset_ns
+                if self._previous_measured_ns is not None and measured_ns <= self._previous_measured_ns:
+                    continue
             velocity = np.zeros_like(position)
-            if self._previous_position is not None and self._previous_received_ns is not None:
-                dt = (received_ns - self._previous_received_ns) * 1e-9
+            if self._previous_position is not None and self._previous_measured_ns is not None:
+                dt = (measured_ns - self._previous_measured_ns) * 1e-9
                 if 1e-4 <= dt <= 1.0:
                     velocity = (position - self._previous_position) / dt
             self._previous_position = position
-            self._previous_received_ns = received_ns
+            self._previous_measured_ns = measured_ns
             snapshot = JointStateData(
                 name=G1_JOINT_NAMES,
                 position=position,
@@ -168,6 +181,7 @@ class BoundaryJointStateSource:
                 tick=getattr(state, "source_tick", None),
                 received_monotonic_ns=received_ns,
                 base_quat_wxyz=base_quat,
+                measured_monotonic_ns=measured_ns,
             )
             gripper = getattr(state, "gripper_q", None)
             with self._lock:

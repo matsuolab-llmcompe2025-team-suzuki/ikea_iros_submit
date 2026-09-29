@@ -63,6 +63,9 @@ class GuardedStateStream:
         # Conservative local-time lower bound; no PC2/Thor wall-clock sync needed.
         state.source_received_ns = started_ns - int(age * 1e9)
         state.source_tick = tick
+        # The guard's own clock of the confirming sample: its spacing is the sample
+        # spacing, unlike source_received_ns (which moves with each reply's delay).
+        state.source_sample_ns = sample_ns
         self.session, self.sequence, self.last_sample_ns = session, sequence, sample_ns
         return state
 

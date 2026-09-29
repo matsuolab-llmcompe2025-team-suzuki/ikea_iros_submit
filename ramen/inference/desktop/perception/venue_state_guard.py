@@ -128,8 +128,9 @@ class StateAttestor:
     def attest(self, payload: dict) -> dict:
         """Proof that a fresh DDS sample of our own confirms ``payload``.
 
-        The sample the bridge relayed (exact match) is preferred; otherwise the newest
-        sample within ``MATCH_TOLERANCE`` of every value.
+        The sample the bridge relayed (exact match) is preferred; otherwise the sample
+        closest to it within ``MATCH_TOLERANCE`` on every value (the newest on a tie),
+        so the returned sample time stays near the relayed sample's time while moving.
         """
         wanted = state_values(payload)
         now = self.clock()
@@ -148,10 +149,9 @@ class StateAttestor:
                 if values == wanted:
                     found = (observed, sequence, tick, age, "exact", 0.0)
                     break
-                if found is None:
-                    diff = max(abs(a - b) for a, b in zip(values, wanted))
-                    if diff <= MATCH_TOLERANCE:
-                        found = (observed, sequence, tick, age, "tolerance", diff)
+                diff = max(abs(a - b) for a, b in zip(values, wanted))
+                if diff <= MATCH_TOLERANCE and (found is None or diff < found[5]):
+                    found = (observed, sequence, tick, age, "tolerance", diff)
             if found is not None:
                 observed, sequence, tick, age, match, diff = found
                 return {"schema": PROTOCOL, "session": self.session, "sequence": sequence,
