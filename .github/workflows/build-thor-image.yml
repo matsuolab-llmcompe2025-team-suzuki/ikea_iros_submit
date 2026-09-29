@@ -119,6 +119,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reject test-only source snapshots
+        run: |
+          test -s ramen/RAMEN_SOURCE.txt
+          ! grep -q '^state: uncommitted-worktree$' ramen/RAMEN_SOURCE.txt
+
       - name: ディスクの空きを確保
         run: |
           # arm runner は掃除前でも 109GB 空いていたが、x86 runner は 20GB 台しか
