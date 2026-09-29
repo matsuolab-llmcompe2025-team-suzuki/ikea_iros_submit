@@ -55,12 +55,20 @@ def owned_groot_worker(root_pid, proc_root=Path("/proc")):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=("retry", "camera", "gate-camera", "retry-camera", "state", "worker", "next", "full", "soak", "stage"), required=True)
+    parser.add_argument("--case", choices=("retry", "camera", "gate-camera", "retry-camera", "state", "guard-dds", "worker", "next", "full", "soak", "stage"), required=True)
+    parser.add_argument("--state-guard", action="store_true",
+                        help="Exercise the opt-in :5558 route with the real guard and synthetic DDS")
+    parser.add_argument("--skill-config", type=Path,
+                        help="Use the exact venue override file instead of the image default")
     parser.add_argument("--stage", type=int, choices=range(6))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dwell-seconds", type=float, default=30)
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
+    if args.case == "guard-dds" and not args.state_guard:
+        parser.error("--case guard-dds requires --state-guard")
+    if args.skill_config is not None and not args.skill_config.is_file():
+        parser.error("--skill-config must be an existing file")
     if (args.case == "stage") != (args.stage is not None):
         parser.error("--stage is required only for --case stage")
     if not 1 <= args.dwell_seconds <= 1800:
@@ -140,7 +148,8 @@ def main():
         events.append({"key": repr(value), "at": time.monotonic()})
 
     try:
-        mock = launch([sys.executable, str(here / "following_mock.py")], "mock.log")
+        mock_options = ["--state-guard"] if args.state_guard else []
+        mock = launch([sys.executable, str(here / "following_mock.py"), *mock_options], "mock.log")
         wire = launch([sys.executable, str(here / "wire_probe.py"),
                        "--output", str(args.output / "wire.json")], "wire.log")
         deadline = time.monotonic() + 60
@@ -157,8 +166,10 @@ def main():
         # Avoid ptrace stops on unrelated CUDA syscalls while auditing every connect.
         traced = (["strace", "--seccomp-bpf", "-f", "-qq", "-e", "trace=connect,execve", "-o",
                    str(args.output / "connect.log")] if args.trace else [])
+        guard_options = ["--boundary-state-guard", "--boundary-state-port", "5558"] if args.state_guard else []
+        config_options = ["--skill-config", str(args.skill_config.resolve())] if args.skill_config else []
         venue = launch([sys.executable, str(here / "pty_run.py"), *traced,
-                        "/usr/local/bin/ramen-venue", *stage_args, "--actuate"], "run.log", stdin=subprocess.PIPE,
+                        "/usr/local/bin/ramen-venue", *stage_args, *guard_options, *config_options, "--actuate"], "run.log", stdin=subprocess.PIPE,
                        env={**os.environ, "IROS_ORIN_HOST": "127.0.0.1"})
         wait_for("Enter starts", 900)
         key(b"\n")
@@ -228,7 +239,8 @@ def main():
                 worker_pid = owned_groot_worker(venue.pid)
                 os.kill(worker_pid, signal.SIGKILL)
             else:
-                fault = signal.SIGUSR1 if args.case in ("camera", "gate-camera", "retry-camera") else signal.SIGUSR2
+                fault = (signal.SIGWINCH if args.case == "guard-dds" else
+                         signal.SIGUSR1 if args.case in ("camera", "gate-camera", "retry-camera") else signal.SIGUSR2)
                 mock.send_signal(fault)
             events.append({"fault": args.case, "at": time.monotonic()})
             wait_for("安全停止／保持中・判断待ち", 15)
@@ -276,7 +288,9 @@ def main():
             network = {"counts": dict(counts), "external": external}
             if not counts or external:
                 error = error or "Missing network observations or outbound connection attempt"
-        result = {"case": args.case, "stage": args.stage, "passed": error is None, "error": error,
+        result = {"case": args.case, "stage": args.stage, "state_guard": args.state_guard,
+                  "skill_config": str(args.skill_config.resolve()) if args.skill_config else None,
+                  "passed": error is None, "error": error,
                   "traced": args.trace, "dwell_seconds": args.dwell_seconds,
                   "network": network,
                   "events": events, "venue_rc": venue.returncode if venue else None,

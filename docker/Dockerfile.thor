@@ -293,6 +293,8 @@ RUN pixi run --frozen --manifest-path inference/desktop/pixi.toml -e vlm python 
 # --- 7) 本体のコード ------------------------------------------------------------
 # 環境の層の後に置き、コードを直しても環境を入れ直さないようにする。
 COPY ramen/ ./
+# Local worktree syncs are for tests, not release images. Keep environment layers cached.
+RUN ! grep -q '^state: uncommitted-worktree$' RAMEN_SOURCE.txt
 COPY docker/venue_entry.sh /usr/local/bin/ramen-venue
 
 # 運営の conformance 一式 (template と同じ並び)。image の環境のまま回せるように /app に置く:

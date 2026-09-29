@@ -313,6 +313,7 @@ def build_sensor_sources(
     zmq_endpoint: Optional[str] = None,
     boundary_state_host: Optional[str] = None,
     boundary_state_port: int = 5557,
+    boundary_state_guard: bool = False,
     synthetic_hand_initial_rad: Optional[tuple[float, float]] = None,
 ) -> SensorSources:
     """観測に要る source を作る。
@@ -368,7 +369,7 @@ def build_sensor_sources(
         if not boundary_state_host:
             raise ValueError("joint_source='boundary' requires boundary_state_host")
         joint = BoundaryJointStateSource(
-            host=boundary_state_host, port=boundary_state_port
+            host=boundary_state_host, port=boundary_state_port, guarded=boundary_state_guard
         )
     else:
         raise ValueError(

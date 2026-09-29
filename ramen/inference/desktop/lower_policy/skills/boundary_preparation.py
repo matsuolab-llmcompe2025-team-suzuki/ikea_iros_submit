@@ -118,6 +118,11 @@ class BoundaryPreparation:
         ):
             raise RuntimeError("preparation requires finite 29-D position and velocity")
         measured, speed = body[15:29], float(np.max(np.abs(velocity[15:29])))
+        # Freshness uses ``stamp``; sample spacing (distinct samples, dwell) uses the
+        # measurement time, which a delayed PC2-guard reply does not shift.
+        measured_at = getattr(state, "measured_monotonic_ns", None)
+        if measured_at is None:
+            measured_at = stamp
         self.last_measurement = body.copy()
         if self.initial is None:
             self.initial = measured.copy()
@@ -127,13 +132,14 @@ class BoundaryPreparation:
             self.stop_navigation()
             self._publish(measured, now)
         # Reusing a cached observation is not another convergence sample.
-        distinct = stamp != self.last_stamp
+        distinct = measured_at != self.last_stamp
         if distinct:
             if self.last_stamp is not None and (
-                stamp < self.last_stamp or (stamp - self.last_stamp) / 1e9 > self.cfg.state_max_age_s
+                measured_at < self.last_stamp
+                or (measured_at - self.last_stamp) / 1e9 > self.cfg.state_max_age_s
             ):
                 self.stable_since = None
-            self.last_stamp = stamp
+            self.last_stamp = measured_at
         intent = np.asarray(self.segment["intent"])
         errors = np.abs(intent - measured)
         error = float(np.max(errors))
@@ -144,11 +150,11 @@ class BoundaryPreparation:
             self.stable_since = None
         elif distinct:
             if self.stable_since is None:
-                self.stable_since = stamp / 1e9
+                self.stable_since = measured_at / 1e9
         reached = bool(
             distinct and within and elapsed >= duration
             and self.stable_since is not None
-            and stamp / 1e9 - self.stable_since >= self.cfg.arrival_dwell_s
+            and measured_at / 1e9 - self.stable_since >= self.cfg.arrival_dwell_s
         )
         if now - self.last_diagnostic >= self.cfg.diagnostic_period_s:
             self.last_diagnostic = now

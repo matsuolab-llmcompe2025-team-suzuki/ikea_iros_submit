@@ -6,11 +6,11 @@
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
-**更新状況（Issue #16）:** 本体 `10b8d73` の `gb10-preparation-10b8d73` を GHCR へ公開済み。
-ARM64 [CI run 36479757032](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36479757032)
-が成功した（build commit `c56fc69`）。digest は `manifest.yaml` に固定。
-このimageの検証結果・完了状況は[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md)を参照。
-§6は旧`rebuild4`、§8は旧`rebuild5`の履歴であり、新imageの検証を代替しない。
+**更新状況（Issue #20）:** 本体 `1cd5fdf` の `gb10-guard-1cd5fdf` を GHCR へ公開済み。
+ARM64 [CI run 36567638842](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36567638842)
+が成功した（build commit `55c1a55`）。digest は `manifest.yaml` に固定。
+このimageの検証結果・完了状況は[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md)を参照。
+§6は旧`rebuild4`、§8は旧`rebuild5`、[準備動作の記録](GB10_PREPARATION_REPORT.md)は旧`10b8d73`の履歴であり、新imageの検証を代替しない。
 GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
 
 ## 1. なぜ GB10 か
@@ -321,3 +321,31 @@ Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace
 運営テスト依存とWBCの固定commit・LFS資産が必要（版は検証レポート参照）。
 実測姿勢をpacket先頭targetに設定し時刻だけ更新するため、実機追従誤差や実ホスト間の時計精度は検証しない。
 旧記録用`--rows-capture <wire.npz>`ではenvelopeを再構成するので、元wireそのものの試験とは区別する。
+
+## 9. 任意の PC2 state guard を含む image を焼き直したとき
+
+本体 [#184](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/issues/184) の guard は任意の経路で、
+既定の経路（Thor が `:5557` を直接読む）は変えない。`gb10-preparation-10b8d73` には入っていない。焼き直したら、上の手順に加えて:
+
+1. `ramen/` は push 済みの commit から通常の `tools/sync_ramen.sh <commit>` で写す（`--worktree` の写しは Dockerfile・CI が拒む）。
+   `tests/test_manifest.py` は `ramen/RAMEN_SOURCE.txt` の commit と manifest の tag が合うまで通らない。
+2. **既定の経路**（option 無し）で、これまでと同じ Stage の確認を通す（guard の追加で既定の経路が変わっていないこと）。
+3. **guard の経路**: 模擬の camera/state に加えて、同じ loopback に guard（`venue_state_guard.serve` と模擬 DDS）を立て、
+   `--boundary-state-guard --boundary-state-port 5558` で Stage を通す。DDS の停止・bridge だけの停止・tick の逆行・guard の再起動・
+   往復の遅れで、古い state で準備が進まず、安全停止に入ることを確かめる。実機への故障注入はしない。
+   `operator_probe.py --state-guard` は両側を自動設定する。`following_mock.py` は別 thread の本番 `serve()` に模擬 lowstate を渡す。
+   `state` は bridge だけ停止、`guard-dds` は bridge の再配信を続けたまま DDS だけ停止する。通常の経路は option 無し。
+   tick 逆行・guard 再起動は `tests/test_gb10_guard.py`、通信遅延と静止時間は本体の `test_venue_state_guard.py` / `test_boundary_preparation.py` でも確認する。
+4. PC2 用 bundle（`tools/package_pc2_guard.py`）を同じ commit から作り、bundle の SHA256・image の digest・本体 commit・結果を記録する。
+5. 実機の DDS の負荷・タイミングは GB10 では確かめられない。運営の許可を得て、会場で `--check-only` と短い試運転から使う。
+
+```bash
+# GB10 only, /app/ramen; helpers are under /root. All endpoints are loopback.
+PY=/root/gb10-validation/.venv/bin/python
+"$PY" /root/operator_probe.py --state-guard --case full --trace --output /root/runs/guard-full
+"$PY" /root/operator_probe.py --state-guard --case state --trace --output /root/runs/guard-bridge-stop
+"$PY" /root/operator_probe.py --state-guard --case guard-dds --trace --output /root/runs/guard-dds-stop
+```
+
+会場の override を使う試験では各 command に `--skill-config /root/submission-validation/venue/skill_config_venue.yaml`
+を追加する（同じ commit の `venue/` を事前転送）。結果 JSON に採用した path を記録する。

@@ -26,6 +26,7 @@
 #
 #   ./tools/sync_ramen.sh                    # 本体で今 checkout している commit
 #   ./tools/sync_ramen.sh <commit|branch>    # 指定
+#   ./tools/sync_ramen.sh --worktree        # 未commit変更のローカル試験専用。image buildは拒否
 #   IROS_RAMEN_REPO=~/work/iros/iros_2026_ramen ./tools/sync_ramen.sh
 #
 # コピー元の commit は ramen/RAMEN_SOURCE.txt に残る。コピーしたら差分を読んでから commit する。
@@ -37,6 +38,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUBMIT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_REPO="${IROS_RAMEN_REPO:-$(cd "${SUBMIT_ROOT}/.." && pwd)/iros_2026_ramen}"
 REF="${1:-HEAD}"
+MODE=published
+if [[ "${REF}" == --worktree ]]; then
+  MODE=uncommitted-worktree
+  REF=HEAD
+fi
 DEST="${SUBMIT_ROOT}/ramen"
 
 PATHS=(
@@ -63,8 +69,10 @@ REMOTE_URL="$(git -C "${SOURCE_REPO}" remote get-url origin)"
 echo "[ramen] source : ${SOURCE_REPO} (${REMOTE_URL})"
 echo "[ramen] commit : ${COMMIT} ${SUBJECT}"
 
-git -C "${SOURCE_REPO}" fetch --quiet origin
-if [[ -z "$(git -C "${SOURCE_REPO}" branch -r --contains "${COMMIT}")" ]]; then
+if [[ "${MODE}" == published ]]; then
+  git -C "${SOURCE_REPO}" fetch --quiet origin
+fi
+if [[ "${MODE}" == published && -z "$(git -C "${SOURCE_REPO}" branch -r --contains "${COMMIT}")" ]]; then
   echo "error: ${COMMIT} は本体の origin に push されていない。push してからコピーする" >&2
   exit 1
 fi
@@ -72,8 +80,13 @@ fi
 # --- 取り出す (その commit の中身だけ。手元の未 commit の変更は入らない) --------
 
 mkdir -p "${WORK}/src"
-git -C "${SOURCE_REPO}" archive --format=tar "${COMMIT}" -- "${PATHS[@]}" |
-  tar -x -C "${WORK}/src"
+if [[ "${MODE}" == uncommitted-worktree ]]; then
+  git -C "${SOURCE_REPO}" ls-files -z --cached --others --exclude-standard -- "${PATHS[@]}" |
+    rsync -a --from0 --files-from=- --ignore-missing-args "${SOURCE_REPO}/" "${WORK}/src/"
+else
+  git -C "${SOURCE_REPO}" archive --format=tar "${COMMIT}" -- "${PATHS[@]}" |
+    tar -x -C "${WORK}/src"
+fi
 find "${WORK}/src" -type d -name tests -prune -exec rm -rf {} +
 
 # --- 境界のコードが運営の最新と同じか ------------------------------------------
@@ -93,6 +106,7 @@ cat >"${WORK}/src/RAMEN_SOURCE.txt" <<EOF
 repo: ${REMOTE_URL}
 commit: ${COMMIT}
 subject: ${SUBJECT}
+state: ${MODE}
 EOF
 
 # --delete で本体で消えたファイルはこちらからも消す。手元の pixi 環境の実体と

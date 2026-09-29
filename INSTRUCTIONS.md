@@ -54,16 +54,16 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 export RAMEN_HOST_DIR=~/Humanoid_IKEA_Assembly_Challenge/In-Person/RAMEN
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag gb10-preparation-10b8d73 = 本体 10b8d73。digest は manifest.yaml と同じ。
-# GB10の確認記録はGB10_PREPARATION_REPORT.md。実機の追従・干渉は未検証）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4
+# image（tag gb10-guard-1cd5fdf = 本体 1cd5fdf。digest は manifest.yaml と同じ。
+# GB10の確認記録はGB10_STATE_GUARD_REPORT.md。実機の追従・干渉は未検証）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
 
 # 会場用の skill_config（毎 run の docker run で mount する。理由は 4 章の「会場用の skill_config」）。
 # image の設定から Dex1 の到達の許容だけを 0.05 → 0.20 rad にした物（repo の venue/skill_config_venue.yaml と同じ）
-docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262 \
   cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml \
   | sed 's/^  tolerance_rad: 0\.05 .*$/  tolerance_rad: 0.20  # venue: Dex1 air arrival, ~3.3 mm (INSTRUCTIONS.md sec. 4)/' \
   > $RAMEN_HOST_DIR/skill_config_venue.yaml
@@ -110,7 +110,7 @@ sequenceDiagram
   `:5556` を他が掴んでいると私たちの bind が失敗し、`:8000` なら VLM が起動できない。
 - **Thor に提出 image があるか**（無いと run が始まらない。会場の回線では GitHub からの pull が途中で切れた実例がある、2026-09-27）:
   ```bash
-  docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 --format '{{.Id}}'
+  docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262 --format '{{.Id}}'
   ```
   エラーなら run の前に pull（約 9 GB）か USB から `docker load`。
 - **Thor の shell で `$RAMEN_HOST_DIR` が重みを置いた場所を指しているか**（新しい shell・tmux window では空になる。
@@ -119,7 +119,7 @@ sequenceDiagram
 - **Thor に会場用の skill_config があるか**（1 章で作った物。無いと Step 4 で docker が同じ名前の空の directory を作り、
   起動が `IsADirectoryError` で止まる）。image の設定との違いが、許容の 1 行（と 4 章の手順で直した行）だけであること:
   ```bash
-  docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+  docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262 \
     cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml | diff - $RAMEN_HOST_DIR/skill_config_venue.yaml
   ```
 - **Stage 0 の歩く距離を運営に確かめる。** Stage 0 は目で見て止まらず、決めた時間だけ前進する
@@ -200,7 +200,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
   -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262 \
   --stage N --actuate --skill-config /app/venue_skill_config.yaml
 ```
 
@@ -215,8 +215,8 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。
-  今回の全Stage連続試験ではGPU使用量の最大44.36 GiB、MemAvailableの最小39.78 GiBを記録した。
-  詳細は`GB10_PREPARATION_REPORT.md`を参照する。
+  旧image `10b8d73` の全Stage連続試験ではGPU使用量の最大44.36 GiB、MemAvailableの最小39.78 GiBを記録した。
+  新imageの検証結果は`GB10_STATE_GUARD_REPORT.md`を参照する。
   GB10の測定値をThorの起動時間やメモリ上限の保証として扱わない。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
 - 通常Policyの腕の送り方（本体 #172）: joint lane で、目標が変わったときだけ最短 0.1 s おきに同じ目標を 16 行送る
@@ -348,3 +348,45 @@ python conformance.py --lane decoupled
 ## 6. 接続テスト（09-27）の記録
 
 `CONNECTION_TEST.md`（09-27 の接続テストの計画と、その後に会場で分かったこと。本番の手順はこの文書）。
+
+## 7. 任意: PC2 の読み取り専用 state guard（既定では無効）
+
+運営 bridge（`~/real_orin_state.py`）は最後に受けた `rt/lowstate` を 50 Hz で配り直し、DDS の時刻・tick を載せない。
+ロボットが止まっているのか、DDS が止まって bridge が古い値を配り直しているのかを、Thor 側では区別できない。
+guard はこれを補う**任意の**経路（本体 [#184](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/issues/184)）。
+**既定の経路（Thor が `:5557` を直接読む）は変えない。**
+
+使える条件（全部そろうまで使わない）:
+
+- guard 対応の `gb10-guard-1cd5fdf` 以降を使用する（`VERIFY.md` §9、検証結果は `GB10_STATE_GUARD_REPORT.md`）。
+  旧 image `gb10-preparation-10b8d73` には無く、option を付けると引数の誤りで起動しない。
+- PC2 に私たちのプロセスを 1 つ足し、`:5558` を開けることを運営の PC2 担当が許可したとき。
+
+PC2 に置く物（手元の submit repo の直下で作り、`scp` で PC2 の `~/ramen-state-guard/` に展開する。運営の file は上書きしない）:
+
+```bash
+python3 tools/package_pc2_guard.py /tmp/ramen-pc2-guard.tar.gz   # guard・G1 (3) の profile・SHA256SUMS・RAMEN_SOURCE.txt
+```
+
+PC2 の新しい tmux window で（Step 0〜1 の状態 bridge を起動した後）:
+
+```bash
+source ~/iros_g1_3/iros_env.sh
+cd ~/ramen-state-guard
+sha256sum -c SHA256SUMS
+grep '^commit:' RAMEN_SOURCE.txt       # Thor の image の本体 commit と同じであること
+python venue_state_guard.py --check-only   # 運営の 6 file の hash と環境変数だけを確かめる（DDS・socket は開かない）
+python venue_state_guard.py --bind-address <PC2_IP>
+```
+
+- `--bind-address` は PC2 のロボット側の IP（`192.168.123.164`）。既定の `127.0.0.1` のままでは Thor から読めない。
+- 確かめる行: `[state-guard] profile=G1(3) internal, …; organizer files/environment verified` と
+  `[state-guard] read-only: DDS subscriber + state relay; NO actuator/publisher`。
+- Thor では Step 4 の `docker run` の最後に `--boundary-state-guard --boundary-state-port 5558` を足す。
+- guard は DDS の tick が進んでいる間だけ state を返す（止まっている姿勢でも tick が進めば正常）。bridge の値は、guard 自身が
+  0.25 s 以内に受けた DDS の値と照合する（ぴったり一致、無ければ全値 0.01 以内）。guard が返さない間、Thor は古い state で
+  到達判定を進めず、state が古くなると鮮度の検査で安全停止する。手の実測が無いときも指令のエコーには戻らない。
+- `[state-guard] …` が続いて run が始まらないとき: 表示された理由を確かめる（`waiting for advancing DDS ticks` = DDS が来ない、
+  `upstream :5557 missing or stale` = 状態 bridge が止まった、`DDS tick regressed` = ロボットの再起動。guard の再起動が要る）。
+  guard を使えないときは、**Thor の run を option 無しで起動し直せば既定の `:5557` の経路に戻る**（run の途中で切り替えない）。
+- guard を起動し直したら、Thor の run も起動し直す（`state guard restarted` で止まる。自動で再開しない）。

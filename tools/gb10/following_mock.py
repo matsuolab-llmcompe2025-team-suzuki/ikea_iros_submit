@@ -2,9 +2,11 @@
 """Loopback-only joint follower for software tests, NOT physics or robot dynamics.
 
 SIGUSR1 toggles camera publishing; SIGUSR2 toggles state publishing for fault tests.
+With --state-guard, SIGWINCH toggles synthetic DDS while the bridge keeps publishing.
 All sockets stay on 127.0.0.1. No SDK, DDS or robot connection is created.
 """
 
+import argparse
 import json
 import os
 import signal
@@ -55,22 +57,28 @@ class ScheduledFollower:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-guard", action="store_true")
+    args = parser.parse_args()
     stop = False
     camera_enabled = True
     state_enabled = True
+    dds_enabled = True
 
     def handle(sig, _frame):
-        nonlocal stop, camera_enabled, state_enabled
+        nonlocal stop, camera_enabled, state_enabled, dds_enabled
         if sig == signal.SIGUSR1:
             camera_enabled = not camera_enabled
         elif sig == signal.SIGUSR2:
             state_enabled = not state_enabled
+        elif sig == signal.SIGWINCH:
+            dds_enabled = not dds_enabled
         else:
             stop = True
         print(json.dumps({"signal": sig, "camera_enabled": camera_enabled,
-                          "state_enabled": state_enabled}), flush=True)
+                          "state_enabled": state_enabled, "dds_enabled": dds_enabled}), flush=True)
 
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2):
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2, signal.SIGWINCH):
         signal.signal(sig, handle)
     context = zmq.Context()
     cameras = context.socket(zmq.PUB)
@@ -97,6 +105,10 @@ def main():
         follower = OfficialFollower(organizer, gravity)
     else:
         follower = ScheduledFollower(gravity)
+    guard = None
+    if args.state_guard:
+        from guard_mock import LoopbackStateGuard
+        guard = LoopbackStateGuard()
     hands = np.full(2, 4.5)
     hand_target = hands.copy()
     start = last_state = last_camera = time.monotonic()
@@ -130,10 +142,14 @@ def main():
                 dt = now - last_state
                 q[15:29] = follower.step(now, dt)
                 hands += np.clip(hand_target - hands, -3 * dt, 3 * dt)
+                payload = {"body_q": q.tolist(), "base_quat": [1., 0., 0., 0.],
+                           "gripper_q": {side: {"q": -float(value)}
+                                         for side, value in zip(("left", "right"), hands)}}
+                if guard is not None:
+                    guard.check()
+                    if dds_enabled:
+                        guard.observe(payload)
                 if state_enabled:
-                    payload = {"body_q": q.tolist(), "base_quat": [1., 0., 0., 0.],
-                               "gripper_q": {side: {"q": -float(value)}
-                                             for side, value in zip(("left", "right"), hands)}}
                     states.send(b"g1_debug" + msgpack.packb(payload, use_bin_type=True))
                 last_state = now
             if now - last_camera >= 1 / 30:
@@ -150,9 +166,13 @@ def main():
                                                use_bin_type=True))
                 last_camera = now
     finally:
-        for socket in (cameras, states, actions):
-            socket.close()
-        context.term()
+        try:
+            if guard is not None:
+                guard.close()
+        finally:
+            for socket in (cameras, states, actions):
+                socket.close()
+            context.term()
         if organizer:
             print(json.dumps(follower.report()), flush=True)
         print(json.dumps({"messages": messages, "physical_commands_sent": False}), flush=True)

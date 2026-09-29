@@ -34,7 +34,11 @@ class JointStateData:
             ないので、受信時の monotonic ns が入る。
         tick: ロボット側の通し番号 (lowstate の `tick`)。`/joint_states` 経由では None。
         received_monotonic_ns: Desktop がこの sample を読んだ時刻。`/joint_states`
-            経由では None (callback 時刻は t と別に持っていない)。
+            経由では None (callback 時刻は t と別に持っていない)。鮮度の判定に使う。
+            PC2 state guard 経由では「問い合わせ時刻 − source の age」の下限で、
+            返事が遅れた分だけ早くなる (sample の間隔には使えない)。
+        measured_monotonic_ns: sample を計測した時刻 (この host の monotonic に合わせた値)。
+            速度・静止時間など sample の間隔に使う。None なら received_monotonic_ns と同じ。
         base_quat_wxyz: official boundary ``:5557`` が配る実測base姿勢。
             DDS経路には無いためNone。
     """
@@ -47,6 +51,7 @@ class JointStateData:
     tick: Optional[int] = None
     received_monotonic_ns: Optional[int] = None
     base_quat_wxyz: Optional[np.ndarray] = None
+    measured_monotonic_ns: Optional[int] = None
 
 
 class JointStateSource:
