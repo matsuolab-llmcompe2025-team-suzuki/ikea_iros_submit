@@ -40,10 +40,18 @@ sockets:
   "5556": "actions — BOUND by the Thor container on all interfaces; the adapter dials in with --actions-host <THOR_IP>"
   "8000": "VLM server inside the Thor container, bound to 127.0.0.1 only (Stage 1-4)"
 
+# On the event PC2 (G1 (3)) every organizer process runs after `source ~/iros_g1_3/iros_env.sh`
+# (cameras: iros_env_teleimager.sh). That env carries this robot's Dex1 calibration
+# (IROS_DEX1_*), read only by ~/wbc_adapter/deploy/run_wbc_with_dex1.py and ~/real_orin_state.py;
+# the package copies under ~/iros_g1_orin_package hardcode the bench unit's opposite direction.
+# THOR_IP = 192.168.123.222, PC2 = 192.168.123.164 (INSTRUCTIONS.md §2).
 organizer_stack_on_pc2:
+  cameras: "source ~/iros_g1_3/iros_env_teleimager.sh && python ~/real_orin_cameras.py"
+  state: "source ~/iros_g1_3/iros_env.sh && python ~/real_orin_state.py"
   wbc: >-
-    run_wbc_with_dex1.py --interface real --no-with-hands --keyboard_dispatcher_type ros
-    --no-enable-onscreen --dex1-max-speed 4.2
+    source ~/iros_g1_3/iros_env.sh && cd ~/GR00T-WholeBodyControl &&
+    iros_with_wbc_preload python ~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0
+    --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen --dex1-max-speed 4.2
   adapter_dry_run: "wbc_driver.py --lane decoupled --actions-host <THOR_IP> --state-source boundary"
   adapter_go_live: "wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-policy"
 

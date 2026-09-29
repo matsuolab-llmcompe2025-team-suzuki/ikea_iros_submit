@@ -80,47 +80,99 @@ sequenceDiagram
   T->>T: 終わり: Ctrl+C → 手を開き、腕を下ろして container が終了
 ```
 
-### Step 0〜1 [PC2] 環境とカメラ・状態の配信
+### 始める前に（毎 run。PC2 と Thor）
 
-RUNBOOK の Step 0（環境変数・`rt/lowcmd` を掴んでいる process が無いこと）と Step 1（`real_orin_cameras.py` と
-`real_orin_state.py` の 2 本）をそのまま行う。
+会場の PC2 は G1 (3)。以下は会場 PC2 の実ファイルと 2026-09-28/29 の実機 log で確かめた手順
+（運営 RUNBOOK の `conda activate …` の書き方はこの機体では使えない）。
+
+- **tmux の中で動かす。** SSH が切れても端末ごと残り、つなぎ直して `tmux attach` で操作を続けられる
+  （2026-09-29 の他チームの実機セッションで SSH が切れ、WBC と adapter が動いたまま残った）。
+  PC2: `tmux new -s ramen`（カメラ・状態・WBC・adapter を別 window で）、Thor: `tmux new -s ramen`（`docker run -it` を中で）。
+  tmux の外で `docker run -it` した後に切れたら、つなぎ直して `docker ps` → `docker attach <container>` で同じ端末に戻る
+  （抜けるのは Ctrl+P Ctrl+Q。attach 中の Ctrl+C は run を止める）。
+- **PC2 に他チームの WBC・adapter・bridge が残っていないか**（WBC が 2 つあると同じ `rt/lowcmd` を 2 つが出す）:
+  ```bash
+  ps -eo pid,user,etime,args | grep -E "run_wbc_with_dex1|run_g1_control_loop|wbc_driver|real_orin|g1_policy_bridge|gear_sonic" | grep -v grep
+  ```
+  残っていたら**自分で kill せず、運営に止めてもらう。**
+- **Thor に前の container や port が残っていないか**: `docker ps`、`ss -ltnp | grep -E ':(5556|8000)\b'`、`nvidia-smi`。
+  `:5556` を他が掴んでいると私たちの bind が失敗し、`:8000` なら VLM が起動できない。
+- **Thor に提出 image があるか**（無いと run が始まらない。会場の回線では GitHub からの pull が途中で切れた実例がある、2026-09-27）:
+  ```bash
+  docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 --format '{{.Id}}'
+  ```
+  エラーなら run の前に pull（約 9 GB）か USB から `docker load`。
+- IP: Thor のロボット側は `192.168.123.222`（`ip -4 addr show`）、PC2 は `192.168.123.164`。以下の `<THOR_IP>` / `<PC2_IP>` はこの値。
+
+### Step 0〜1 [PC2] カメラ・状態の配信
+
+PC2 の新しい shell は `ros:foxy(1) noetic(2) ?` と聞く。**何も選ばず Enter**（1 / 2 を選ぶと下の env が読み込みを拒否する）。
+この機体に base conda は無い（`conda activate` は使わない。env は下の `source` で読む）。
+
+```bash
+# カメラ（tmux window 1）
+source ~/iros_g1_3/iros_env_teleimager.sh
+python ~/real_orin_cameras.py
+
+# 状態（tmux window 2）
+source ~/iros_g1_3/iros_env.sh
+python ~/real_orin_state.py
+```
+
+- カメラで確かめる行: `head camera live at 1280x480 (native side-by-side; …)`、
+  `left_wrist (RealSense 262622270004) live`、`right_wrist (RealSense 262622273652) live`。
+  wrist の左右は運営が画像で確かめた割り当てで、`iros_env_teleimager.sh` が設定する（読まずに起動すると頭カメラの
+  名前が合わず、wrist の左右も決まらない）。
+- 状態で確かめる行: `Dex1 left (motor 31): raw closed -0.720 / open +4.640 -> published 0.00 closed / -5.30 open` と
+  `Dex1 right (motor 33): raw closed +0.000 / open +5.380 -> …`。**この 2 行が無ければ止める**（校正を読まない
+  `~/iros_g1_orin_package/reference/orin_bridge/real_orin_state.py` を起動している。グリッパの実測が逆向きになる）。
 
 ### Step 2 [PC2] WBC — **`run_wbc_with_dex1.py` で起動する**
 
 ```bash
-conda activate g1_wbc
+# tmux window 3
+source ~/iros_g1_3/iros_env.sh
 cd ~/GR00T-WholeBodyControl
-python <運営 package の tools>/run_wbc_with_dex1.py \
-  --interface real --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen \
+iros_with_wbc_preload python ~/wbc_adapter/deploy/run_wbc_with_dex1.py \
+  --interface eth0 --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen \
   --dex1-max-speed 4.2
 ```
 
+- **`~/wbc_adapter/deploy/run_wbc_with_dex1.py` を使う。** `~/iros_g1_orin_package/tools/run_wbc_with_dex1.py`（運営 package
+  `497f3ab` のまま）はベンチ機のグリッパの向き（0 = 閉 / −5.30 = 開）を決め打ちしている。この機体は開く向きが逆
+  （左 −0.72 閉 / +4.64 開、右 0.00 閉 / +5.38 開。`iros_env.sh` が `IROS_DEX1_*` で渡す）なので、package の方で起動すると
+  「開け」でグリッパを閉じる側の端へ押し付ける。
+- 起動 log で確かめる行: `[dex1] left (motor 31): closed q=-0.720, open q=+4.640` と
+  `[dex1] right (motor 33): closed q=+0.000, open q=+5.380`（**出なければ止める**）、
+  `[seed] upper-body interpolator seeded from MEASURED q`、`[wbc] defaulting --upper-body-joint-speed 3.0`。
+- `iros_with_wbc_preload` は WBC の process にだけ torch の `LD_PRELOAD` を付ける（adapter や bridge には付けない）。
 - RUNBOOK の `run_g1_control_loop.py` **ではない**。それだとグリッパ（Dex1-1）を動かすものが居ない
   （`run_wbc_with_dex1.py` は同じ引数を受ける差し替えで、グリッパの指令を同じ `rt/lowcmd` に載せる）。
 - `--dex1-max-speed 4.2`: 学習データのグリッパの速さ（運営の既定は 2.0）。
-- `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある。運営 RUNBOOK
-  （2026-09-25 版）の例は `~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0`。`--interface` は `real` でも
-  インターフェース名でもよい）。
 - **WBC の起動時の腕**: 運営 package が `f31952c`（2026-09-25）より古い wrapper だと、起動した瞬間に
   （adapter も私たちのコードもつながる前に）腕を肩 roll ±0.2・他 0 の姿勢へ 2 秒・フル剛性で動かす。新しい
   wrapper は実測の関節から始めて保持する（`--seed-from-measured` が既定。取れないと `[seed] WARNING: falling back
   to STOCK start-up` と出て古い動きになる）。どちらでも、**腕が台や物に届かない所で起動し**、止まってから stage の
   位置に置く。
-- 安定した保持状態になってから次へ（`ros2 topic hz /G1Env/env_state_act`）。
+- 安定した保持状態になってから次へ（`iros_env.sh` を読んだ別の shell で `ros2 topic hz /G1Env/env_state_act`）。
 
 ### Step 3 [PC2] adapter の試運転（まだ `--live` を付けない）
 
 ```bash
-conda activate g1_wbc
+# tmux window 4
+source ~/iros_g1_3/iros_env.sh
 cd ~/wbc_adapter
-python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --state-source boundary
+python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --state-source boundary
 ```
+
+- `[adapter] no actions on :5556 yet` が出ていれば、Thor の起動を待っている状態。
+- 試運転は Ctrl+C で止めてから Step 4 へ（go-live の adapter は Step 5 で同じ window に起動する）。
 
 ### Step 4 [Thor] 私たちの container
 
 ```bash
 docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host \
-  -e IROS_ORIN_HOST=<PC2_IP> \
+  -e IROS_ORIN_HOST=192.168.123.164 \
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
@@ -155,8 +207,16 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 ### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
 
 ```bash
-python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-policy
+# tmux window 4（Step 3 と同じ env）
+source ~/iros_g1_3/iros_env.sh
+cd ~/wbc_adapter
+python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --engage-policy
 ```
+
+- `Press Enter to proceed, Ctrl+C to abort...` と聞くので、E-stop 担当を確かめてから Enter。**対話端末で起動する**
+  （tmux の window。標準入力の無い起動では `EOFError` で落ちた実例がある、2026-09-28）。
+- 確かめる行: `joint lane: ON -- topics b'joint'/b'goto', limits=urdf, goto max speed 0.45 rad/s …`
+  （joint lane が使える。私たちの既定の送り方）と `--engage-policy: sent toggle_policy_action=True once`。
 
 - **`--state-source boundary` を付けない**（既定の `wbc` のまま）。decoupled で `boundary` と `--live` を
   一緒にすると adapter が `LAUNCH DENIED` で起動を拒否する（RUNBOOK の Step 6 の書き方はこの点でコードと違う）。
@@ -197,7 +257,7 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 ## 3. 次の run
 
-- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。
+- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。PC2 のカメラ・状態・WBC は止めない。
 - **adapter は止めない。** `--engage-policy` は押すたびに切り替わる。adapter を起動し直すなら WBC から起動し直す。
 
 ## 4. よく出る表示
@@ -219,6 +279,26 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 | `フェーズ：安全停止／保持中・判断待ち` | 安全停止。直前の `[safety-stop] …` が理由。確かめてから Enter（戻す）か Ctrl+C（その場で終える） |
 | `[gate] initial pose not reached (worst=… error=…); Enter ignored` | 開始姿勢に届いていないので Enter を捨てた。一番ずれた関節と量。腕を目で見て、届くのを待つ |
 | 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`WEIGHTS.md` の 4（`prefetch_weights.py --check`） |
+| `Address already in use`（`:5556`） | 前の run か他チームの container が `:5556` を掴んでいる。`docker ps` / `ss -ltnp` で確かめ、自分の古い container なら止める。他チームなら運営へ |
+| `operator transition 'hand_open_…' did not reach its target: hand_open_… did not reach [5.3, 5.3] before the deadline (measured=[…])` | Dex1 が全開（校正の端）まで 0.05 rad 以内に届かずに安全停止した。まず Step 1 の状態 bridge の Dex1 校正の 2 行を確かめる（無ければ bridge の起動し直し）。校正が正しいのに届かないなら、次の run は全開を 0.15 rad 手前にした設定で起動する（image は変えない。下の手順） |
+| `[gate] … NOT reached` や `[preparation] … holding` が続き、`joint=` が同じ関節 | その関節が届いていない。腕を目で見て、干渉が無ければ R で同じ経由点を再試行（準備）か、届くまで待つ（開始待ち） |
+
+Dex1 の全開を手前にする手順（上の表の行のときだけ。image は変えずに設定だけ差し替える）:
+
+```bash
+docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+  cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml > $RAMEN_HOST_DIR/skill_config_venue.yaml
+sed -i 's/^  open_rad: 5.4$/  open_rad: 5.15/' $RAMEN_HOST_DIR/skill_config_venue.yaml
+grep -n "open_rad" $RAMEN_HOST_DIR/skill_config_venue.yaml        # hand_pre_motion の open_rad: 5.15 を確かめる
+# Step 4 の docker run に次の 2 つを足す（-v は image の前、--skill-config は --actuate の後ろ）
+#   -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro
+#   --skill-config /app/venue_skill_config.yaml
+```
+
+起動 log の `[init] Dex1 preparation/release opening=5.15rad (boundary)` で効いたことが分かる。
+
+**pose lane（`--boundary-lane pose`）に切り替えない。** 2026-09-29 の他チームの実機 run では、この機体の運営 IK の受理が
+602 waypoint で左右とも 0% だった（joint lane は reject 0）。
 
 ## 5. conformance（運営の適合試験）
 
