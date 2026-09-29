@@ -23,26 +23,13 @@ images:
   thor:
     repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-preparation-10b8d73"
     digest: "sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4"
-    # What the operator types; everything that never changes at the venue is added by the
-    # image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
-    # One start runs every remaining stage (the 36-min evaluation cycle equals 6 stages x
-    # 2 runs x 3 min, while a start with Stage 1-4 loads for 4-5 min). <S> is the first stage;
-    # N after a stage's last policy moves on to the next stage. run_single_stage re-runs one
-    # stage (INSTRUCTIONS.md section 3).
+    # What the operator types per run; everything that never changes at the venue is added
+    # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
     # <skill_config_venue.yaml> is venue/skill_config_venue.yaml: the image's own skill_config
     # with only the Dex1 arrival tolerance widened (0.05 -> 0.20 rad), made on the Thor from
     # this image (INSTRUCTIONS.md section 1). Without it, a Dex1 that settles short of the
     # commanded opening ends the run before the policy starts.
     run: >-
-      docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host
-      -e IROS_ORIN_HOST=<PC2_IP>
-      -v <hf_cache>:/root/.cache/huggingface:ro
-      -v <outputs>:/app/ramen/outputs
-      -v <vlm_cache>:/cache
-      -v <skill_config_venue.yaml>:/app/venue_skill_config.yaml:ro
-      <image> --phase3-full --phase3-start-stage <S> --phase3-end-stage 5 --actuate
-      --skill-config /app/venue_skill_config.yaml
-    run_single_stage: >-
       docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host
       -e IROS_ORIN_HOST=<PC2_IP>
       -v <hf_cache>:/root/.cache/huggingface:ro

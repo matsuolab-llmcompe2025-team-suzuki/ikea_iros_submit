@@ -37,8 +37,6 @@ ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835f
    (other teams' processes, image, venue config, Stage 0 walking distance) and operator controls.
    On the event PC2 (G1 (3)) the organizer processes run after `source ~/iros_g1_3/iros_env.sh`,
    and the WBC is `~/wbc_adapter/deploy/run_wbc_with_dex1.py` (per-robot Dex1 calibration).
-5. Start the Thor container once and run the remaining stages in it (`--phase3-full`): the
-   36-minute evaluation cycle leaves no time to reload models (4-5 min with Stage 1-4) per run.
    [CONNECTION_TEST.md](CONNECTION_TEST.md) is the 09-27 connection-test record.
 
 The default action contract is the joint lane `(T,22)`; the organizer adapter is launched

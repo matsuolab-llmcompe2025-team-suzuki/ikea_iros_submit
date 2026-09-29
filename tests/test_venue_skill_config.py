@@ -66,16 +66,13 @@ def test_the_procedure_names_the_same_sed_hash_and_image_path() -> None:
 
 
 def test_every_venue_run_mounts_the_venue_config() -> None:
-    thor = yaml.safe_load((SUBMIT_ROOT / "manifest.yaml").read_text())["images"]["thor"]
-    for key, stages in (("run", "--phase3-full --phase3-start-stage <S> --phase3-end-stage 5"),
-                        ("run_single_stage", "--stage <0-5>")):
-        run = " ".join(thor[key].split())
-        assert f"-v <skill_config_venue.yaml>:{MOUNT}:ro" in run
-        assert run.endswith(f"<image> {stages} --actuate --skill-config {MOUNT}"), key
+    manifest = yaml.safe_load((SUBMIT_ROOT / "manifest.yaml").read_text())
+    run = " ".join(manifest["images"]["thor"]["run"].split())
+    assert f"-v <skill_config_venue.yaml>:{MOUNT}:ro" in run
+    assert run.endswith(f"--actuate --skill-config {MOUNT}")
     step4 = _instructions().split("### Step 4", 1)[1].split("### Step 5", 1)[0]
     assert f"skill_config_venue.yaml:{MOUNT}:ro" in step4
-    assert (f"--phase3-full --phase3-start-stage S --phase3-end-stage 5 --actuate "
-            f"--skill-config {MOUNT}") in step4
+    assert f"--skill-config {MOUNT}" in step4
 
 
 @pytest.fixture()

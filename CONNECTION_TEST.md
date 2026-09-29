@@ -12,7 +12,6 @@
 > - **pose lane は使えない**: この機体の運営 IK の受理は 602 waypoint で左右とも 0%（joint lane は reject 0）。R3・R4 は行わない。
 > - Dex1 は運営の柔らかい P 制御（kp 5.0）。目標の手前で止まりうるので、本番は Dex1 の到達の許容だけを広げた
 >   会場用の skill_config を mount する（`INSTRUCTIONS.md` §1・§4）。
-> - 評価時間は 36 分で、Stage 1〜4 の起動は 4〜5 分。本番は 1 回の起動で Stage を続けて動かす（`INSTRUCTIONS.md` Step 4・§3）。
 
 接続テストでやることは 2 つです。
 
