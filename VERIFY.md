@@ -333,6 +333,16 @@ Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace
 3. **guard の経路**: 模擬の camera/state に加えて、同じ loopback に guard（`venue_state_guard.serve` と模擬 DDS）を立て、
    `--boundary-state-guard --boundary-state-port 5558` で Stage を通す。DDS の停止・bridge だけの停止・tick の逆行・guard の再起動・
    往復の遅れで、古い state で準備が進まず、安全停止に入ることを確かめる。実機への故障注入はしない。
+   `operator_probe.py --state-guard` は両側を自動設定する。`following_mock.py` は別 thread の本番 `serve()` に模擬 lowstate を渡す。
+   `state` は bridge だけ停止、`guard-dds` は bridge の再配信を続けたまま DDS だけ停止する。通常の経路は option 無し。
+   tick 逆行・guard 再起動は `tests/test_gb10_guard.py`、通信遅延と静止時間は本体の `test_venue_state_guard.py` / `test_boundary_preparation.py` でも確認する。
 4. PC2 用 bundle（`tools/package_pc2_guard.py`）を同じ commit から作り、bundle の SHA256・image の digest・本体 commit・結果を記録する。
 5. 実機の DDS の負荷・タイミングは GB10 では確かめられない。運営の許可を得て、会場で `--check-only` と短い試運転から使う。
 
+```bash
+# GB10 only, /app/ramen; helpers are under /root. All endpoints are loopback.
+PY=/root/gb10-validation/.venv/bin/python
+"$PY" /root/operator_probe.py --state-guard --case full --trace --output /root/runs/guard-full
+"$PY" /root/operator_probe.py --state-guard --case state --trace --output /root/runs/guard-bridge-stop
+"$PY" /root/operator_probe.py --state-guard --case guard-dds --trace --output /root/runs/guard-dds-stop
+```
