@@ -12,9 +12,9 @@ CONTRACT は ``body_q`` / ``base_quat`` だけを保証し、手の state は「
 message に **``gripper_q``** (Dex1 の motor の実測 ``q``、``0`` = 閉 /
 ``-5.30`` = 開) を載せている (2026-09-10 に team の要望で追加)。
 
-契約外なので **あれば使い、無ければ合成 (指令エコー) に戻る** (2026-09-23 決定、
-Codex #2)。公式の ``StateStream`` の検証はそのまま通し (``_decode`` を subclass で
-包むだけ、vendor は無改変)、追加 key を読むだけにする。
+legacy経路では無ければ合成 (指令エコー) に戻る。会場のguarded経路は
+PC2の読み取り専用guard (:5558) からDDS鮮度確認付きstateだけを受け、合成へ戻らない。
+公式のdecodeはそのまま使い、vendorは無改変。
 """
 
 from __future__ import annotations
@@ -29,8 +29,9 @@ import numpy as np
 
 from inference.desktop.perception.g1_urdf_fk import G1_JOINT_NAMES
 from inference.desktop.perception.joint_state_source import JointStateData
+from inference.desktop.perception.venue_state_guard import MAX_SOURCE_AGE_S
 
-#: 運営 relay の写像 (`tools/run_wbc_with_dex1.py`): motor q = -(物理の開き)。
+#: 運営 bridge の正規化済み q = -(物理の開き)。raw motorの符号ではない。
 #: 我々の model 座標は物理の開き [rad] (0 = 閉) なので符号だけ反転する
 #: (`taskspace_adapter.dex1_model_to_taskspace` と同じ前提)。
 ORGANIZER_GRIPPER_Q_TO_OPENING = -1.0
@@ -92,8 +93,13 @@ class BoundaryJointStateSource:
     """Latest-only adapter for the organizer's canonical 29-DoF state."""
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 5557, *, stream: Any = None
+        self, host: str = "127.0.0.1", port: int = 5557, *, stream: Any = None,
+        guarded: bool = False,
     ) -> None:
+        self._guarded = guarded
+        if stream is None and guarded:
+            from inference.desktop.perception.guarded_state_stream import GuardedStateStream
+            stream = GuardedStateStream(host, port)
         self._stream = stream if stream is not None else _gripper_aware_stream(host, port)
         self._latest: Optional[JointStateData] = None
         self._latest_gripper: Optional[tuple[np.ndarray, int]] = None
@@ -109,6 +115,13 @@ class BoundaryJointStateSource:
         self._thread.start()
 
     def _receive_loop(self) -> None:
+        try:
+            self._receive_states()
+        finally:
+            if getattr(self, "_guarded", False):
+                self._stream.close()
+
+    def _receive_states(self) -> None:
         while True:
             with self._lock:
                 if self._closed:
@@ -124,7 +137,14 @@ class BoundaryJointStateSource:
 
             position = np.asarray(state.body_q, dtype=np.float64).copy()
             base_quat = np.asarray(state.base_quat, dtype=np.float64).copy()
-            received_ns = time.monotonic_ns()
+            now_ns = time.monotonic_ns()
+            received_ns = getattr(state, "source_received_ns", now_ns)
+            if getattr(self, "_guarded", False) and (
+                not hasattr(state, "source_received_ns")
+                or not 0 <= now_ns - received_ns <= MAX_SOURCE_AGE_S * 1e9
+                or (self._previous_received_ns is not None and received_ns <= self._previous_received_ns)
+            ):
+                continue
             velocity = np.zeros_like(position)
             if self._previous_position is not None and self._previous_received_ns is not None:
                 dt = (received_ns - self._previous_received_ns) * 1e-9
@@ -138,7 +158,7 @@ class BoundaryJointStateSource:
                 velocity=velocity,
                 effort=np.zeros_like(position),
                 t=received_ns,
-                tick=None,
+                tick=getattr(state, "source_tick", None),
                 received_monotonic_ns=received_ns,
                 base_quat_wxyz=base_quat,
             )
@@ -222,12 +242,17 @@ class BoundaryDex1StateSource:
                 file=sys.stderr,
             )
         elif report and sample is None:
-            print(
-                "[dex1] no gripper_q on :5557 yet; Dex1 state is the SYNTHETIC "
-                "command echo (grasp checks fall back to VLM-only)",
-                file=sys.stderr,
-            )
+            if getattr(self._joint, "_guarded", False):
+                print("[dex1] waiting for guarded measured state; synthetic fallback disabled", file=sys.stderr)
+            else:
+                print(
+                    "[dex1] no gripper_q on :5557 yet; Dex1 state is the SYNTHETIC "
+                    "command echo (grasp checks fall back to VLM-only)",
+                    file=sys.stderr,
+                )
         if sample is None:
+            if getattr(self._joint, "_guarded", False):
+                return None
             return self._synthetic.get()
         q, received_ns = sample
         return Dex1StateData(

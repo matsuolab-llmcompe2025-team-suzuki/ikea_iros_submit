@@ -1,0 +1,31 @@
+{
+  "name": "G1(3) internal, organizer ZIP 2026-09-29",
+  "hand_type": "internal",
+  "robot_serial": "1423825052744",
+  "interface": "eth0",
+  "upstream_endpoint": "tcp://127.0.0.1:5557",
+  "guard_port": 5558,
+  "source_max_age_s": 0.25,
+  "calibration": {"left": [-0.72, 4.64], "right": [0.0, 5.38]},
+  "environment": {
+    "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+    "ROS_DISTRO": "humble",
+    "ROS_DOMAIN_ID": "0",
+    "CONDA_PREFIX": "${HOME}/miniconda3/envs/g1_wbc",
+    "AMENT_PREFIX_PATH": "${HOME}/miniconda3/envs/g1_wbc",
+    "CYCLONEDDS_HOME": "${HOME}/cyclonedds/install",
+    "PYTHONPATH": "${HOME}/GR00T-WholeBodyControl",
+    "IROS_DEX1_LEFT_CLOSED_Q": "-0.72",
+    "IROS_DEX1_LEFT_OPEN_Q": "4.64",
+    "IROS_DEX1_RIGHT_CLOSED_Q": "0.00",
+    "IROS_DEX1_RIGHT_OPEN_Q": "5.38"
+  },
+  "files_sha256": {
+    "wbc_adapter/deploy/run_wbc_with_dex1.py": "c4f25ee4b56635db15b9abf2285e0ed1ee025b02b0e436bb38b70d7989751d13",
+    "wbc_adapter/wbc_driver.py": "657c8141a2802c7adc467aa75f9e96d24451ec09689b69bef771f40dcc50005e",
+    "real_orin_state.py": "134cc12bc8074480478eddf6c21b594f978c03f95186bce7787bd1fe87913ff7",
+    "real_orin_cameras.py": "e49a8ebf6789a996c835d305aef16b994cec110b0b1d365c1fa43e679b438d50",
+    "iros_g1_3/iros_env.sh": "be25d01393ac5a5d8de5c23d7218fa63ca36e3850b0d134a27cacd2b3cfa4bdd",
+    "iros_g1_3/iros_env_teleimager.sh": "f9985dd738b9449dbcbc16a26016f535f529aae530045110af382e6614760143"
+  }
+}

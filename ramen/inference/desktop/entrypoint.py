@@ -1639,7 +1639,16 @@ def parse_args() -> argparse.Namespace:
         "--boundary-state-port",
         type=int,
         default=5557,
-        help="運営公式 robot-state SUB endpoint の port",
+        help="robot-state port: legacy SUB 5557; --boundary-state-guard requires REP 5558",
+    )
+    p.add_argument(
+        "--boundary-state-guard",
+        action="store_true",
+        help=(
+            "opt-in: read state from the PC2 read-only state guard (REP :5558), which confirms "
+            "each :5557 payload with a fresh DDS tick; needs the organizer's approval to run the "
+            "guard on PC2. Without this option the organizer's :5557 is read directly (default)"
+        ),
     )
     p.add_argument(
         "--synthetic-hand-state",
@@ -1808,6 +1817,11 @@ def configure_official_endpoints(args: argparse.Namespace) -> None:
     (`:5557`) は同じ Orin が配るので、最後に同じ host であることを確かめる。
     """
 
+    if getattr(args, "boundary_state_guard", False):
+        if getattr(args, "action_sink", "sdk") != "boundary":
+            raise ValueError("--boundary-state-guard requires --action-sink boundary")
+        if getattr(args, "boundary_state_port", 5557) == 5557:
+            raise ValueError("state guard uses REQ/REP, not legacy :5557; use --boundary-state-port 5558")
     if getattr(args, "action_sink", "sdk") == "boundary":
         args.head_source = "zmq"
         args.joint_source = "boundary"
@@ -3483,6 +3497,7 @@ def main() -> None:
             zmq_endpoint=args.zmq_endpoint,
             boundary_state_host=args.boundary_state_host,
             boundary_state_port=args.boundary_state_port,
+            boundary_state_guard=args.boundary_state_guard,
             synthetic_hand_initial_rad=synthetic_hand_initial_rad,
         )
         if synthetic_hand_initial_rad is not None:
