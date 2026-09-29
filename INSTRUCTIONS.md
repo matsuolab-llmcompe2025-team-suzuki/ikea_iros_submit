@@ -53,8 +53,9 @@ Stage 1〜4 の起動は読み込みに 4〜5 分かかるため、run ごとに
 ## 1. 事前準備（会場の前に Thor で 1 回）
 
 ```bash
-# 置き場所（例）。以下の手順はこの 3 つを使う
-export RAMEN_HOST_DIR=~/ramen
+# 置き場所。運営の指定はチームの folder（ADMINISTRATIVE_MANIFEST §6: In-Person/<TEAM>/ に Thor 側の image・file を置く）。
+# 既に別の場所（例 ~/ramen）に重みを置いたなら、中身は動かさずにそこを指す。以下の手順はすべて $RAMEN_HOST_DIR を使う
+export RAMEN_HOST_DIR=~/Humanoid_IKEA_Assembly_Challenge/In-Person/RAMEN
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
 # image（tag gb10-preparation-10b8d73 = 本体 10b8d73。digest は manifest.yaml と同じ。
@@ -116,6 +117,9 @@ sequenceDiagram
   docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 --format '{{.Id}}'
   ```
   エラーなら run の前に pull（約 9 GB）か USB から `docker load`。
+- **Thor の shell で `$RAMEN_HOST_DIR` が重みを置いた場所を指しているか**（新しい shell・tmux window では空になる。
+  空のまま `docker run` すると `/hf_cache` などの空の directory が mount され、重みが無くて止まる）:
+  `echo $RAMEN_HOST_DIR && ls $RAMEN_HOST_DIR/hf_cache/hub | head -3`。空なら 1 章の `export` をもう一度。
 - **Thor に会場用の skill_config があるか**（1 章で作った物。無いと Step 4 で docker が同じ名前の空の directory を作り、
   起動が `IsADirectoryError` で止まる）。image の設定との違いが、許容の 1 行（と 4 章の手順で直した行）だけであること:
   ```bash
