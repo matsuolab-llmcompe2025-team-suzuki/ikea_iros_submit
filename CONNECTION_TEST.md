@@ -1,5 +1,19 @@
 # 接続テスト（09-27）の手順 — Team RAMEN
 
+> **この文書は 09-27 の接続テストの計画と記録です。本番の起動・確認・操作は `INSTRUCTIONS.md` だけを使います。**
+> 2026-09-29 までに会場で分かったこと（会場 PC2 の実ファイル一式と、同じ機体の他チームの実機 log）:
+>
+> - 会場の機体は G1 (3)。運営のプログラムは `source ~/iros_g1_3/iros_env.sh` の後に起動する（base conda は無い）。
+>   WBC は `~/wbc_adapter/deploy/run_wbc_with_dex1.py`（機体ごとの Dex1 校正を読む。package の `tools/` の同名 file は使わない）。
+> - 2-1: 運営 RUNBOOK どおり、PC2 の運営のプログラムも私たちが起動する（`INSTRUCTIONS.md` §2）。
+> - 2-2: 会場 PC2 の `~/wbc_adapter` は運営 `497f3ab` と同一（`609f61d` 以降。joint lane あり）。R4 は不要。
+> - 2-3: 頭カメラは `head camera live at 1280x480 (native side-by-side; …)`。wrist は左 `262622270004` / 右 `262622273652`。
+> - 2-6: WBC の腕の `MOTOR_KP` は `100, 100, 40, 40, 20, 20, 20`（重力の垂れ補正の前提どおり）。
+> - **pose lane は使えない**: この機体の運営 IK の受理は 602 waypoint で左右とも 0%（joint lane は reject 0）。R3・R4 は行わない。
+> - Dex1 は運営の柔らかい P 制御（kp 5.0）。目標の手前で止まりうるので、本番は Dex1 の到達の許容だけを広げた
+>   会場用の skill_config を mount する（`INSTRUCTIONS.md` §1・§4）。
+> - 評価時間は 36 分で、Stage 1〜4 の起動は 4〜5 分。本番は 1 回の起動で Stage を続けて動かす（`INSTRUCTIONS.md` Step 4・§3）。
+
 接続テストでやることは 2 つです。
 
 1. 会場の機材（運営の PC2・WBC・adapter と実機）で、私たちの image が最後まで動くかを確かめる。
@@ -69,8 +83,8 @@ PC2 の中を読むときは、必ず運営に断ってからにします。
 
 ## 4. 試す run（上から順に。前の run で問題があれば、次へ進む前に止まって相談）
 
-1 run は 5〜10 分（読み込みを含む）かかります。時間が足りなければ **R1 → R2 → R3 → R5** を優先します。
-2-2 が `609f61d` より前なら、R2・R3 の代わりに R4 を通します（R5 も R4 と同じ option で）。
+1 run は 5〜10 分（読み込みを含む）かかります。時間が足りなければ **R1 → R2 → R5** を優先します（R3・R4 は行わない）。
+（会場の package は `497f3ab` なので、R4 に切り替える場合は無い。）
 
 | # | stage | 足す option | 目的 | 見る所 |
 |---|---|---|---|---|
@@ -78,8 +92,8 @@ PC2 の中を読むときは、必ず運営に断ってからにします。
 | **R1** | 0 | なし（既定） | 歩いて pick の開始姿勢まで | go-live の後に腕を下ろす → `[setup] measured lowered arm pose latched` → 台まで歩く → 止まって手を開く → pick の開始姿勢 |
 | R1b | 0 | `--walk-lowering-check converged` | **R1 が歩く前に止まったときだけ** | R1 の止まり方が `lowering the arms before the walk failed` か `not in the lowered walk envelope` のとき。`[setup] WARNING: lowered arms are outside the walk envelope (…)` のどの関節が外れたかを記録し、歩けるか |
 | **R2** | 1（脚 1 本目） | なし（既定 = joint lane・重力の垂れ補正 on） | 今の既定の形で 1 本通す（2-2 が 609f61d 以降のときだけ） | pick（VLM が答えるか、握れるか、持ち替え）→ **N** → insert → **N** → 締め付け（policy の終わりは自分で見て N。各 policy の開始姿勢で Enter）。**最初の開始待ちで 10 秒以上待ってから Enter**（保持の確認に使う。下の注）。開始待ちの問い（下の注）、開始姿勢への到達（`joint_error`）、動きが学習どおりに見えるか、adapter の `[stats]` に joint の受信が数えられるか、URDF の clamp の log が多すぎないか |
-| **R3** | 1 | `--boundary-lane pose` | 手先の姿勢で送る形（運営 IK を通る。2-2 が 609f61d 以降のときだけ） | R2 と同じ所を比べる。開始姿勢への到達（`ee_pos_error`）、adapter の IK の失敗（reject）の多さ、締め付け（手首 roll を大きく使う）で腕が止まらないか。起動 log の `[boundary] wrist_roll clamp: off …` |
-| R4 | 1 | `--boundary-lane pose --wrist-roll-clamp on` | **2-2 が 609f61d より前のときだけ**（古い運営 IK の手首 roll ±0.9 の上限に合わせる） | R2 の見る所と同じ。起動 log の `[boundary] wrist_roll clamp: on …` |
+| ~~R3~~ | 1 | `--boundary-lane pose` | **行わない**（09-29: この機体の運営 IK の受理 0%）。手先の姿勢で送る形（運営 IK を通る） | R2 と同じ所を比べる。開始姿勢への到達（`ee_pos_error`）、adapter の IK の失敗（reject）の多さ、締め付け（手首 roll を大きく使う）で腕が止まらないか。起動 log の `[boundary] wrist_roll clamp: off …` |
+| ~~R4~~ | 1 | `--boundary-lane pose --wrist-roll-clamp on` | **行わない**（会場の package は `497f3ab`。pose lane も使えない） | R2 の見る所と同じ。起動 log の `[boundary] wrist_roll clamp: on …` |
 | **R5** | 5 | R2・R3 で良かった方の送り方（joint なら option なし） | flip | 開始姿勢 → Enter → 裏返す → 終わったら Ctrl+C（戻して終わる） |
 | R6 | 2 など | `--policy-variant-set all6_400k` | 候補の model（時間があれば） | 既定の model と比べて明らかに良いか |
 
@@ -101,8 +115,8 @@ PC2 の中を読むときは、必ず運営に断ってからにします。
 | 決めること | 選択肢 | 決め方 |
 |---|---|---|
 | 重力の垂れ補正の倍率（`--boundary-gravity-offset-scale`） | `1.0`（今の既定）/ 測った値 | §4 の保持の確認で `suggested` が 0.8〜1.2 なら `1.0` のまま。外れたら測った値を試し、良くなれば既定にする。補正で腕がおかしくなるなら `--boundary-gravity-offset off` |
-| 指令の送り方（`--boundary-lane`） | `joint`（今の既定）/ `pose` | 2-2 が 609f61d 以降で、R2 が開始姿勢に届き、腕が止まらず、動きが学習どおりなら `joint` のまま。R2 が怪しく R3 の方が良ければ `pose`。2-2 が古ければ `pose` |
-| 手首 roll の clamp（`--wrist-roll-clamp`、pose lane のときだけ効く） | `off`（今の既定）/ `on` | 2-2 が 609f61d より前（古い運営 IK）のときだけ `on`。それ以外は `off` のまま |
+| 指令の送り方（`--boundary-lane`） | `joint`（今の既定）/ `pose` | **`joint` のまま**（09-29: 会場の package は `497f3ab`、この機体の運営 IK の受理は 0% なので `pose` は使えない） |
+| 手首 roll の clamp（`--wrist-roll-clamp`、pose lane のときだけ効く） | `off`（今の既定）/ `on` | `off` のまま（pose lane を使わないので効かない） |
 | Stage 0 の下ろした腕の確かめ方（`--walk-lowering-check`） | `joint`（今の既定）/ `converged` | R1 が歩く前に止まり、R1b で歩けたときだけ `converged`。R1 で歩ければ `joint` のまま |
 | model（`--policy-variant-set`） | 既定 / `all6_400k` | R6 で明らかに良かったときだけ切り替える。試さなければ既定のまま |
 | GPU に載せる model の数（`--gpu-models`） | `all`（今の既定）/ `2` | 読み込みでメモリが足りずに止まったときだけ `2` |
@@ -127,7 +141,8 @@ flowchart LR
   - Stage 0 の確かめ方: `skill_config.yaml` の `skills.walk_lowered_pose.latch_check`
   - model: `policy_config.yaml` の `default_variant_by_skill`
   - GPU: 起動口 `docker/venue_entry.sh`
-- `INSTRUCTIONS.md` の本番の `docker run` の行には、option を 1 つも書かない（書くのはこの手順書だけ）。
+- `INSTRUCTIONS.md` の本番の `docker run` の行には、Stage の指定・`--actuate`・会場用の skill_config（`--skill-config`）
+  以外の option を書かない（試す option を書くのはこの手順書だけ）。
 - **焼き直しが間に合わないとき**: 今の image のまま、決めた option を `INSTRUCTIONS.md` §2 Step 4 の `docker run` の行に書き込んで戦う。本番は打つのではなく、その 1 行を貼るだけにする。
 
 ## 7. 記録の表（run ごとに 1 行）
@@ -184,7 +199,7 @@ log は Thor の `$RAMEN_HOST_DIR/outputs/orch_logs/`（`orch_*.jsonl` と VLM �
 
 - 起動 log の `[boundary] JointSink (joint lane) bound on …` で分かる（pose なら `DecoupledSink (pose lane)`）。
 - 運営のシミュレーションでは、同じ軌道で joint lane が誤差 0.05 rad 以内、pose lane は最大 0.75 rad（IK は全部成功していても）。
-- 運営はまだ実機で試していない（「組み込んでよいが、本番で頼るのはまだ」）。
+- 09-29 に会場の機体で他チームが pose lane を使ったところ、運営 IK の受理は 602 waypoint で左右とも 0% だった（joint lane は reject 0）。本番は joint lane。
 
 ### 重力の垂れ補正（`--boundary-gravity-offset {on,off}`・`--boundary-gravity-offset-scale <0〜2>`）
 

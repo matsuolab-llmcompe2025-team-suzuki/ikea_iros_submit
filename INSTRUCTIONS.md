@@ -26,8 +26,9 @@ flowchart LR
 - Thor の entrypoint が PC2 の `:5555` / `:5557` を**直接**読み、`:5556` は **Thor が bind** する。
   PC2 の adapter は `--actions-host <THOR_IP>` で Thor につなぐ（adapter の `--actions-host` は
   「:5556 を bind した側の host」、既定は 127.0.0.1 = PC2 自身）。
-- VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 の run の中で container が自分で起動し、run の終わりに止める。
-- container は run ごとに作り直す。重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
+- VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 を含む起動で container が自分で起動し、container の終わりに止める。
+- 本番は 1 回の起動で残りの Stage を続けて動かし（Step 4）、Stage をやり直すときだけ container を作り直す（§3）。
+  重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
 
 **この提出経路は運営WBCを使います。** joint laneは運営IKを迂回して腕関節角を渡す方式であり、
 Regular Modeの`arm_sdk`へ直接送る方式ではありません。hybrid preflight等に残る`Regular`の文言は
@@ -41,10 +42,13 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 
 | Stage | 中身 | 操作（§2「操作キー」） |
 |---|---|---|
-| 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | Enter 1（安全確認）だけ |
-| 1 | 1本目: pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
-| 2〜4 | 脚1本ずつ: 台を回す → pick → insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
-| 5 | 台を裏返す（flip） | Enter 1 → 開始姿勢で Enter |
+| 0 | 準備（go-live 後に腕を下ろす → 決めた時間だけ前進 → pick の開始姿勢） | Enter 1（安全確認）だけ。終わると Stage 1 の pick の開始待ちへ自動で続く |
+| 1 | 1本目: pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ。最後の policy の後の **N** で次の Stage へ |
+| 2〜4 | 脚1本ずつ: 台を回す → pick → insert → 締め付け | 同上 |
+| 5 | 台を裏返す（flip） | 開始姿勢で Enter → 終わったら Ctrl+C（戻して終わる） |
+
+**本番は 1 回の起動で Stage を続けて動かす**（Step 4）。評価時間は 36 分（6 Stage × 2 run × 3 分と同じ長さ）で、
+Stage 1〜4 の起動は読み込みに 4〜5 分かかるため、run ごとに起動し直すと時間が尽きる。
 
 ## 1. 事前準備（会場の前に Thor で 1 回）
 
@@ -72,7 +76,7 @@ sha256sum $RAMEN_HOST_DIR/skill_config_venue.yaml
 ```
 
 - `vlm_cache` は VLM の compile 結果の置き場。1 回目の run だけ小さな kernel の compile が走り、2 回目以降は再利用する。
-- `outputs` に run ごとの log（`orch_logs/orch_*.jsonl`、VLM の `orch_logs/vlm_*.log`）が残る。
+- `outputs` に起動ごとの log（`orch_logs/orch_*.jsonl`、VLM の `orch_logs/vlm_*.log`）が残る。
 
 ## 2. 1 run の手順（**順番が大事**）
 
@@ -83,10 +87,10 @@ sequenceDiagram
   P->>P: Step 0-1 環境・bridge（:5555 / :5557）
   P->>P: Step 2 WBC（run_wbc_with_dex1.py）
   P->>P: Step 3 adapter 試運転（--actions-host THOR、--live 無し）
-  T->>T: Step 4 docker run … --stage N --actuate（model・VLM の読み込み）
+  T->>T: Step 4 docker run … --phase3-full … --actuate（全 Stage の model・VLM を 1 回だけ読み込む）
   T->>T: Enter 1（安全確認）→ go-live 待ち（肩を少し動かし、実測がついてくるまで待つ）
   P->>T: Step 5 人が go-live（--live --engage-policy）
-  T->>T: 開始姿勢・保持 → Enter → policy → N → 次の開始姿勢 → Enter → …（Stage 0 は Enter 1 だけ）
+  T->>T: 開始姿勢・保持 → Enter → policy → N → 次の開始姿勢 → Enter → …（Stage の最後の N で次の Stage へ）
   T->>T: 終わり: Ctrl+C → 手を開き、腕を下ろして container が終了
 ```
 
@@ -187,7 +191,11 @@ python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --state-sou
 - `[adapter] no actions on :5556 yet` が出ていれば、Thor の起動を待っている状態。
 - 試運転は Ctrl+C で止めてから Step 4 へ（go-live の adapter は Step 5 で同じ window に起動する）。
 
-### Step 4 [Thor] 私たちの container
+### Step 4 [Thor] 私たちの container（本番は 1 回の起動で続けて動かす）
+
+準備時間（20 分）のうちに起動し、読み込み（Stage 1〜4 を含むと 4〜5 分）を済ませておく。`S` は最初に動かす Stage
+（歩行をするなら 0）。最後の Stage 5 まで同じ container で進む（GB10 の最終 image で Stage 0〜5 の連続実行を確認済み。
+`GB10_PREPARATION_REPORT.md`）。
 
 ```bash
 docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host \
@@ -197,21 +205,23 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
   -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro \
   ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
-  --stage N --actuate --skill-config /app/venue_skill_config.yaml
+  --phase3-full --phase3-start-stage S --phase3-end-stage 5 --actuate --skill-config /app/venue_skill_config.yaml
 ```
+
+1 つの Stage だけを動かすとき（同じ Stage の 2 回目の run、確かめの run）は、
+`--phase3-full --phase3-start-stage S --phase3-end-stage 5` の代わりに `--stage S` を書く（§3）。
 
 - `-it` 必須（Enter・N・R を押すため。対話端末でないと `--actuate` は
   `N/R/Enter production controls require an interactive TTY` で起動しない）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
 - **操作する端末は半角英数にしておく**（日本語入力が ON だと N / R / Enter は何も表示されずに無視される）。
 - 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
-  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate --skill-config /app/venue_skill_config.yaml` だけ
-  （会場用の skill_config。この image を使う間は毎回付ける）。大会本番ではほかの option を足さない。**
+  （`docker/venue_entry.sh`）が付ける。**打つのは上の Stage の指定・`--actuate`・`--skill-config /app/venue_skill_config.yaml`
+  だけ（会場用の skill_config。この image を使う間は毎回付ける）。大会本番ではほかの option を足さない。**
   起動 log の `[init] topic=… skill_config=/app/venue_skill_config.yaml` で会場用の設定を読んだと分かる。
-  接続テストで試す option（model・送り方・手首 roll の clamp・Stage 0 の確かめ方）は `CONNECTION_TEST.md` にまとめてあり、
-  決めた値は既定にしてから本番に使う。
+  model・送り方などを切り替える option の説明は `CONNECTION_TEST.md` の付録（09-27 の接続テスト用。本番では使わない）。
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
-  目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
-  （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。
+  目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 を含む起動は Enter 1 まで 4〜5 分
+  （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 だけなら 1 分弱、Stage 0 だけなら十数秒。
   今回の全Stage連続試験ではGPU使用量の最大44.36 GiB、MemAvailableの最小39.78 GiBを記録した。
   詳細は`GB10_PREPARATION_REPORT.md`を参照する。
   GB10の測定値をThorの起動時間やメモリ上限の保証として扱わない。
@@ -253,7 +263,7 @@ python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --en
 | キー | 動き |
 |---|---|
 | `Enter` | 開始姿勢に着いてから押すと policy が始まる。着いていない Enter は捨てられ、`[gate] initial pose not reached (worst=<関節> error=<rad>)` と一番ずれた関節が出る。insert・締め付けのやり直しでは、脚を置いた後の Enter で初期の握り幅へ、もう一度 Enter で開始 |
-| `N` | 今の policy を止めて、次の policy の開始姿勢へ移る（着いたら Enter を待つ）。stage の最後の policy では効かない |
+| `N` | 今の policy を止めて、次の policy の開始姿勢へ移る（着いたら Enter を待つ）。Stage の最後の policy では次の Stage の最初の policy へ移る（§3。最後の Stage 5 と、`--stage S` で起動した run の最後では効かない） |
 | `R` 1 回目（Policy中） | 腕は最後の指令のまま、両手だけ全開にする |
 | `R` 2 回目 | 開き終わってから効く。同じ policy の開始姿勢へ戻る（Enter まで始まらない） |
 | `Ctrl+C` | 歩行を 0 にし、今の policy の開始姿勢 → 手を全開 → 起動時の道を逆にたどって腕を下ろし、終わる。**戻し動作の途中で 1 秒以上たってからもう一度押すと、その場で保持して終える**（運営 adapter の最後の指令保持を前提とする。実際の保持は WBC・電源・通信の状態に依存するため、E-stop 担当は離れない） |
@@ -279,9 +289,19 @@ python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --en
   WBC 自身の 1 秒の見張りが速度制限を通らない保持の目標を差し込むため。Thor が go-live 待ちで指令を
   出している状態で go-live する。
 
-## 3. 次の run
+## 3. Stage の間・次の run
 
-- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。PC2 のカメラ・状態・WBC は止めない。
+- **次の Stage へ**: その Stage の最後の policy が済んだら **N**（`[run] Phase 3 continuous stage <次> started`）。
+  腕はすぐ次の Stage の開始姿勢へ動き（手も開く）、開始待ちで止まる（policy はまだ始まらない）。
+  運営が次の Stage の状態（脚・台の向き）を作るので、**N は運営と声をかけ合い、ロボットの手の届く所に人がいないときに押す。**
+  運営の準備が済んでから Enter。Stage 0 から Stage 1 へは自動で続く。
+- **同じ Stage の 2 回目の run**（1 回目の失敗・時間超過で運営がその Stage の初期状態へ戻したとき）: 動いている container は
+  Stage の途中から Stage の最初へ戻れない。**Ctrl+C**（戻して終わる）の後、Step 4 を `--stage S` で起動し直す
+  （Stage 1〜4 は読み込みに 4〜5 分。その分だけ残りの評価時間が減る）。失敗が 1 つの policy だけで、同じ policy から
+  やり直せば済むなら、起動し直さずに **R**（§2「操作キー」）を使う。
+- 2 回目も時間超過すると運営は次の Stage の初期状態へ移る。起動し直した container（`--stage S`）は Stage S で終わるので、
+  続けるなら Step 4 を `--phase3-start-stage <次の Stage>` で起動し直す。
+- **Thor の `docker run` だけをやり直す。** PC2 のカメラ・状態・WBC は止めない。
 - **adapter は止めない。** `--engage-policy` は押すたびに切り替わる。adapter を起動し直すなら WBC から起動し直す。
 
 ## 4. よく出る表示
@@ -342,6 +362,6 @@ python conformance.py --lane decoupled
 `components/server.py` は conformance 専用（本番と同じ受け口・送り口で、実測の姿勢を保つ指令を送る）。
 会場の run はこの file を通らない。`components/client.py` は conformance が起動するための置き物。
 
-## 6. 09-27 の接続テスト
+## 6. 接続テスト（09-27）の記録
 
-`CONNECTION_TEST.md`（運営に確かめること、起動の各段で見る所、試す run の順番、決め方、記録の表）。
+`CONNECTION_TEST.md`（09-27 の接続テストの計画と、その後に会場で分かったこと。本番の手順はこの文書）。

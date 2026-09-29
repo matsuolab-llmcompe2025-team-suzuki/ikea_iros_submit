@@ -1,9 +1,10 @@
 # Team RAMEN — IKEA IROS 提出物
 
-提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。このブランチのimageは
-`gb10-preparation-10b8d73` です。[manifest.yaml](manifest.yaml)のdigest固定版を使用してください。重みの取得は [WEIGHTS.md](WEIGHTS.md)、
-会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、検証結果は
-[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md) を参照してください。mainへのマージは未実施です。
+提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。提出 image は `gb10-preparation-10b8d73`（本体 `10b8d73`）で、
+[manifest.yaml](manifest.yaml) の digest 固定版を使います。会場では image に加えて、image の設定から Dex1 の到達の許容だけを
+広げた会場用の skill_config（[venue/skill_config_venue.yaml](venue/skill_config_venue.yaml)）を mount します。
+重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、image の検証結果は
+[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md) を参照してください。
 
 ## Team RAMEN の部分と直す場所
 
@@ -17,7 +18,8 @@ commit と同じなのかも分からなくなる）。
 | image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
 | 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
 | 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
-| 接続テスト（09-27）で試して決めること | `CONNECTION_TEST.md`（試す option はここだけに書く。大会本番は option なし） |
+| 焼き直さずに会場で変える値（Dex1 の到達の許容・Stage 0 の前進時間） | `venue/skill_config_venue.yaml`（image の skill_config から作る。`tests/test_venue_skill_config.py` が差を固定。焼き直したら作り直す） |
+| 接続テスト（09-27）の記録と、切り替えの option の説明 | `CONNECTION_TEST.md`（履歴。本番は `INSTRUCTIONS.md` の起動だけで、option は足さない） |
 | conformance の受け口 | `components/` |
 
 更新の流れ:
@@ -44,13 +46,13 @@ flowchart LR
 | もの | やること |
 |---|---|
 | カメラ bridge | `:5555` に head と手首カメラの JPEG を publish する |
-| 状態 bridge | `:5557` に `body_q`・`base_quat` を 50 Hz で publish する（2026-09-21 以降の bridge は `gripper_q` も載せる。CONTRACT には無い項目） |
+| 状態 bridge | `:5557` に `body_q`・`base_quat` を 50 Hz で publish する（2026-09-21 以降の bridge は `gripper_q` も載せる。CONTRACT には無い項目。会場の G1 (3) は機体の Dex1 校正 `IROS_DEX1_*` で 0 閉 / −5.30 開に正規化する） |
 | WBC adapter | 我々が bind した `:5556` に接続。既定は joint lane `(T,22)` の関節目標を WBC へ渡す。pose lane `(T,25)` の場合だけ IK を使う。手の列は Dex1 へ relay する。adapter 起動 option はどちらも `--lane decoupled` |
-| WBC 本体 | 全身の制御 |
+| WBC 本体 | 全身の制御。会場の G1 (3) は `~/wbc_adapter/deploy/run_wbc_with_dex1.py`（Dex1 の指令も同じ `rt/lowcmd` に載せる） |
 | e-stop | 我々のコードを通らずにモータを止める |
 
-これらを誰が起動するかは、運営の README（"You do not run any of this"）と
-RUNBOOK（"you run the whole pipeline yourself"）で食い違っている。
+会場では運営 RUNBOOK（"you run the whole pipeline yourself"）どおり、これらも私たちが起動する（`INSTRUCTIONS.md` §2）。
+運営の README は "You do not run any of this" と書いているが、RUNBOOK と会場の手順に従う。
 
 ### この repo の中（運営の repo から取り込む。手で変更しない）
 
