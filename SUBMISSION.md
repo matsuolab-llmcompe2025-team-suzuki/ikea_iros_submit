@@ -3,26 +3,26 @@
 Branch: `main` of https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit
 
 The runtime is RAMEN `develop` as of
-[PR #182](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/182)
-(source `10b8d73` in the image; `develop` `faf73a8` has the same inference code).
+[PR #185](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/185)
+(source `1cd5fdf` in the image, including the opt-in guard's separate measurement clock).
 
 ## Image
 
 - Platform: `linux/arm64`; one container on Thor, no team container on Orin/PC2.
-- Tag: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-preparation-10b8d73`
+- Tag: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-guard-1cd5fdf`
 - Use this immutable reference for pull and execution:
 
 ```text
-ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4
+ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262
 ```
 
-- Image config ID: `sha256:f2eafc93eec07929e1b39f4b9fb48f3b15e11d606dbad4a005509df0a94b728b`
-- RAMEN source: `10b8d736609595bde30c929ddb73ef2f4751c0f1`.
-- Image build input: `c56fc693fa6231529a9b38c7fa0f3e6f1c766596`.
+- Image config ID: `sha256:a2fcf98773e4ca738c083cb36f5dec5024867817e4d7a685d3735166e5cf1e87`.
+- RAMEN source: `1cd5fdf4d37b29edbccc5a0f0434f6d379d1a469`.
+- Image build input: `55c1a55db45a4117f761a99200d4a1977644dbf9`.
 - Tested organizer interface: `497f3ab93e5baa706311daebd31c7a9798258450`.
 - Private GHCR read access is required. Do not put credentials in this repository.
-- [Arm64 build and push](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36479757032) succeeded. GB10 results and untested conditions are recorded below; physical Thor/G1 motion is not verified.
-- Merge-time documentation updates do not change the tested image or its build inputs.
+- [Arm64 build and push](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36567638842) succeeded. GB10 results and untested conditions are recorded below; physical Thor/G1 motion is not verified.
+- Merge-time documentation updates do not change the built image or its build inputs.
 
 ## Preparation And Operation
 
@@ -40,8 +40,8 @@ ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835f
    [CONNECTION_TEST.md](CONNECTION_TEST.md) is the 09-27 connection-test record.
 
 An optional read-only PC2 state guard (`:5558`, RAMEN issue #184) is declared in the manifest as
-`pc2_read_only_guard` and is off by default; the submitted image does not contain it, and using it
-requires a rebuilt image and the organizer's approval (INSTRUCTIONS.md section 7).
+`pc2_read_only_guard` and is off by default. The image includes the Thor reader, but using it
+requires deployment of the separate PC2 bundle with the organizer's approval (INSTRUCTIONS.md section 7).
 
 The default action contract is the joint lane `(T,22)`; the organizer adapter is launched
 with `--lane decoupled`. Do not switch to the pose lane: on 2026-09-29 the organizer IK on this
@@ -51,9 +51,15 @@ Runtime reads the preloaded weights offline; the camera/state/action network rem
 
 ## Verification And Limits
 
-[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md) records this image's identity,
+GB10 end-to-end validation was interrupted at the owner's request. The owner then
+requested main integration without resuming it. Default-path Stage 0 passed;
+Stage 1 was interrupted during model preparation. Remaining Stage/guard-path
+end-to-end and forward-matrix checks are pending, not passed.
+
+[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md) records this image's identity,
 verification status, retained failed attempts and limitations. The earlier
-[rebuild5 report](GB10_REBUILD5_REPORT.md) is historical evidence, not proof for this image.
+[preparation report](GB10_PREPARATION_REPORT.md) and
+[rebuild5 report](GB10_REBUILD5_REPORT.md) are historical evidence, not proof for this image.
 
 These are software and non-actuating tests, not a guarantee of physical task success on Thor/G1.
 Client/transport-loss navigation retention remains tracked in

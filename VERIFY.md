@@ -6,11 +6,11 @@
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
-**更新状況（Issue #16）:** 本体 `10b8d73` の `gb10-preparation-10b8d73` を GHCR へ公開済み。
-ARM64 [CI run 36479757032](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36479757032)
-が成功した（build commit `c56fc69`）。digest は `manifest.yaml` に固定。
-このimageの検証結果・完了状況は[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md)を参照。
-§6は旧`rebuild4`、§8は旧`rebuild5`の履歴であり、新imageの検証を代替しない。
+**更新状況（Issue #20）:** 本体 `1cd5fdf` の `gb10-guard-1cd5fdf` を GHCR へ公開済み。
+ARM64 [CI run 36567638842](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36567638842)
+が成功した（build commit `55c1a55`）。digest は `manifest.yaml` に固定。
+このimageの検証結果・完了状況は[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md)を参照。
+§6は旧`rebuild4`、§8は旧`rebuild5`、[準備動作の記録](GB10_PREPARATION_REPORT.md)は旧`10b8d73`の履歴であり、新imageの検証を代替しない。
 GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
 
 ## 1. なぜ GB10 か

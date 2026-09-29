@@ -4,12 +4,12 @@
 # RUNBOOK.md: --lane "must match the team's manifest.yaml"). The full venue procedure,
 # in the order the pieces must come up, is INSTRUCTIONS.md.
 #
-# One image, on the Thor. Nothing of ours runs on PC2: the Thor container subscribes to
+# One image, on the Thor. By default nothing of ours runs on PC2: the Thor container subscribes to
 # PC2's :5555 / :5557 directly and binds :5556 itself, and the organizer adapter on PC2 is
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# Current GB10 checks are recorded in GB10_PREPARATION_REPORT.md. Physical tracking is not verified.
+# Current GB10 checks are recorded in GB10_STATE_GUARD_REPORT.md. Physical tracking is not verified.
 # Client/transport loss is NOT certified as a safe stop: see Issue #14 and INSTRUCTIONS.md.
 # The adapter mode is decoupled; on it our arms go by default on the joint
 # lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
@@ -21,8 +21,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-preparation-10b8d73"
-    digest: "sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-guard-1cd5fdf"
+    digest: "sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
     # <skill_config_venue.yaml> is venue/skill_config_venue.yaml: the image's own skill_config
@@ -66,7 +66,7 @@ runtime:
     no external Internet required at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
     online check or analytics), the VLM runs with usage stats off and every outbound endpoint
     pointed at a closed local port; weights are read from the mounted cache. PC2 camera/state/action
-    traffic remains necessary. Current connect() audit results are in GB10_PREPARATION_REPORT.md
+    traffic remains necessary. Current connect() audit results are in GB10_STATE_GUARD_REPORT.md
   # Mounted read-only as a Hugging Face cache (~80 GB). Prefetch and offline check:
   # tools/prefetch_weights.py (list derived from policy_config.yaml: defaults + variant_sets);
   # details in WEIGHTS.md.
@@ -95,7 +95,7 @@ conformance: >-
 # OPTIONAL and off by default (INSTRUCTIONS.md section 7). A read-only process on PC2 that
 # confirms each :5557 payload with a fresh rt/lowstate tick and serves it on :5558; the Thor
 # uses it only when the run adds --boundary-state-guard --boundary-state-port 5558. Requires an
-# image built with it (not gb10-preparation-10b8d73) and the organizer's approval on PC2.
+# image built with it (gb10-guard-1cd5fdf) and the organizer's approval on PC2.
 # Without it the Thor reads :5557 directly, as declared above.
 pc2_read_only_guard:
   enabled_by_default: false
