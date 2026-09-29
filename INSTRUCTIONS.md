@@ -41,7 +41,7 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 
 | Stage | 中身 | 操作（§2「操作キー」） |
 |---|---|---|
-| 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | Enter 1（安全確認）だけ |
+| 0 | 準備（go-live 後に腕を下ろす → 決めた時間だけ前進 → pick の開始姿勢） | Enter 1（安全確認）だけ |
 | 1 | 1本目: pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
 | 2〜4 | 脚1本ずつ: 台を回す → pick → insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
 | 5 | 台を裏返す（flip） | Enter 1 → 開始姿勢で Enter |
@@ -49,8 +49,9 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 ## 1. 事前準備（会場の前に Thor で 1 回）
 
 ```bash
-# 置き場所（例）。以下の手順はこの 3 つを使う
-export RAMEN_HOST_DIR=~/ramen
+# 置き場所。運営の指定はチームの folder（ADMINISTRATIVE_MANIFEST §6: In-Person/<TEAM>/ に Thor 側の image・file を置く）。
+# 既に別の場所（例 ~/ramen）に重みを置いたなら、中身は動かさずにそこを指す。以下の手順はすべて $RAMEN_HOST_DIR を使う
+export RAMEN_HOST_DIR=~/Humanoid_IKEA_Assembly_Challenge/In-Person/RAMEN
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
 # image（tag gb10-preparation-10b8d73 = 本体 10b8d73。digest は manifest.yaml と同じ。
@@ -59,6 +60,16 @@ docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
+
+# 会場用の skill_config（毎 run の docker run で mount する。理由は 4 章の「会場用の skill_config」）。
+# image の設定から Dex1 の到達の許容だけを 0.05 → 0.20 rad にした物（repo の venue/skill_config_venue.yaml と同じ）
+docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+  cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml \
+  | sed 's/^  tolerance_rad: 0\.05 .*$/  tolerance_rad: 0.20  # venue: Dex1 air arrival, ~3.3 mm (INSTRUCTIONS.md sec. 4)/' \
+  > $RAMEN_HOST_DIR/skill_config_venue.yaml
+sha256sum $RAMEN_HOST_DIR/skill_config_venue.yaml
+# → 9cc4496426c1b80deea6644aa6ab34c606595cf6875469bca6a843b3a5e30c22 と同じであること。違えば使わない
+#   （手元の repo の venue/skill_config_venue.yaml を scp で $RAMEN_HOST_DIR に置いても同じ物になる）
 ```
 
 - `vlm_cache` は VLM の compile 結果の置き場。1 回目の run だけ小さな kernel の compile が走り、2 回目以降は再利用する。
@@ -80,61 +91,127 @@ sequenceDiagram
   T->>T: 終わり: Ctrl+C → 手を開き、腕を下ろして container が終了
 ```
 
-### Step 0〜1 [PC2] 環境とカメラ・状態の配信
+### 始める前に（毎 run。PC2 と Thor）
 
-RUNBOOK の Step 0（環境変数・`rt/lowcmd` を掴んでいる process が無いこと）と Step 1（`real_orin_cameras.py` と
-`real_orin_state.py` の 2 本）をそのまま行う。
+会場の PC2 は G1 (3)。以下は会場 PC2 の実ファイルと 2026-09-28/29 の実機 log で確かめた手順
+（運営 RUNBOOK の `conda activate …` の書き方はこの機体では使えない）。
+
+- **tmux の中で動かす。** SSH が切れても端末ごと残り、つなぎ直して `tmux attach` で操作を続けられる
+  （2026-09-29 の他チームの実機セッションで SSH が切れ、WBC と adapter が動いたまま残った）。
+  PC2: `tmux new -s ramen`（カメラ・状態・WBC・adapter を別 window で）、Thor: `tmux new -s ramen`（`docker run -it` を中で）。
+  tmux の外で `docker run -it` した後に切れたら、つなぎ直して `docker ps` → `docker attach <container>` で同じ端末に戻る
+  （抜けるのは Ctrl+P Ctrl+Q。attach 中の Ctrl+C は run を止める）。
+- **PC2 に他チームの WBC・adapter・bridge が残っていないか**（WBC が 2 つあると同じ `rt/lowcmd` を 2 つが出す）:
+  ```bash
+  ps -eo pid,user,etime,args | grep -E "run_wbc_with_dex1|run_g1_control_loop|wbc_driver|real_orin|g1_policy_bridge|gear_sonic" | grep -v grep
+  ```
+  残っていたら**自分で kill せず、運営に止めてもらう。**
+- **Thor に前の container や port が残っていないか**: `docker ps`、`ss -ltnp | grep -E ':(5556|8000)\b'`、`nvidia-smi`。
+  `:5556` を他が掴んでいると私たちの bind が失敗し、`:8000` なら VLM が起動できない。
+- **Thor に提出 image があるか**（無いと run が始まらない。会場の回線では GitHub からの pull が途中で切れた実例がある、2026-09-27）:
+  ```bash
+  docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 --format '{{.Id}}'
+  ```
+  エラーなら run の前に pull（約 9 GB）か USB から `docker load`。
+- **Thor の shell で `$RAMEN_HOST_DIR` が重みを置いた場所を指しているか**（新しい shell・tmux window では空になる。
+  空のまま `docker run` すると `/hf_cache` などの空の directory が mount され、重みが無くて止まる）:
+  `echo $RAMEN_HOST_DIR && ls $RAMEN_HOST_DIR/hf_cache/hub | head -3`。空なら 1 章の `export` をもう一度。
+- **Thor に会場用の skill_config があるか**（1 章で作った物。無いと Step 4 で docker が同じ名前の空の directory を作り、
+  起動が `IsADirectoryError` で止まる）。image の設定との違いが、許容の 1 行（と 4 章の手順で直した行）だけであること:
+  ```bash
+  docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+    cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml | diff - $RAMEN_HOST_DIR/skill_config_venue.yaml
+  ```
+- **Stage 0 の歩く距離を運営に確かめる。** Stage 0 は目で見て止まらず、決めた時間だけ前進する
+  （`skills.move_to_table` の `vx` 0.185 m/s × `max_dwell_sec` 1.0 s ≈ 0.19 m。加減速で実際はこれより短い）。
+  スタート位置が台からそれより遠いなら、4 章の手順で `max_dwell_sec` だけを変える（`vx` は変えない）。
+- IP: Thor のロボット側は `192.168.123.222`（`ip -4 addr show`）、PC2 は `192.168.123.164`。以下の `<THOR_IP>` / `<PC2_IP>` はこの値。
+
+### Step 0〜1 [PC2] カメラ・状態の配信
+
+PC2 の新しい shell は `ros:foxy(1) noetic(2) ?` と聞く。**何も選ばず Enter**（1 / 2 を選ぶと下の env が読み込みを拒否する）。
+この機体に base conda は無い（`conda activate` は使わない。env は下の `source` で読む）。
+
+```bash
+# カメラ（tmux window 1）
+source ~/iros_g1_3/iros_env_teleimager.sh
+python ~/real_orin_cameras.py
+
+# 状態（tmux window 2）
+source ~/iros_g1_3/iros_env.sh
+python ~/real_orin_state.py
+```
+
+- カメラで確かめる行: `head camera live at 1280x480 (native side-by-side; …)`、
+  `left_wrist (RealSense 262622270004) live`、`right_wrist (RealSense 262622273652) live`。
+  wrist の左右は運営が画像で確かめた割り当てで、`iros_env_teleimager.sh` が設定する（読まずに起動すると頭カメラの
+  名前が合わず、wrist の左右も決まらない）。
+- 状態で確かめる行: `Dex1 left (motor 31): raw closed -0.720 / open +4.640 -> published 0.00 closed / -5.30 open` と
+  `Dex1 right (motor 33): raw closed +0.000 / open +5.380 -> …`。**この 2 行が無ければ止める**（校正を読まない
+  `~/iros_g1_orin_package/reference/orin_bridge/real_orin_state.py` を起動している。グリッパの実測が逆向きになる）。
 
 ### Step 2 [PC2] WBC — **`run_wbc_with_dex1.py` で起動する**
 
 ```bash
-conda activate g1_wbc
+# tmux window 3
+source ~/iros_g1_3/iros_env.sh
 cd ~/GR00T-WholeBodyControl
-python <運営 package の tools>/run_wbc_with_dex1.py \
-  --interface real --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen \
+iros_with_wbc_preload python ~/wbc_adapter/deploy/run_wbc_with_dex1.py \
+  --interface eth0 --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen \
   --dex1-max-speed 4.2
 ```
 
+- **`~/wbc_adapter/deploy/run_wbc_with_dex1.py` を使う。** `~/iros_g1_orin_package/tools/run_wbc_with_dex1.py`（運営 package
+  `497f3ab` のまま）はベンチ機のグリッパの向き（0 = 閉 / −5.30 = 開）を決め打ちしている。この機体は開く向きが逆
+  （左 −0.72 閉 / +4.64 開、右 0.00 閉 / +5.38 開。`iros_env.sh` が `IROS_DEX1_*` で渡す）なので、package の方で起動すると
+  「開け」でグリッパを閉じる側の端へ押し付ける。
+- 起動 log で確かめる行: `[dex1] left (motor 31): closed q=-0.720, open q=+4.640` と
+  `[dex1] right (motor 33): closed q=+0.000, open q=+5.380`（**出なければ止める**）、
+  `[seed] upper-body interpolator seeded from MEASURED q`、`[wbc] defaulting --upper-body-joint-speed 3.0`。
+- `iros_with_wbc_preload` は WBC の process にだけ torch の `LD_PRELOAD` を付ける（adapter や bridge には付けない）。
 - RUNBOOK の `run_g1_control_loop.py` **ではない**。それだとグリッパ（Dex1-1）を動かすものが居ない
   （`run_wbc_with_dex1.py` は同じ引数を受ける差し替えで、グリッパの指令を同じ `rt/lowcmd` に載せる）。
 - `--dex1-max-speed 4.2`: 学習データのグリッパの速さ（運営の既定は 2.0）。
-- `run_wbc_with_dex1.py` の PC2 上の置き場所は会場で確かめる（運営 package の `tools/` にある。運営 RUNBOOK
-  （2026-09-25 版）の例は `~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0`。`--interface` は `real` でも
-  インターフェース名でもよい）。
 - **WBC の起動時の腕**: 運営 package が `f31952c`（2026-09-25）より古い wrapper だと、起動した瞬間に
   （adapter も私たちのコードもつながる前に）腕を肩 roll ±0.2・他 0 の姿勢へ 2 秒・フル剛性で動かす。新しい
   wrapper は実測の関節から始めて保持する（`--seed-from-measured` が既定。取れないと `[seed] WARNING: falling back
   to STOCK start-up` と出て古い動きになる）。どちらでも、**腕が台や物に届かない所で起動し**、止まってから stage の
   位置に置く。
-- 安定した保持状態になってから次へ（`ros2 topic hz /G1Env/env_state_act`）。
+- 安定した保持状態になってから次へ（`iros_env.sh` を読んだ別の shell で `ros2 topic hz /G1Env/env_state_act`）。
 
 ### Step 3 [PC2] adapter の試運転（まだ `--live` を付けない）
 
 ```bash
-conda activate g1_wbc
+# tmux window 4
+source ~/iros_g1_3/iros_env.sh
 cd ~/wbc_adapter
-python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --state-source boundary
+python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --state-source boundary
 ```
+
+- `[adapter] no actions on :5556 yet` が出ていれば、Thor の起動を待っている状態。
+- 試運転は Ctrl+C で止めてから Step 4 へ（go-live の adapter は Step 5 で同じ window に起動する）。
 
 ### Step 4 [Thor] 私たちの container
 
 ```bash
 docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host \
-  -e IROS_ORIN_HOST=<PC2_IP> \
+  -e IROS_ORIN_HOST=192.168.123.164 \
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
+  -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro \
   ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
-  --stage N --actuate
+  --stage N --actuate --skill-config /app/venue_skill_config.yaml
 ```
 
 - `-it` 必須（Enter・N・R を押すため。対話端末でないと `--actuate` は
   `N/R/Enter production controls require an interactive TTY` で起動しない）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
 - **操作する端末は半角英数にしておく**（日本語入力が ON だと N / R / Enter は何も表示されずに無視される）。
 - 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
-  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate` だけ。大会本番では option を足さない。**
-  接続テストで試す option（model・送り方・手首 roll の clamp・Stage 0 の確かめ方）は `CONNECTION_TEST.md` にまとめてあり、
-  決めた値は既定にしてから本番に使う。
+  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate --skill-config /app/venue_skill_config.yaml` だけ
+  （会場用の skill_config。この image を使う間は毎回付ける）。大会本番ではほかの option を足さない。**
+  起動 log の `[init] topic=… skill_config=/app/venue_skill_config.yaml` で会場用の設定を読んだと分かる。
+  model・送り方などを切り替える option の説明は `CONNECTION_TEST.md` の付録（09-27 の接続テスト用。本番では使わない）。
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。
@@ -155,8 +232,16 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 ### Step 5 [PC2] go-live — **人がキーボードで打つ**（script や agent から実行しない）
 
 ```bash
-python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-policy
+# tmux window 4（Step 3 と同じ env）
+source ~/iros_g1_3/iros_env.sh
+cd ~/wbc_adapter
+python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --engage-policy
 ```
+
+- `Press Enter to proceed, Ctrl+C to abort...` と聞くので、E-stop 担当を確かめてから Enter。**対話端末で起動する**
+  （tmux の window。標準入力の無い起動では `EOFError` で落ちた実例がある、2026-09-28）。
+- 確かめる行: `joint lane: ON -- topics b'joint'/b'goto', limits=urdf, goto max speed 0.45 rad/s …`
+  （joint lane が使える。私たちの既定の送り方）と `--engage-policy: sent toggle_policy_action=True once`。
 
 - **`--state-source boundary` を付けない**（既定の `wbc` のまま）。decoupled で `boundary` と `--live` を
   一緒にすると adapter が `LAUNCH DENIED` で起動を拒否する（RUNBOOK の Step 6 の書き方はこの点でコードと違う）。
@@ -178,7 +263,9 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 - **押す前に腕が開始姿勢にあるかを目で確かめる。**
 - Stage 0: go-live の直後に、現在の実測姿勢から腕を下ろし
-  （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
+  （肩 roll ±0.2・肘 0.9）、決めた時間だけ前進し（目で見て止まらない。距離は「始める前に」）、
+  止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
+  台に近づきすぎたら待たずに E-stop（歩行中に通信が切れても運営 adapter は歩き続ける）。
 - **準備保持**（`準備／<経由点>／holding`）: 予定時間+5秒で未到達なら、その経由点で保持する。
   誤差と関節indexを確認し、Rで**同じ経由点だけ**再試行できる。遅れて到達すると`ready`になり、
   新しいEnterで準備を続ける。このEnterはPolicy開始のEnterとは別。モデルを読み直す必要はない。
@@ -197,7 +284,7 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 
 ## 3. 次の run
 
-- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。
+- **Thor の `docker run` だけをやり直す**（`--stage` を変える）。PC2 のカメラ・状態・WBC は止めない。
 - **adapter は止めない。** `--engage-policy` は押すたびに切り替わる。adapter を起動し直すなら WBC から起動し直す。
 
 ## 4. よく出る表示
@@ -219,6 +306,32 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 | `フェーズ：安全停止／保持中・判断待ち` | 安全停止。直前の `[safety-stop] …` が理由。確かめてから Enter（戻す）か Ctrl+C（その場で終える） |
 | `[gate] initial pose not reached (worst=… error=…); Enter ignored` | 開始姿勢に届いていないので Enter を捨てた。一番ずれた関節と量。腕を目で見て、届くのを待つ |
 | 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`WEIGHTS.md` の 4（`prefetch_weights.py --check`） |
+| `Address already in use`（`:5556`） | 前の run か他チームの container が `:5556` を掴んでいる。`docker ps` / `ss -ltnp` で確かめ、自分の古い container なら止める。他チームなら運営へ |
+| `skill config not found` / `IsADirectoryError: … venue_skill_config.yaml` | 会場用の skill_config が Thor に無い（docker が同じ名前の空の directory を作った）。`rmdir $RAMEN_HOST_DIR/skill_config_venue.yaml` の後、1 章の手順で作り直す |
+| `operator transition 'hand_…' did not reach its target: hand_… did not reach [a, b] before the deadline (measured=[…])` | Dex1 が目標（全開 5.3、または開始時の開き幅）まで許容の 0.20 rad 以内に届かずに安全停止した。まず Step 1 の状態 bridge の Dex1 校正の 2 行を確かめる（無ければ bridge を起動し直す）。校正が正しく、`measured` と目標の差が 0.3 rad 未満なら、下の手順で許容を 0.30 にして次の run を始める。それ以上ずれるなら Dex1 の故障・干渉を疑い、運営に確かめる |
+| `[gate] … NOT reached` や `[preparation] … holding` が続き、`joint=` が同じ関節 | その関節が届いていない。腕を目で見て、干渉が無ければ R で同じ経由点を再試行（準備）か、届くまで待つ（開始待ち） |
+
+#### 会場用の skill_config
+
+image の skill_config と違うのは、Dex1 の到達の許容 `hand_pre_motion.tolerance_rad` だけ（0.05 → 0.20 rad。
+指先で約 3.3 mm）。会場の Dex1 は運営の中継（`~/wbc_adapter/deploy/run_wbc_with_dex1.py`）の柔らかい P 制御
+（kp 5.0、重力・摩擦の補償なし）で動き、全開は手で動かして測った機械の端。目標の手前で止まると、0.05 rad では
+時間切れになり、Dex1 の時間切れは腕の準備と違って保持の道が無く、その run が policy の前に終わる
+（本体の同じ code で、手前 0.08 / 0.12 rad で止まる Dex1 は 0.05 では時間切れ、0.20 では完了: `tests/test_venue_skill_config.py`）。
+完了は「許容の中に 5 回続けて入る」ことなので、大きく動いている途中では完了しない。
+全開の目標（5.3 rad）・開始時の開き幅・policy の手の指令は変えない。
+
+会場で直すとき（上の表の行のとき・Stage 0 の距離）。直した後は「始める前に」の `diff` で、直した行だけが違うことを確かめる:
+
+```bash
+# Dex1 の到達の許容を 0.30 rad へ
+sed -i 's/^  tolerance_rad: 0\.20 /  tolerance_rad: 0.30 /' $RAMEN_HOST_DIR/skill_config_venue.yaml
+# Stage 0 の前進時間（距離 ≈ 0.185 m/s × 秒。例: 約 0.6 m なら 3.2）。vx は変えない
+sed -i 's/^    max_dwell_sec: 1\.0$/    max_dwell_sec: 3.2/' $RAMEN_HOST_DIR/skill_config_venue.yaml
+```
+
+**pose lane（`--boundary-lane pose`）に切り替えない。** 2026-09-29 の他チームの実機 run では、この機体の運営 IK の受理が
+602 waypoint で左右とも 0% だった（joint lane は reject 0）。
 
 ## 5. conformance（運営の適合試験）
 
@@ -232,6 +345,6 @@ python conformance.py --lane decoupled
 `components/server.py` は conformance 専用（本番と同じ受け口・送り口で、実測の姿勢を保つ指令を送る）。
 会場の run はこの file を通らない。`components/client.py` は conformance が起動するための置き物。
 
-## 6. 09-27 の接続テスト
+## 6. 接続テスト（09-27）の記録
 
-`CONNECTION_TEST.md`（運営に確かめること、起動の各段で見る所、試す run の順番、決め方、記録の表）。
+`CONNECTION_TEST.md`（09-27 の接続テストの計画と、その後に会場で分かったこと。本番の手順はこの文書）。

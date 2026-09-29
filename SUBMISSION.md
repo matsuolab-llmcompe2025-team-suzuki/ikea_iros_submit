@@ -1,10 +1,10 @@
 # Team RAMEN Submission
 
-Candidate branch: `issue/16-recoverable-joint-preparation` of
-https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit
+Branch: `main` of https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit
 
-Not merged into `main`. Runtime changes are proposed in
-[RAMEN PR #182, targeting develop](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/182).
+The runtime is RAMEN `develop` as of
+[PR #182](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/182)
+(source `10b8d73` in the image; `develop` `faf73a8` has the same inference code).
 
 ## Image
 
@@ -26,17 +26,22 @@ ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835f
 
 ## Preparation And Operation
 
-1. Pull the digest above on Thor with an authorized GHCR account.
+1. Pull the digest above on Thor with an authorized GHCR account, and make the venue
+   `skill_config` from it (INSTRUCTIONS.md section 1; sha256 checked). It is the image's own
+   config with only the Dex1 arrival tolerance widened (0.05 -> 0.20 rad); every run mounts it.
 2. Follow [WEIGHTS.md](WEIGHTS.md) to prefetch the configured checkpoints and dependencies
    into the host HF cache (approximately 80 GB). Image download alone does not include weights.
    The HF account needs Team-RAMEN private-repository access and Cosmos model access approval.
 3. Run the documented offline `prefetch_weights.py --check` inside the image with the cache mounted.
-4. Use [INSTRUCTIONS.md](INSTRUCTIONS.md) for the ordered PC2/Thor startup and operator controls.
-   Confirm venue addresses, camera streams, clocks and WBC settings with
-   [CONNECTION_TEST.md](CONNECTION_TEST.md) before actuation.
+4. Use [INSTRUCTIONS.md](INSTRUCTIONS.md) for the ordered PC2/Thor startup, the pre-run checks
+   (other teams' processes, image, venue config, Stage 0 walking distance) and operator controls.
+   On the event PC2 (G1 (3)) the organizer processes run after `source ~/iros_g1_3/iros_env.sh`,
+   and the WBC is `~/wbc_adapter/deploy/run_wbc_with_dex1.py` (per-robot Dex1 calibration).
+   [CONNECTION_TEST.md](CONNECTION_TEST.md) is the 09-27 connection-test record.
 
 The default action contract is the joint lane `(T,22)`; the organizer adapter is launched
-with `--lane decoupled`. Ports and launch commands are declared in [manifest.yaml](manifest.yaml).
+with `--lane decoupled`. Do not switch to the pose lane: on 2026-09-29 the organizer IK on this
+robot accepted 0% of 602 waypoints for another team, while the joint lane rejected none. Ports and launch commands are declared in [manifest.yaml](manifest.yaml).
 Organizer code is not modified. No head-camera geometry compensation is applied by this submission.
 Runtime reads the preloaded weights offline; the camera/state/action network remains necessary.
 

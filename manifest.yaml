@@ -25,13 +25,18 @@ images:
     digest: "sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
+    # <skill_config_venue.yaml> is venue/skill_config_venue.yaml: the image's own skill_config
+    # with only the Dex1 arrival tolerance widened (0.05 -> 0.20 rad), made on the Thor from
+    # this image (INSTRUCTIONS.md section 1). Without it, a Dex1 that settles short of the
+    # commanded opening ends the run before the policy starts.
     run: >-
       docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host
       -e IROS_ORIN_HOST=<PC2_IP>
       -v <hf_cache>:/root/.cache/huggingface:ro
       -v <outputs>:/app/ramen/outputs
       -v <vlm_cache>:/cache
-      <image> --stage <0-5> --actuate
+      -v <skill_config_venue.yaml>:/app/venue_skill_config.yaml:ro
+      <image> --stage <0-5> --actuate --skill-config /app/venue_skill_config.yaml
   orin: null   # no PC2-side container (see the header)
 
 sockets:
@@ -40,10 +45,18 @@ sockets:
   "5556": "actions — BOUND by the Thor container on all interfaces; the adapter dials in with --actions-host <THOR_IP>"
   "8000": "VLM server inside the Thor container, bound to 127.0.0.1 only (Stage 1-4)"
 
+# On the event PC2 (G1 (3)) every organizer process runs after `source ~/iros_g1_3/iros_env.sh`
+# (cameras: iros_env_teleimager.sh). That env carries this robot's Dex1 calibration
+# (IROS_DEX1_*), read only by ~/wbc_adapter/deploy/run_wbc_with_dex1.py and ~/real_orin_state.py;
+# the package copies under ~/iros_g1_orin_package hardcode the bench unit's opposite direction.
+# THOR_IP = 192.168.123.222, PC2 = 192.168.123.164 (INSTRUCTIONS.md §2).
 organizer_stack_on_pc2:
+  cameras: "source ~/iros_g1_3/iros_env_teleimager.sh && python ~/real_orin_cameras.py"
+  state: "source ~/iros_g1_3/iros_env.sh && python ~/real_orin_state.py"
   wbc: >-
-    run_wbc_with_dex1.py --interface real --no-with-hands --keyboard_dispatcher_type ros
-    --no-enable-onscreen --dex1-max-speed 4.2
+    source ~/iros_g1_3/iros_env.sh && cd ~/GR00T-WholeBodyControl &&
+    iros_with_wbc_preload python ~/wbc_adapter/deploy/run_wbc_with_dex1.py --interface eth0
+    --no-with-hands --keyboard_dispatcher_type ros --no-enable-onscreen --dex1-max-speed 4.2
   adapter_dry_run: "wbc_driver.py --lane decoupled --actions-host <THOR_IP> --state-source boundary"
   adapter_go_live: "wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-policy"
 

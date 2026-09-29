@@ -39,3 +39,15 @@ def test_the_venue_procedure_pulls_and_runs_the_manifest_digest() -> None:
     pinned = re.findall(rf"{re.escape(REGISTRY)}@(sha256:[0-9a-f]+)", instructions)
     assert len(pinned) >= 2, pinned  # docker pull と docker run
     assert set(pinned) == {_thor()["digest"]}
+
+
+def test_the_copied_source_is_the_one_the_image_was_built_from() -> None:
+    """ramen/ を写し直したのに image を焼き直さないまま main に入れると、会場の image と repo の code が食い違う。
+
+    image の tag は `<名前>-<本体 commit の先頭 7 文字>`。写し直したら、焼き直して tag と digest を差し替えるまで通らない。
+    """
+    source = (SUBMIT_ROOT / "ramen" / "RAMEN_SOURCE.txt").read_text()
+    commit = re.search(r"^commit: ([0-9a-f]{40})$", source, re.MULTILINE)
+    assert commit, source
+    assert not re.search(r"^state: (?!published$)", source, re.MULTILINE), "test-only copy"
+    assert _thor()["repo_tag"].endswith("-" + commit.group(1)[:7])
