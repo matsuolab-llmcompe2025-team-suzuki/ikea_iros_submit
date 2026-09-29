@@ -1083,6 +1083,46 @@ policies:
       enabled: false
     cams: [head_left, wrist_left, wrist_right]
 
+  # ---- flip_table の追加学習 (Issue #183) の実機評価 slot ---- #
+  # all6 150k (上の flip_table_ramen_ori_all6_150k) の重みから flip だけで 2 万 step 追加学習した 2 本の 20k
+  # (推論と同じ生成の評価で 2 本とも 20k が最良、Issue #183 のコメント)。学習は手先の位置の入力を推論と同じ
+  # FK (G1WristFK の既定) で作った → skills.flip_table に wrist_tool_offset を書かないこと (書くと学習とずれる)。
+  # progress の ckpt は補助 head (model/ramen_ori/aux_progress.py) つきで組み立てる (推論では使わない)。
+  # 手順は docs/handoff/realmachine_flip_ft_eval.md
+  flip_table_ramen_ori_flip_ft_fk_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk@ebc1410996e1cd666ef8a7df079691c80a37c49c
+    ckpt_filename: ckpt_step_020000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_flip_ft_fk_progress_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk_progress@6c4f30c683528f6b3954dabae3df5834ddc94e76
+    ckpt_filename: ckpt_step_020000.pt
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
   # ---- insert_table_leg Diffusion Policy (optimal / raw PNG / 100k) ---- #
   # 本番既定。ramen_ori / all6_400k の明示セットは各自の insert slot を維持する。
   # 学習は raw 3cam / 19D absolute targets / FP32。PNG は学習時の I/O cache で、

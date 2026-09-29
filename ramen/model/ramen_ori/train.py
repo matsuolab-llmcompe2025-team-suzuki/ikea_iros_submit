@@ -524,6 +524,7 @@ def _run_val_loop(
         if skill_name is not None:
             _accumulate(f"per_skill/{skill_name}", {
                 "loss": float(parts["loss"].item()),
+                "loss_action": float(parts["loss_action"].item()),   # 補助 loss を除いた値 (Issue #183)
                 "bc": float(parts["bc"].item()),
             })
 
@@ -564,6 +565,59 @@ def _build_model(cfg: DictConfig, device: str) -> RamenOriPolicy:
     train.py 経由の呼び出しはそのまま残す (学習の script を変えないため)。
     """
     return build_model(cfg, device)
+
+
+def _load_init_weights(model: torch.nn.Module, path: str, weights: str = "ema") -> dict:
+    """学習済みの ckpt の重みを model に入れる (Issue #183、`training.init_from`)。
+
+    `training.resume_from` (途中再開) と違い、optimizer・LR の予定・step・EMA は引き継がない (追加学習を新しく始める)。
+    正規化の統計 (buffer) は ckpt のものを使う (学習済みの重みはその統計で学習されているため)。
+
+    Args:
+        model: 組み立て直後の model (compile の前)
+        path: ckpt の path (`train.py` が保存した形)
+        weights: "ema" = 学習する param は EMA の重み (推論で使う重み)、それ以外 (buffer・凍結した backbone) は
+            model_state_dict。"model" = model_state_dict だけ
+
+    ckpt に無い key は新しく足した補助 head (`aux_head.*`) だけ許す。ほかに欠けている・余っている key があれば
+    (構造が違う) 止める。形が違う key は load_state_dict が止める。
+
+    Returns:
+        ckpt の約束に書く記録 {"path", "step", "weights", "provenance"}
+    """
+    if weights not in {"ema", "model"}:
+        raise ValueError(f"training.init_from_weights={weights!r} は 'ema' か 'model'")
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"training.init_from={path} not found")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = {EMA._canonical(k): v for k, v in ckpt["model_state_dict"].items()}
+    if weights == "ema":
+        if "ema_state_dict" not in ckpt:
+            raise ValueError(f"{path} に ema_state_dict が無い (training.init_from_weights=model を使う)")
+        ema_state = {EMA._canonical(k): v for k, v in ckpt["ema_state_dict"].items()}
+        unknown = sorted(set(ema_state) - set(state))
+        if unknown:
+            raise ValueError(f"ema_state_dict に model_state_dict に無い key がある: {unknown[:5]}")
+        state.update(ema_state)
+    result = model.load_state_dict(state, strict=False)
+    missing = [k for k in result.missing_keys if not k.startswith("aux_head.")]
+    if missing or result.unexpected_keys:
+        raise ValueError(
+            f"training.init_from の ckpt と model の構造が違う: 欠けている key {missing[:5]}、"
+            f"余っている key {list(result.unexpected_keys)[:5]}"
+        )
+    info = {
+        "path": str(ckpt_path),
+        "step": int(ckpt.get("step", -1)),
+        "weights": weights,
+        "provenance": (ckpt.get("contract") or {}).get("provenance"),
+    }
+    print(
+        f"[init_from] {ckpt_path} (step {info['step']}、{weights} の重み) を初期値にした。"
+        f"ckpt に無く新しく作った param {len(result.missing_keys)} 個 (補助 head)"
+    )
+    return info
 
 
 def _set_training_stats(
@@ -924,9 +978,21 @@ def main(cfg: DictConfig) -> None:
 
     # Model
     model = _build_model(cfg, device)
-    # Issue #141 RO-4 / RO-6 / RO-16: 正規化と FK の loss の統計。resume 時は ckpt の buffer を使う (計算し直さない)
-    if (model.state_normalizer is not None or model.fk_normalizer is not None) and not cfg.training.get(
-        "resume_from"
+    # Issue #183: 学習済みの ckpt の重みだけを初期値にする (optimizer・LR の予定・step は新しく始める)
+    init_from = cfg.training.get("init_from")
+    if init_from and cfg.training.get("resume_from"):
+        raise ValueError(
+            "training.init_from と training.resume_from は同時に使えない "
+            "(init_from は重みだけを読んで新しく始める、resume_from は途中再開)"
+        )
+    if init_from:
+        init_info = _load_init_weights(model, init_from, cfg.training.get("init_from_weights", "ema"))
+        if contract is not None:
+            contract["init_from"] = init_info
+    # Issue #141 RO-4 / RO-6 / RO-16: 正規化と FK の loss の統計。resume / init_from の時は ckpt の buffer を使う
+    # (計算し直さない)
+    if (model.state_normalizer is not None or model.fk_normalizer is not None) and not (
+        cfg.training.get("resume_from") or init_from
     ):
         _set_training_stats(
             model, dataset, float(cfg.model.normalization.std_min), cfg.training.num_workers
@@ -1103,6 +1169,41 @@ def main(cfg: DictConfig) -> None:
     # Issue #122: 明示 iter() で書くと ckpt save 時に loader を再構築できる
     # (safe_shm_cleanup_on_ckpt 対応)。従来の enumerate(_infinite_batches(loader)) は
     # loader が generator 内で参照ハンドルを握り mid-loop 差替えができなかった。
+    def _validate(step: int) -> None:
+        """val を 1 回回して print と wandb に出す (EMA があれば EMA の重みで)。"""
+        if ema is not None and eval_use_ema:
+            with ema.applied(model):
+                val_loss, extra_metrics = _run_val_loop(
+                    model, val_loader, device, val_max_batches, autocast_dtype,
+                    val_fk, val_ee_error_rows,
+                )
+            tag = "val/loss_ema"
+        else:
+            val_loss, extra_metrics = _run_val_loop(
+                model, val_loader, device, val_max_batches, autocast_dtype,
+                val_fk, val_ee_error_rows,
+            )
+            tag = "val/loss"
+        print(f"[val] step={step} {tag}={val_loss:.4f} (over {val_max_batches} batches)")
+        # Issue #129 Phase H (2026-08-31): 補助 metric (V1: EE error mm、V2: motion energy)。
+        # val loss と別 key で log、5-run 型 val_loss ≠ real gap の判断材料。
+        if extra_metrics:
+            print(
+                "[val] extra: "
+                + ", ".join(f"{k}={v:.4f}" for k, v in sorted(extra_metrics.items()))
+            )
+        if wandb_run is not None:
+            log_dict = {tag: val_loss}
+            # EMA 有無の tag prefix (val/ema/... or val/...) に合わせる
+            metric_prefix = "val/ema" if tag == "val/loss_ema" else "val"
+            for mk, mv in extra_metrics.items():
+                log_dict[f"{metric_prefix}/{mk}"] = mv
+            wandb_run.log(log_dict, step=step)
+
+    # Issue #183: 学習の前にも 1 回 val を取る (init_from の重みそのままの値 = 追加学習と比べる基準)
+    if val_loader is not None and val_cfg.get("at_start", False):
+        _validate(start_step)
+
     loader_iter = iter(loader)
     step = start_step - 1
     while True:
@@ -1200,34 +1301,7 @@ def main(cfg: DictConfig) -> None:
             and step > 0
             and step % val_every == 0
         ):
-            if ema is not None and eval_use_ema:
-                with ema.applied(model):
-                    val_loss, extra_metrics = _run_val_loop(
-                        model, val_loader, device, val_max_batches, autocast_dtype,
-                        val_fk, val_ee_error_rows,
-                    )
-                tag = "val/loss_ema"
-            else:
-                val_loss, extra_metrics = _run_val_loop(
-                    model, val_loader, device, val_max_batches, autocast_dtype,
-                    val_fk, val_ee_error_rows,
-                )
-                tag = "val/loss"
-            print(f"[val] step={step} {tag}={val_loss:.4f} (over {val_max_batches} batches)")
-            # Issue #129 Phase H (2026-08-31): 補助 metric (V1: EE error mm、V2: motion energy)。
-            # val loss と別 key で log、5-run 型 val_loss ≠ real gap の判断材料。
-            if extra_metrics:
-                print(
-                    "[val] extra: "
-                    + ", ".join(f"{k}={v:.4f}" for k, v in sorted(extra_metrics.items()))
-                )
-            if wandb_run is not None:
-                log_dict = {tag: val_loss}
-                # EMA 有無の tag prefix (val/ema/... or val/...) に合わせる
-                metric_prefix = "val/ema" if tag == "val/loss_ema" else "val"
-                for mk, mv in extra_metrics.items():
-                    log_dict[f"{metric_prefix}/{mk}"] = mv
-                wandb_run.log(log_dict, step=step)
+            _validate(step)
 
         if (step + 1) % cfg.training.ckpt_every == 0:
             ckpt_path = ckpt_dir / f"ckpt_step_{step + 1:06d}.pt"

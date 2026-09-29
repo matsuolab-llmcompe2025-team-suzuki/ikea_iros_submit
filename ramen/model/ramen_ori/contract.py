@@ -56,7 +56,12 @@ def build_contract(cfg: DictConfig, dataset) -> dict:
             {"id": int(s), "name": skill_id_name(int(s)), "frames": int(n)}
             for s, n in zip(skill_ids, frames)
         ],
-        "state": {"variant": dataset.state_variant, **STATE71_DEFINITION},
+        "state": {
+            "variant": dataset.state_variant,
+            **STATE71_DEFINITION,
+            # Issue #183: 手先の位置 (ee_pose) の出どころ。dataset = 記録された ee_state、fk = 推論と同じ FK
+            "ee_pose_source": getattr(dataset, "ee_state_source", "dataset"),
+        },
         "action": {
             "space": "rel" if dataset.use_relative_action else "abs",
             "dim": int(cfg.model.action_dim),

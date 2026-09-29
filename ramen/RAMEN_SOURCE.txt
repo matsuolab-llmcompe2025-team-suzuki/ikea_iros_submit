@@ -1,5 +1,5 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 1cd5fdf4d37b29edbccc5a0f0434f6d379d1a469
-subject: Merge pull request #185 from matsuolab-llmcompe2025-team-suzuki/issue/184-opt-in-pc2-state-guard
+commit: e1dff41c3bdb35860926bf45ec2fb37f1bc98d23
+subject: #183 flip_table の RAMEN-Ori 学習（all6 150k からの追加学習・手先の入力を FK・進みの補助 head）と実機評価 slot (#186)
 state: published

@@ -386,6 +386,14 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         # Issue #141 Phase 7: memory の入力 (memory_features.py)。true なら起動時に区間ごとの表を作り、item に
         # "memory" (51,) を入れる。head_left の OBB (obb_precomputed_root) と教師の指令から作る (obb_source とは別)
         memory: bool = False,
+        # Issue #183: state の手先の位置 (ee_pose) の出どころ。"dataset" = 記録された observation.state.ee_state
+        # (これまでの学習)、"fk" = 推論と同じ FK (inference/desktop/assembly.FkFactory.for_skill、skill ごとの
+        # wrist_tool_offset も推論と同じ) で今の関節角 (robot_q_current[:29]) から計算する。推論は FK で入れるので、
+        # flip では記録値と平均 13〜18 cm ずれていた (記録値の std は 5〜9 cm)
+        ee_state_source: str = "dataset",
+        # Issue #183: 区間の進み (frame_index / (区間の長さ − 1)) を item の "progress_target" に入れる
+        # (aux_progress.ProgressHead の正解)
+        progress_target: bool = False,
     ) -> None:
         _valid_obb_sources = {"none", "precomputed_token", "overlay"}
         if obb_source not in _valid_obb_sources:
@@ -399,6 +407,8 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
             )
         if memory and obb_precomputed_root is None:
             raise ValueError("memory=True requires obb_precomputed_root (head_left の OBB から memory を作る)")
+        if ee_state_source not in {"dataset", "fk"}:
+            raise ValueError(f"ee_state_source={ee_state_source!r} not supported; choices=['dataset', 'fk']")
         # Issue #129 Phase I-0-3: frame_cache_mode validation + env set
         _valid_frame_cache_modes = {"online", "baked_token", "baked_overlay"}
         if frame_cache_mode not in _valid_frame_cache_modes:
@@ -474,6 +484,9 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         self._obb_cache = None  # type: ignore[assignment]
         self._overlay_renderer = None  # type: ignore[assignment]
         self.state_variant = state_variant
+        self.ee_state_source = ee_state_source
+        self._ee_fk_by_skill: dict | None = None   # "fk" のとき skill_id → FK (skill の表を作った後に作る)
+        self.progress_target = bool(progress_target)
         self.include_depth_target = include_depth_target
         self.depth_target_size = tuple(depth_target_size)
         self.depth_target_num_cams = depth_target_num_cams
@@ -610,11 +623,15 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         # skill_id の表 (episode_index → skill_id)。_transform_item が frame の episode_index で引く。
         # 表に無い番号・source_task_index の欠損はここで止める (学習を始めてからでは気づけない)
         self._skill_id_by_episode: dict[int, int] = {}
+        self._episode_length_by_episode: dict[int, int] = {}   # 区間の進み (progress_target) 用
         frames_by_skill: dict[int, int] = {}
         for row in _iter_episode_rows(self._base.meta.episodes):
             skill_id = _episode_skill_id(row)
             self._skill_id_by_episode[int(row["episode_index"])] = skill_id
+            self._episode_length_by_episode[int(row["episode_index"])] = _episode_length(row)
             frames_by_skill[skill_id] = frames_by_skill.get(skill_id, 0) + _episode_length(row)
+        if self.ee_state_source == "fk":
+            self._ee_fk_by_skill = _inference_ee_fk_by_skill(sorted(frames_by_skill))
         source = merged_source_root if merged_source_root is not None else "base_dataset (injected)"
         print(
             f"[data] {source}: "
@@ -809,7 +826,12 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         q_desired = q_desired_all[1:]
         hand_cmd = hand_cmd_all[1:]
         action_is_pad = action_pad_all[1:]
-        ee_state_12 = ee_state[0].astype(np.float32)
+        if self._ee_fk_by_skill is not None:
+            # Issue #183: 推論と同じ FK (その skill の offset) で今の関節角から計算する (記録された ee_state は使わない)
+            fk = self._ee_fk_by_skill[self._skill_id_by_episode[_scalar_from(item["episode_index"])]]
+            ee_state_12 = fk.compute_ee_state(q_current[1][:29])
+        else:
+            ee_state_12 = ee_state[0].astype(np.float32)
 
         if self.state_variant == "73d":
             depth_contact = self._fetch_depth_contact(item, idx)
@@ -996,6 +1018,12 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
             H, W = self.depth_target_size
             sample["depth_target"] = torch.zeros(
                 self.depth_target_num_cams, 1, H, W, dtype=torch.float32
+            )
+        if self.progress_target:
+            # Issue #183: 区間の進み (0〜1)。aux_progress.ProgressHead の正解
+            length = self._episode_length_by_episode[_scalar_from(item["episode_index"])]
+            sample["progress_target"] = torch.tensor(
+                _scalar_from(item["frame_index"]) / max(1, length - 1), dtype=torch.float32
             )
         return sample
 
@@ -1250,6 +1278,35 @@ class RamenOriMultiSplitView(torch.utils.data.Dataset):
         return self.sub_views[k][local_i]
 
 
+# 推論の skill の設定。skill ごとの手先の tool offset (skills.<skill>.wrist_tool_offset、rotate_table_base など) を持つ
+_INFERENCE_SKILL_CONFIG = (
+    Path(__file__).resolve().parents[2] / "inference" / "desktop" / "lower_policy" / "configs" / "skill_config.yaml"
+)
+
+
+def _inference_ee_fk_by_skill(skill_ids) -> dict:
+    """推論 (`inference/desktop/assembly.FkFactory.for_skill`) と同じ手先の FK を skill ごとに作る (Issue #183)。
+
+    推論は `skill_config.yaml` の `skills.<skill>.wrist_tool_offset` があればその offset、無ければ既定の offset で
+    FK する (rotate_table_base は独自の offset)。学習の手先の入力 (`ee_state_source: fk`) も同じ関数で作る。
+    """
+    import yaml
+
+    from inference.desktop.assembly import FkFactory
+
+    skill_config = yaml.safe_load(_INFERENCE_SKILL_CONFIG.read_text(encoding="utf-8"))
+    factory = FkFactory()
+    out = {}
+    for skill_id in skill_ids:
+        fk = factory.for_skill(skill_config, skill_id_name(int(skill_id)))
+        if fk is None:
+            raise FileNotFoundError(
+                "G1 の URDF が無い (推論は手先の入力を 0 にする)。ee_state_source=fk は使えない"
+            )
+        out[int(skill_id)] = fk
+    return out
+
+
 # multi の sub ごとに書ける key (data の場所)。base_dataset は test の DI 用
 _SUB_DATASET_KEYS = frozenset(
     {
@@ -1277,6 +1334,8 @@ _SHARED_SUB_ATTRS = (
     "overlay_class_filter",
     "memory",
     "memory_yolo_ckpt",   # memory を作った OBB の YOLO の重み (sub で違えば止める)
+    "ee_state_source",    # Issue #183: 手先の位置の出どころ (ckpt の約束に書く)
+    "progress_target",
 )
 
 
@@ -1347,6 +1406,8 @@ class RamenOriMultiDataset(torch.utils.data.Dataset):
         frame_cache_num_variants: int = 1,
         auto_precompute_frame_cache: bool = True,
         memory: bool = False,
+        ee_state_source: str = "dataset",   # Issue #183 (RamenOriLerobotDataset と同じ)
+        progress_target: bool = False,
     ) -> None:
         if not sub_datasets or len(sub_datasets) < 1:
             raise ValueError("RamenOriMultiDataset requires at least 1 sub_dataset config")
@@ -1374,6 +1435,8 @@ class RamenOriMultiDataset(torch.utils.data.Dataset):
             auto_precompute_frame_cache=auto_precompute_frame_cache,
             augmentation_cfg=augmentation_cfg,
             memory=memory,
+            ee_state_source=ee_state_source,
+            progress_target=progress_target,
         )
 
         self.subs: list[RamenOriLerobotDataset] = []

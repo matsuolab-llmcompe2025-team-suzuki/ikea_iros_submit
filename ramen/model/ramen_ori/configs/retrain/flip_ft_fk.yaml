@@ -1,0 +1,52 @@
+# @package _global_
+# Issue #183: all6 150k (#155、flip の val が最良圏で実機評価もした点) の重みから、flip_table の 1 skill で追加学習する。
+# 起動: pixi run train --config-name=retrain/flip_ft_fk
+# 初期値の ckpt は HF から /nvme/init に落としておく (docs/handoff/issue_183_ramen_ori_flip_training.md §7)。
+#
+# 学習手法 (c32 + state group dropout、chunk 32、FK の loss、AdamW、vision 凍結、batch 32) は変えない。変えるのは:
+#   1. 初期値 = all6 150k の EMA の重み (training.init_from)。flip だけを一から学習した 100k の run
+#      (retrain/flip_state_dropout) は val が all6 より悪かった (bc の最小 0.133 @45k vs all6 0.10 台、
+#      手先の誤差 約 18 mm vs 14.5 mm)。ほかの skill のデータで学んだ表現を土台にする
+#   2. 手先の位置の入力を推論と同じ FK に (data.ee_state_source: fk)。推論は FK で入れるが、学習は記録された
+#      ee_state だった。flip では平均 13〜18 cm (記録値の std の 2〜3.5 倍) ずれていた
+#   3. 追加学習向けの LR・EMA・val (下)
+#
+# 正規化の統計は init_from の ckpt (all6、記録値の ee_state で計算) のまま使う。手先の入力は FK なので、ee_pose の
+# 12 次元は平均で 2〜3σ ずれた所から追加学習が始まる。学習と推論は同じ統計を使うので食い違いにはならない
+# (state_clip 10 の内側)。統計ごと合わせたいときは ee_pose だけ計算し直す (未実装)
+defaults:
+  - /retrain/c32_state_dropout
+  - override /data: unified_flip
+  - _self_
+
+data:
+  ee_state_source: fk
+
+training:
+  init_from: /nvme/init/all6_state_dropout_17b5658/ckpt_step_150000.pt
+  init_from_weights: ema
+  # flip だけを一から学習した run は 45k (flip 7.5 周) で val の bc が底。学習済みの重みから LR を下げて始めるので
+  # 2 万 step (3.3 周) で足りる見込み。val を 500 step ごとに取って選ぶ
+  max_steps: 20000
+  ckpt_every: 2500
+  ckpt_dir: /nvme/train_outputs/ramen_ori_flip_ft_fk
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk
+    every_n_ckpt: 2          # 5k ごと (2.5k の倍数で使うものは止める前に上げる)
+
+optim:
+  lr: 3.0e-5                 # 一から学習の 1e-4 の 0.3 倍 (学習済みの重みを大きく崩さない)
+
+lr_schedule:
+  warmup_steps: 500
+  cosine_end_lr: 1.0e-6
+
+ema:
+  decay: 0.999               # 0.9999 は約 1 万 step の平均で、2 万 step の追加学習では初期値に引っ張られすぎる
+
+val:
+  val_every: 500
+  at_start: true             # all6 150k そのまま (FK の入力) の値を、追加学習と比べる基準に取る
+
+wandb:
+  run_name: ramen_ori_flip_ft_fk
