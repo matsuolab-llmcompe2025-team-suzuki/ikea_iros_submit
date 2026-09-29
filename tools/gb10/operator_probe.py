@@ -55,11 +55,14 @@ def owned_groot_worker(root_pid, proc_root=Path("/proc")):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=("retry", "camera", "state", "worker", "next", "full", "soak"), required=True)
+    parser.add_argument("--case", choices=("retry", "camera", "gate-camera", "retry-camera", "state", "worker", "next", "full", "soak", "stage"), required=True)
+    parser.add_argument("--stage", type=int, choices=range(6))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dwell-seconds", type=float, default=30)
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
+    if (args.case == "stage") != (args.stage is not None):
+        parser.error("--stage is required only for --case stage")
     if not 1 <= args.dwell_seconds <= 1800:
         parser.error("--dwell-seconds must be in [1,1800]")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -99,9 +102,11 @@ def main():
         processes.append(proc)
         return proc
 
-    def wait_for(marker, timeout=180):
+    def wait_for(marker, timeout=180, *, retry_enter=False):
         nonlocal position
         deadline = time.monotonic() + timeout
+        retry_position = position
+        retries = 0
         while time.monotonic() < deadline:
             text = log_path.read_text(errors="replace")
             found = text.find(marker, position)
@@ -111,6 +116,18 @@ def main():
                 return
             if venue.poll() is not None:
                 raise RuntimeError(f"Venue exited {venue.returncode} before {marker!r}")
+            if retry_enter:
+                if "安全停止／保持中・判断待ち" in text[position:]:
+                    raise RuntimeError("Safety stop while awaiting policy start")
+                rejected = text.find("Enter ignored", retry_position)
+                if rejected >= 0:
+                    retries += 1
+                    if retries > 5:
+                        raise RuntimeError("Five fresh Enter retries did not satisfy the start gate")
+                    retry_position = rejected + len("Enter ignored")
+                    events.append({"retry_enter": retries, "reason": "gate rejected previous Enter",
+                                   "at": time.monotonic()})
+                    key(b"\n")
             time.sleep(0.2)
         raise TimeoutError(f"No {marker!r} within {timeout}s")
 
@@ -126,29 +143,40 @@ def main():
         mock = launch([sys.executable, str(here / "following_mock.py")], "mock.log")
         wire = launch([sys.executable, str(here / "wire_probe.py"),
                        "--output", str(args.output / "wire.json")], "wire.log")
-        time.sleep(2)
+        deadline = time.monotonic() + 60
+        while (time.monotonic() < deadline and mock.poll() is None
+               and "mock ready on loopback" not in (args.output / "mock.log").read_text(errors="replace")):
+            time.sleep(0.2)
         if mock.poll() is not None or wire.poll() is not None:
             raise RuntimeError("Mock or observer exited before venue startup")
+        if "mock ready on loopback" not in (args.output / "mock.log").read_text(errors="replace"):
+            raise TimeoutError("Mock did not finish initialization")
+        selected_stage = args.stage if args.case == "stage" else 2 if args.case == "next" else 5
         stage_args = (["--phase3-full", "--phase3-start-stage", "0", "--phase3-end-stage", "5"]
-                      if args.case == "full" else ["--stage", "2" if args.case == "next" else "5"])
-        traced = (["strace", "-f", "-qq", "-e", "trace=connect,execve", "-o",
+                      if args.case == "full" else ["--stage", str(selected_stage)])
+        # Avoid ptrace stops on unrelated CUDA syscalls while auditing every connect.
+        traced = (["strace", "--seccomp-bpf", "-f", "-qq", "-e", "trace=connect,execve", "-o",
                    str(args.output / "connect.log")] if args.trace else [])
         venue = launch([sys.executable, str(here / "pty_run.py"), *traced,
                         "/usr/local/bin/ramen-venue", *stage_args, "--actuate"], "run.log", stdin=subprocess.PIPE,
                        env={**os.environ, "IROS_ORIN_HOST": "127.0.0.1"})
         wait_for("Enter starts", 900)
         key(b"\n")
-        if args.case == "full":
+        if args.case in ("full", "stage"):
             labels = {"rotate_table_base": "テーブル回転", "pick_table_leg": "pick",
                       "insert_table_leg": "insert", "rotate_leg_to_tighten": "tighten",
                       "flip_table": "flip"}
-            wait_for("Phase 3 continuous stage 0 started")
-            for stage, skills in full_stage_plan().items():
-                wait_for(f"Phase 3 continuous stage {stage} started", 300)
-                for skill in skills:
+            if args.case == "full":
+                wait_for("Phase 3 continuous stage 0 started")
+            plan = full_stage_plan() if args.case == "full" else {
+                selected_stage: full_stage_plan().get(selected_stage, [])}
+            for stage, skills in plan.items():
+                if args.case == "full":
+                    wait_for(f"Phase 3 continuous stage {stage} started", 300)
+                for index, skill in enumerate(skills):
                     wait_for(skill + "／開始待ち")
                     key(b"\n")
-                    wait_for("フェーズ：" + labels[skill])
+                    wait_for("フェーズ：" + labels[skill], retry_enter=True)
                     deadline = time.monotonic() + args.dwell_seconds
                     while time.monotonic() < deadline:
                         if venue.poll() is not None:
@@ -158,12 +186,18 @@ def main():
                         time.sleep(0.2)
                     events.append({"completed_dwell": skill, "stage": stage,
                                    "seconds": args.dwell_seconds, "at": time.monotonic()})
-                    key(b"\x03" if stage == 5 else b"n")
+                    last = (stage == max(plan) and index == len(skills) - 1)
+                    key(b"\x03" if last else b"n")
         else:
             skill = "rotate_table_base" if args.case == "next" else "flip_table"
             wait_for(skill + "／開始待ち")
-            key(b"\n")
-            wait_for("フェーズ：テーブル回転" if args.case == "next" else "フェーズ：flip")
+            if args.case != "gate-camera":
+                key(b"\n")
+                wait_for("フェーズ：テーブル回転" if args.case == "next" else "フェーズ：flip",
+                         retry_enter=True)
+            if args.case == "retry-camera":
+                key(b"r")
+                wait_for(skill + "／腕保持・ハンド全開")
             time.sleep(1)
         if args.case == "soak":
             deadline = time.monotonic() + args.dwell_seconds
@@ -182,19 +216,19 @@ def main():
             key(b"r")
             wait_for(skill + "／開始待ち")
             key(b"\n")
-            wait_for("フェーズ：flip")
+            wait_for("フェーズ：flip", retry_enter=True)
             time.sleep(2)
             key(b"\x03")
         elif args.case == "next":
             key(b"n")
             wait_for("pick_table_leg／開始待ち")
             key(b"\x03")
-        elif args.case != "full":
+        elif args.case not in ("full", "stage"):
             if args.case == "worker":
                 worker_pid = owned_groot_worker(venue.pid)
                 os.kill(worker_pid, signal.SIGKILL)
             else:
-                fault = signal.SIGUSR1 if args.case == "camera" else signal.SIGUSR2
+                fault = signal.SIGUSR1 if args.case in ("camera", "gate-camera", "retry-camera") else signal.SIGUSR2
                 mock.send_signal(fault)
             events.append({"fault": args.case, "at": time.monotonic()})
             wait_for("安全停止／保持中・判断待ち", 15)
@@ -206,7 +240,7 @@ def main():
             key(b"\n")
             wait_for("operator confirmed the return motion", 10)
         rc = venue.wait(timeout=180)
-        expected = (0, 130) if args.case in ("retry", "next", "full", "soak") else (1, 2) if args.case == "worker" else (2,)
+        expected = (0, 130) if args.case in ("retry", "next", "full", "soak", "stage") else (1, 2) if args.case == "worker" else (2,)
         if rc not in expected:
             raise RuntimeError(f"Unexpected venue exit {rc}, expected {expected}")
     except Exception as exc:
@@ -233,6 +267,8 @@ def main():
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
         if CODE_ERRORS.search(log_text) or "[return] failed:" in log_text or "[return] lowering failed:" in log_text:
             error = error or "Application or return-path error in run.log"
+        if args.case == "gate-camera" and "operator confirmed start of flip_table" in log_text:
+            error = error or "Obsolete start gate consumed the safety decision Enter"
         network = None
         if args.trace:
             trace_path = args.output / "connect.log"
@@ -240,7 +276,7 @@ def main():
             network = {"counts": dict(counts), "external": external}
             if not counts or external:
                 error = error or "Missing network observations or outbound connection attempt"
-        result = {"case": args.case, "passed": error is None, "error": error,
+        result = {"case": args.case, "stage": args.stage, "passed": error is None, "error": error,
                   "traced": args.trace, "dwell_seconds": args.dwell_seconds,
                   "network": network,
                   "events": events, "venue_rc": venue.returncode if venue else None,

@@ -1,23 +1,17 @@
 # 会場前の確認（Vast.ai の GB10）— Team RAMEN
 
 提出 image を会場に持っていく前に、**Thor に近い機械で image そのものを起動して**、ネット無しで
-全 stage が立ち上がるかを確かめる手順。image を焼き直したら毎回やる（準備込みで 45 分〜1 時間、$1〜3 ほど。§7）。
+全 stage が立ち上がるかを確かめる手順。image を焼き直したら毎回やる。
+起動確認だけと、全Stageの操作・故障注入・連続推論を含む拡張検証では所要時間が異なる（§7）。
 
 会場の手順は `INSTRUCTIONS.md`、重みは `WEIGHTS.md`。
 
-**更新状況:** 本体 `c73c922` の `20260927-insert-dp100k-01` を GHCR へ公開済み。
-[Arm64 CI run 36318545130](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36318545130)
-はビルド・pushに成功。新しいinsert Diffusion版のGB10・Thor/G1確認は**未実施**。
-以下のGB10実測は、insert GR00Tを使っていた**旧**rebuild5の履歴であり、新版の検証結果ではない。
-
-**旧版の検証（Issue #12）:** 本体 `e3a4187` の `20260927-rebuild5` を GHCR へ公開済み。
-ARM64 [CI run 36264063035](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36264063035)
-が build/import・重力補償 probe を通過した（build commit `56c69c5`）。旧版のdigestは
-[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照（現在の`manifest.yaml`は新版）。
-旧版をGHCR認証後にGB10へ取得し、4環境のGPU演算、全Stageのpreflight、全11構成の
-model forward、操作・故障注入を確認済み。詳細と追加検証の状況は
-[GB10_REBUILD5_REPORT.md](GB10_REBUILD5_REPORT.md)を参照。
-§6の測定結果は旧`rebuild4`の履歴。GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
+**更新状況（Issue #16）:** 本体 `10b8d73` の `gb10-preparation-10b8d73` を GHCR へ公開済み。
+ARM64 [CI run 36479757032](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36479757032)
+が成功した（build commit `c56fc69`）。digest は `manifest.yaml` に固定。
+このimageの検証結果・完了状況は[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md)を参照。
+§6は旧`rebuild4`、§8は旧`rebuild5`の履歴であり、新imageの検証を代替しない。
+GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証とは扱わない。
 
 ## 1. なぜ GB10 か
 
@@ -28,7 +22,7 @@ model forward、操作・故障注入を確認済み。詳細と追加検証の�
 
 ## 2. 確かめること / 確かめられないこと
 
-| 確かめること | 確かめられないこと（09-27 に Thor で） |
+| 確かめること | GB10だけでは確かめられないこと |
 |---|---|
 | image の起動口・4 環境（runtime / desktop / vlm / pick）が GPU を使えるか | sm_110（Thor）専用の kernel（GB10 は sm_121） |
 | 重みの事前取得と、ネット無しの `--check` | 実機・実カメラ・運営の WBC / adapter |
@@ -36,11 +30,11 @@ model forward、操作・故障注入を確認済み。詳細と追加検証の�
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
 | `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
 | 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
-| `--actuate` の経路: Enter 1 → go-live 待ち → 安全停止の判断待ち / Ctrl+C → 後始末 | 実機が指令へ追従すること（mock の sin 波で go-live が誤成立する場合がある） |
+| `--actuate` の経路: 準備goto・到達待ち・Enter/N/R・安全停止の判断待ち・後始末 | 実機の追従・干渉・接触（遅れ付き模擬追従でも物理応答は証明できない） |
 | conformance | |
 
-4-6 の run 以外は `--actuate` を付けないので、指令は 1 通も出ない（起動確認だけで終わる）。4-6 の run も、
-指令の宛先（Thor が bind する `:5556`）には誰もつながっていない。
+4-6 の run 以外は `--actuate` を付けないので、指令は 1 通も出ない（起動確認だけで終わる）。
+4-6 はloopbackの模擬adapterだけが `:5556` を購読する。会場への接続や実機指令は行わない。
 
 ## 3. 秘密の値
 
@@ -72,7 +66,7 @@ curl -s -G -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/api/v0/b
 
 # 作る（create.json は権限 600 で作り、作ったらすぐ消す。PAT が入っている）
 #   {"client_id":"me","image":"ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-test-<commit>",
-#    "image_login":"-u <GitHub user> -p <PAT> ghcr.io","env":{},"disk":250,
+#    "image_login":"-u <GitHub user> -p <PAT> ghcr.io","env":{},"disk":350,
 #    "runtype":"ssh_direc ssh_proxy","label":"ramen-gb10-check","cancel_unavail":true}
 curl -s -X PUT -H "Authorization: Bearer $VAST_KEY" -H "Content-Type: application/json" \
   --data @create.json https://console.vast.ai/api/v0/asks/<offer id>/
@@ -97,7 +91,8 @@ bash で実行する（zsh は `$SSH` を単語に分けないので動かない
 SSH="ssh -i <秘密鍵> -p <port> root@<ip>"
 # scp は使えない (Vast の SSH は sftp を通さない)。標準入力で送る
 for f in tools/gb10/*; do $SSH "cat > /root/$(basename $f) && chmod +x /root/$(basename $f)" < $f; done
-$SSH 'apt-get update -qq && apt-get install -y -qq strace'   # 使い捨ての container に OS の道具を入れるだけ
+# strace は /install の確認・承認後、使い捨てGB10だけへ固定versionを導入する。
+# 検証時: 6.8-0ubuntu2。導入直前にも apt-get -s で追加依存を確認する。
 $SSH 'bash /root/check_envs.sh'
 ```
 
@@ -139,33 +134,43 @@ strace の下は起動が遅く出る（VLM で 1.3 倍ほど）。起動秒は 
 
 ### 4-6 `--actuate` の経路
 
-`ACTUATE_HOLD=<秒>` で `--actuate` を付けて起動し、Enter 1 の問いに改行を送り、go-live 待ち（`[go-live]`）が
-出てからその秒数だけ待つ。安全停止で「判断待ち」なら Enter で戻し動作を承認し、それ以外は
-自分の擬似端末へ Ctrl+C を送る。外向きの接続は 4-5 で見たので strace は付けない。
-**この自動承認は mock 専用。実機で run_stage.sh を使わない。**
+現行joint準備の検証には `operator_probe.py` を使う。これは運営adapterの
+`_handle_joint` / `_handle_goto` と遅れ付き模擬関節を使い、実際のimageの
+`ramen-venue --actuate` を擬似端末から操作する。接続先はloopbackに固定する。
+**キーの自動承認はこの隔離試験専用。会場・実機では実行しない。**
 
-模擬の PC2 の関節は指令と関係なく sin 波で動くので、go-live 待ちは「ついてきた」と成立してしまい、その先の
-準備動作（腕を動かす）は指令に従わないので時間切れになる。見るのは、そこまでに指令の経路（実測の関節の読み取り・
-到達の誤差（joint lane は関節角の `joint_error`、pose lane は運営 IK と同じ URDF での手先の `ee_pos_error`）・
-publish・後始末）がコードの誤り無しに動くこと。
-- Stage 1〜5: 開始姿勢（時間切れ）→ 安全停止・判断待ち → Enter 承認 → 後始末 → rc=2。
-  `[safety-stop] operator transition … did not reach its target` と判断待ち・承認の両 log があること。
-- Stage 0: 腕を下ろす準備動作が時間切れ → 判断待ち → Enter 承認 → 後始末 → **設計どおりの停止**（腕を下ろせないまま歩かない。
-  `RuntimeError: lowering the arms before the walk failed: … did not converge`、rc=1）
-- `actuate5_pose_clamp`: `[boundary] wrist_roll clamp: on …`。`actuate0_converged`: `[init] walk latch check = converged (cli)`
-  （模擬の PC2 では下ろす動きが収束しないので、終わり方は Stage 0 と同じ設計どおりの停止）
+`fetch_validation_assets.py` で固定revisionの運営コードとWBC資産を用意する。
+公式adapter用のPython依存は、`GB10_PREPARATION_REPORT.md`記載の承認済みversionを
+`/install`手順で独立venvへ入れる。本番のPython環境や運営コードを書き換えない。
 
 ```bash
-$SSH -n 'setsid nohup bash -c "for s in 0 5; do NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\$s; \
-  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh \$s actuate\${s}_pose --boundary-lane pose; done; \
-  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh 5 actuate5_pose_clamp --boundary-lane pose --wrist-roll-clamp on; \
-  NOSTRACE=1 ACTUATE_HOLD=60 /root/run_stage.sh 0 actuate0_converged --walk-lowering-check converged" \
-  > /dev/null 2>&1 < /dev/null &'
-$SSH 'python3 /root/summarize.py /root/runs/actuate*'   # 終わったら。exit 0 = 合格
+# GB10内で、他のprobeが停止し :5555/:5556/:5557 が空いているときだけ実行
+export PYTHONPATH=/root/gb10-validation/wbc:/app/ramen:/app:/root
+export RAMEN_TEST_ORGANIZER=/root/gb10-validation/organizer
+export OPENBLAS_NUM_THREADS=1
+PY=/root/gb10-validation/.venv/bin/python
+"$PY" /root/operator_probe.py --case stage --stage 1 --dwell-seconds 30 \
+  --trace --output /root/runs/stage-1
+"$PY" /root/operator_probe.py --case full --dwell-seconds 30 \
+  --trace --output /root/runs/full
+"$PY" /root/operator_probe.py --case gate-camera --trace --output /root/runs/gate-camera
+"$PY" /root/operator_probe.py --case retry-camera --trace --output /root/runs/retry-camera
+"$PY" /root/operator_probe.py --case soak --dwell-seconds 600 \
+  --trace --output /root/runs/soak
 ```
 
-2026-09-25 の本番 image（`20260925-rebuild`）は、ここで落ちる不具合（`main()` の numpy の import 漏れ、
-本体 #164）を持っていた。4-5 は `--actuate` 無しなので通っていた。
+同じ方法で個別Stage 0〜5、`retry` / `next` / `camera` / `state` / `worker` を逐次確認する。
+出力先は毎回新しいdirectoryにする。各`result.json`の`passed`、wireと外向きconnectを確認する。
+Enterが速度・鮮度条件で拒否された場合、probeは拒否ログを確認した後だけ新しいEnterで再確認する。
+到達判定自体は変更しない。安全停止を検出した場合は通常のPolicy開始を再試行しない。
+
+`preparation_adapter_probe.py`は受信欠落・再試行・clamp・中断・遅延到達を別途検査する。
+未到達timeoutは終了ではなく`holding`、到達後は`ready`となり新しいEnterを待つ。
+古い開始待ちやR待ちが、安全停止画面のEnterを消費しないことも確認する。
+旧`run_stage.sh`のsin波mockはpreflight用であり、準備の追従・到達の証拠にはしない。
+
+2026-09-25のimageでは`--actuate`なしの検査を通っても、実行経路にimport漏れがあった。
+このため、preflightだけをもって合格としない。
 
 ### 4-7 片付け
 
@@ -173,16 +178,20 @@ $SSH 'python3 /root/summarize.py /root/runs/actuate*'   # 終わったら。exit
 curl -s -X DELETE -H "Authorization: Bearer $VAST_KEY" https://console.vast.ai/api/v0/instances/<instance id>/
 ```
 
-試験用 tag を GHCR から消し、PAT を revoke する。
+ログを退避してhashを確認してから、今回借りたinstanceだけを削除する。
+digest固定で提出する検証済みimageは消さない。不要な試験tagと一時認証を整理する。
+他作業が使う共用認証を勝手にrevokeしない。
 
 ## 5. 合格の基準
 
 - `summarize.py` が exit 0: 全 stage が `rc=0`（`[preflight] … validation passed; NO command sent`）、**外向き connect 0 件**。
   候補（`stage*_all6`）と DP（`stage2_dp`）も同じ
-- `--actuate` の run（`actuate*`）: Enter 1 → `[go-live]` まで進み、log にコードの誤り（`NameError` など。
-  後始末は例外を握って `[return] failed: …` と出すので、名前で見る）が無い。終わり方は Ctrl+C（rc 0 か 130）か
-  4-6 の設計どおりの停止（Stage 0 の rc=1、Stage 1〜5 の安全停止 rc=2）。
-  安全停止では判断待ちと操作者の応答が必須。それ以外の例外は不合格
+- `operator_probe.py`の個別・連続Stage、N/R、故障注入、soakが全て`passed=true`。
+  通常ケースは実際のPolicy開始・所定時間の推論・正常終了まで確認する。
+  故障ケースは安全停止と新しいEnterによる戻し承認を確認する。
+  `[return] failed`や未回収worker、予期しない例外を合格扱いにしない。
+- `preparation_adapter_probe.py`の全ケースが合格し、wire再生が運営adapterに受理される。
+- 全model構成で実forwardを実施する。起動だけ・即追従mockだけでは合格にしない。
 - `prefetch_weights.py --check` が `all present`、conformance が `PASS`
 - GPU の使用量が基準値から大きく増えていない（増えたら model か設定の変更を疑う）
 
@@ -234,10 +243,15 @@ rebuild3 までは「initial arm/hand pose is reached and actively held」と出
 
 ## 7. 費用
 
-GB10 は 1 時間 $0.3〜0.7（disk 250 GB の保存料金込みで $0.4 前後）。1 回の確認は image の pull 10 分・
+GB10 は 1 時間 $0.3〜0.7程度（disk容量・hostに依存）。旧来の起動確認は image の pull 10 分・
 重み 3 分・stage の起動 30〜40 分（4-5・4-6 の全部）で、合わせて 45 分〜1 時間。host によっては回線の従量料金が
 時間料金より大きい（2026-09-26 のハンガリーの host は約 45 分で $3.0。スペインの host は約 1.1 時間で $0.99）。
 借りる前に offer の `inet_down_cost`（1 GB あたり）を見る。2026-09-25 の初回は $0.90（不具合の調査を含む）。
+
+Issue #16の拡張検証は、全Stage個別・連続実行、操作・故障注入、600秒soak、
+990回forward、公式adapterへのwire再生、候補別preflightを逐次行う。
+上記45分〜1時間はこの全検証の見積りではない。実行時間と結果は
+[GB10_PREPARATION_REPORT.md](GB10_PREPARATION_REPORT.md)に記録する。
 
 ## 8. rebuild5 の拡張検証と提出判断
 
@@ -297,6 +311,9 @@ model forward は合成画像での実行可能性検査であり、タスク成
 `summarize.py` の `外向き通信: 未検査` は通信ゼロの証拠に数えない。
 Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace不在・空の記録を不合格にする。
 `strace`等の追加導入は`/install`の確認・承認後に隔離検証環境だけで行う。
+対話試験のtraceには`--seccomp-bpf`を使い、CUDAの無関係なsyscallごとのptrace停止を避ける。
+追跡対象は引き続き全子processの`connect,execve`。通常traceは計測対象自体を遅くするため、
+鮮度停止が出た場合は非trace/filtered traceと比較する。安全閾値を緩めて合格させない。
 
 `wire_probe.py`は元packetを長さ付き`.wire`と、解析用`.npz`へ保存する。
 `organizer_replay.py --organizer <checkout> --capture <wire.wire> --output <result.json>`は

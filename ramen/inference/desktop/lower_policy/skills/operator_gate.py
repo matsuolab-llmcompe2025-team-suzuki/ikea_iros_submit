@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -80,6 +81,7 @@ class OperatorConfirmationHoldSkill(Skill):
         name: str,
         next_skill_name: str,
         input_fn: Callable[[str], str] = input,
+        cancellable_input_fn: Optional[Callable[[str, threading.Event], str]] = None,
         discard_pending_input_fn: Callable[[], None] = discard_pending_stdin,
         arrival_check: Optional[ArrivalCheck] = None,
         require_arrival: bool = False,
@@ -89,6 +91,8 @@ class OperatorConfirmationHoldSkill(Skill):
         self.name = name
         self._next_skill_name = str(next_skill_name)
         self._input_fn = input_fn
+        self._cancellable_input_fn = cancellable_input_fn
+        self._input_cancel = threading.Event()
         self._discard_pending_input_fn = discard_pending_input_fn
         self._arrival_check = arrival_check
         self._require_arrival = bool(require_arrival)
@@ -99,16 +103,45 @@ class OperatorConfirmationHoldSkill(Skill):
         self._reader_started = False
         self._failure_reason: Optional[str] = None
         self._lock = threading.Lock()
+        self._generation = 0
+        self._live_state_getter = None
+
+    def require_fresh_state(self, getter, *, max_age_s, max_speed_rad_s):
+        self._live_state_getter = getter
+        self._max_age_s = max_age_s
+        self._max_speed_rad_s = max_speed_rad_s
+
+    def _live_arrival(self):
+        if self._live_state_getter is None or not self._require_arrival:
+            return True
+        state = self._live_state_getter()
+        stamp = getattr(state, "received_monotonic_ns", None)
+        if stamp is None or not (0 <= time.monotonic() - stamp / 1e9 <= self._max_age_s):
+            return False
+        arm = arm_positions_from_joint_state(tuple(state.name), state.position, self.name)
+        velocity = arm_positions_from_joint_state(tuple(state.name), state.velocity, self.name)
+        return bool(
+            np.isfinite(arm).all() and np.isfinite(velocity).all()
+            and np.max(np.abs(velocity)) <= self._max_speed_rad_s
+            and (self._arrival_check is None or self._arrival_check(arm)[0])
+        )
 
     def _on_start(self, params: dict) -> None:
-        self._hold_arm = None
-        self._latest_arm = None
-        self._confirmed.clear()
-        self._reader_started = False
-        self._failure_reason = None
+        with self._lock:
+            self._input_cancel.set()
+            self._input_cancel = threading.Event()
+            self._generation += 1
+            self._hold_arm = None
+            self._latest_arm = None
+            self._confirmed.clear()
+            self._reader_started = False
+            self._failure_reason = None
 
     def _on_stop(self) -> None:
-        pass
+        with self._lock:
+            self._input_cancel.set()
+            self._generation += 1
+            self._confirmed.clear()
 
     def _prompt(self, arm: np.ndarray) -> str:
         if self._arrival_check is None:
@@ -134,23 +167,34 @@ class OperatorConfirmationHoldSkill(Skill):
             + instruction
         )
 
-    def _read_confirmation(self, prompt: str) -> None:
+    def _read_confirmation(self, prompt: str, generation: int, cancel_event=None) -> None:
+        cancel_event = self._input_cancel if cancel_event is None else cancel_event
         try:
             # 姿勢に着く前に押された Enter で policy を始めない。
-            self._discard_pending_input_fn()
+            if self._cancellable_input_fn is None:
+                self._discard_pending_input_fn()
             while True:
-                self._input_fn(prompt)
+                if cancel_event.is_set():
+                    return
+                if self._cancellable_input_fn is None:
+                    self._input_fn(prompt)
+                else:
+                    self._cancellable_input_fn(prompt, cancel_event)
                 with self._lock:
+                    if generation != self._generation:
+                        return
                     latest = None if self._latest_arm is None else self._latest_arm.copy()
+                live_arrived = self._live_arrival()
                 if (
-                    not self._require_arrival
+                    live_arrived and (not self._require_arrival
                     or self._arrival_check is None
-                    or (latest is not None and self._arrival_check(latest)[0])
+                    or (latest is not None and self._arrival_check(latest)[0]))
                 ):
                     break
                 detail = (
-                    "no live arm state"
-                    if latest is None else self._arrival_check(latest)[1]
+                    "no fresh, stationary arm state"
+                    if not live_arrived or latest is None or self._arrival_check is None
+                    else self._arrival_check(latest)[1]
                 )
                 print(
                     f"[gate] initial pose not reached ({detail}); Enter ignored",
@@ -158,14 +202,19 @@ class OperatorConfirmationHoldSkill(Skill):
                 )
                 # 次の問いは今の実測で作り直す (どの関節がどれだけ離れているかを出す)
                 prompt = self._prompt(latest if latest is not None else self._hold_arm)
-        except (EOFError, OSError) as exc:
+        except Exception as exc:  # Surface reader failures instead of leaving a silent gate.
             with self._lock:
+                if generation != self._generation:
+                    return
                 self._failure_reason = (
                     f"operator confirmation input failed before "
                     f"{self._next_skill_name}: {exc!r}"
                 )
             return
-        self._confirmed.set()
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._confirmed.set()
         print(
             f"[gate] operator confirmed start of {self._next_skill_name}",
             file=sys.stderr,
@@ -196,7 +245,7 @@ class OperatorConfirmationHoldSkill(Skill):
             self._reader_started = True
             threading.Thread(
                 target=self._read_confirmation,
-                args=(self._prompt(self._hold_arm),),
+                args=(self._prompt(self._latest_arm), self._generation, self._input_cancel),
                 name=f"{self.name}-stdin",
                 daemon=True,
             ).start()
@@ -204,6 +253,14 @@ class OperatorConfirmationHoldSkill(Skill):
 
     @property
     def is_complete(self) -> bool:
+        if self._confirmed.is_set() and not self._live_arrival():
+            self._confirmed.clear()
+            self._reader_started = False
+            print(
+                "[gate] arrival/fresh stationary state changed before transition; "
+                "Enter ignored. Wait for the pose to settle, then press Enter again.",
+                file=sys.stderr,
+            )
         return self._confirmed.is_set()
 
     @property

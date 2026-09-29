@@ -20,8 +20,9 @@ flowchart LR
 ## 1. 前日まで
 
 - [ ] **使う image を決め、Thor に入れる。** `manifest.yaml` の `images.thor` の digest で pull するか、USB から `docker load`（`WEIGHTS.md` §3・§4）。
-- [ ] **使うのは `20260927-insert-dp100k-01`（digest `sha256:c98c80c7…`、本体 `c73c922`）。** 既定は **joint lane**・手首 roll の clamp **off**・
-  **重力の垂れ補正 on**・**送り方は変化時だけ 16 行**、policy の間は**操作者の N / R / Enter** で進む（本体 #170・858e107・#172）。
+- [ ] **使うのは `gb10-preparation-10b8d73`（digest `sha256:6db3fb0b…`、本体 `10b8d73`）。** 既定は **joint lane**・手首 roll の clamp **off**・
+  **重力の垂れ補正 on**。通常Policyは変化時だけ16行、準備・戻しは公式one-shot goto。policyの間は**操作者の N / R / Enter**で進む。
+  到達遅延時の保持・R再試行は`INSTRUCTIONS.md`、このimageの検証範囲は`GB10_PREPARATION_REPORT.md`を参照する。
   この手順書はこの image 用。`20260926-rebuild4`（本体 `9965c90`）は、腕が重力で下がり続ける送り方・R のやり直しで固まる不具合・
   安全停止の後に確認なしで腕を動かす不具合を持つので使わない。`docker image inspect <image> --format '{{json .RepoDigests}}'` で manifest の registry digest と照合する（`.Id` は別の値）。
   USB から load した image は RepoDigests が空の場合がある。その場合は `WEIGHTS.md` の tar checksum と `IMAGE_ID.txt` の照合を使う。

@@ -44,6 +44,7 @@ class ModelResidency:
         policies: dict[str, Any],
         *,
         resident: int,
+        preparation_loads_only_at_hold: bool = False,
     ) -> None:
         if resident < 1:
             raise ValueError(f"resident must be >= 1, got {resident}")
@@ -51,6 +52,7 @@ class ModelResidency:
         self._order = [name for name in self._timeline if name in policies]
         self._policies = dict(policies)
         self._resident = int(resident)
+        self._preparation_loads_only_at_hold = preparation_loads_only_at_hold
         self._loaded: set[str] = set()
         self._lock = threading.Lock()
         self._queue: "queue.Queue[Optional[tuple[str, str]]]" = queue.Queue()
@@ -110,7 +112,8 @@ class ModelResidency:
             prepare()
         with self._lock:
             self._loaded.add(first)
-        self.on_skill_started(first)
+        if not self._preparation_loads_only_at_hold:
+            self.on_skill_started(first)
 
     def on_skill_started(self, skill_name: Optional[str]) -> None:
         """active な skill が変わったときに呼ぶ。保つ範囲を更新する。
@@ -119,6 +122,12 @@ class ModelResidency:
         checkpoint worker の終了待ちを制御 tick で行ってはいけない。
         """
         if skill_name is None or skill_name not in self._timeline:
+            return
+        if (
+            self._preparation_loads_only_at_hold
+            and skill_name not in self._policies
+            and not skill_name.startswith("hold_transition_")
+        ):
             return
         # Loading a multi-GiB checkpoint during hand/arm motion can starve the
         # control loop.  The final hold is the sole model-switch point.

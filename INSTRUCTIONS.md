@@ -29,6 +29,11 @@ flowchart LR
 - VLM（hybrid pick の区間 1→2 の判定）は、Stage 1〜4 の run の中で container が自分で起動し、run の終わりに止める。
 - container は run ごとに作り直す。重みは host の HF cache を読み取り専用で mount し、**実行中はネットに出ない**。
 
+**この提出経路は運営WBCを使います。** joint laneは運営IKを迂回して腕関節角を渡す方式であり、
+Regular Modeの`arm_sdk`へ直接送る方式ではありません。hybrid preflight等に残る`Regular`の文言は
+実機モードを照会した結果ではないため、モード確認には使わないでください。
+ロボット側のモード・WBCの起動状態は運営手順に従って確認します。
+
 **通信断・強制終了は停止操作ではありません。** 運営adapter `497f3ab` は送信元が消えても
 最後の歩行速度をkeepaliveで再送します（非作動試験で確認）。SSH切断、`kill`、`docker stop`で
 ロボットが停止すると想定しないでください。通常停止は操作端末のCtrl+C、危険時・通信断時は現地の
@@ -37,7 +42,8 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 | Stage | 中身 | 操作（§2「操作キー」） |
 |---|---|---|
 | 0 | 準備（go-live 後に腕を下ろす → 台まで歩く → pick の開始姿勢） | Enter 1（安全確認）だけ |
-| 1〜4 | 脚 1 本ずつ: 台を回す → pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
+| 1 | 1本目: pick（VLM + GR00T + IK + 持ち替え）→ insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
+| 2〜4 | 脚1本ずつ: 台を回す → pick → insert → 締め付け | Enter 1 → policy ごとに開始姿勢で Enter → 終わったら **N** で次の policy へ |
 | 5 | 台を裏返す（flip） | Enter 1 → 開始姿勢で Enter |
 
 ## 1. 事前準備（会場の前に Thor で 1 回）
@@ -47,9 +53,9 @@ E-stop担当者が対応します。運営側のclient-loss時の停止策を確
 export RAMEN_HOST_DIR=~/ramen
 mkdir -p $RAMEN_HOST_DIR/{hf_cache,outputs,vlm_cache}
 
-# image（tag 20260927-insert-dp100k-01 = 本体 c73c922。digest は manifest.yaml と同じ。
-# この版はarm64 CIビルド済み。旧rebuild5のGB10記録は新しいinsertモデルの検証ではない）
-docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923
+# image（tag gb10-preparation-10b8d73 = 本体 10b8d73。digest は manifest.yaml と同じ。
+# GB10の確認記録はGB10_PREPARATION_REPORT.md。実機の追従・干渉は未検証）
+docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
@@ -118,7 +124,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
-  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923 \
+  ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
   --stage N --actuate
 ```
 
@@ -132,13 +138,17 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
   目安（GB10 = Thor に近い arm64・128 GB 共有メモリで実測、2026-09-25）: Stage 1〜4 は Enter 1 まで 4〜5 分
   （VLM の起動 約 3.3 分 + model の読み込み）、Stage 5 は 1 分弱、Stage 0 は十数秒。
-  旧rebuild5の全Stage連続試験ではGPU使用量の最大49.46 GiB、MemAvailableの最小31.99 GiBを記録した。
-  **新しいinsert Diffusion版の測定値ではない**。起動時間・メモリは再確認する（旧結果は`GB10_REBUILD5_REPORT.md`）。
+  今回の全Stage連続試験ではGPU使用量の最大44.36 GiB、MemAvailableの最小39.78 GiBを記録した。
+  詳細は`GB10_PREPARATION_REPORT.md`を参照する。
+  GB10の測定値をThorの起動時間やメモリ上限の保証として扱わない。
 - `Enter 1`: ハーネス・E-stop・周りの空きを確かめてから押す。
-- 腕の送り方（既定、本体 #172）: joint lane で、目標が変わったときだけ最短 0.1 s おきに同じ目標を 16 行送る
+- 通常Policyの腕の送り方（本体 #172）: joint lane で、目標が変わったときだけ最短 0.1 s おきに同じ目標を 16 行送る
   （`[boundary] publish: 16 row(s) per chunk, on change at most every 0.1s …`）。運営 WBC は腕を重力補償なしで
   動かすので、送る腕に重力の垂れの分を足す（`[boundary] gravity sag offset: on (kp=[100, 100, 40, 40, 20, 20, 20] …)`）。
   kp が会場の WBC と合っているかは接続テストで確かめる（`CONNECTION_TEST.md`）。
+- 準備・戻し動作（本体 #181）は別方式: 公式 `JointSink.send_goto` を各区間に一度だけ送り、
+  最大0.3 rad/sで進む。15秒上限を超える区間は同じ線分上で分割する。
+  goto中に通常chunkで上書きしない。SDKの加速度制限付き補間と同じではない。
 - 使う model は起動 log の `[init] policy variants: insert=… (config)` で分かる（`config` = 既定、`set:…` / `cli` = 切り替え）。
 - go-live 待ち: 両肩を少し（−0.05 rad）動かす指令を出し、実測がついてくる（0.02 rad）まで待つ。時間制限なし。
 
@@ -162,14 +172,18 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 |---|---|
 | `Enter` | 開始姿勢に着いてから押すと policy が始まる。着いていない Enter は捨てられ、`[gate] initial pose not reached (worst=<関節> error=<rad>)` と一番ずれた関節が出る。insert・締め付けのやり直しでは、脚を置いた後の Enter で初期の握り幅へ、もう一度 Enter で開始 |
 | `N` | 今の policy を止めて、次の policy の開始姿勢へ移る（着いたら Enter を待つ）。stage の最後の policy では効かない |
-| `R` 1 回目 | 腕は最後の指令のまま、両手だけ全開にする |
+| `R` 1 回目（Policy中） | 腕は最後の指令のまま、両手だけ全開にする |
 | `R` 2 回目 | 開き終わってから効く。同じ policy の開始姿勢へ戻る（Enter まで始まらない） |
 | `Ctrl+C` | 歩行を 0 にし、今の policy の開始姿勢 → 手を全開 → 起動時の道を逆にたどって腕を下ろし、終わる。**戻し動作の途中で 1 秒以上たってからもう一度押すと、その場で保持して終える**（運営 adapter の最後の指令保持を前提とする。実際の保持は WBC・電源・通信の状態に依存するため、E-stop 担当は離れない） |
 
 - **押す前に腕が開始姿勢にあるかを目で確かめる。**
-- Stage 0: go-live の直後に、WBC の既定の姿勢（前腕が前に出た HOME）から腕を下ろし
+- Stage 0: go-live の直後に、現在の実測姿勢から腕を下ろし
   （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
-- **安全停止**（カメラ・関節の状態が途切れた、準備の動きが開始姿勢に届かなかった、想定外の例外）: 歩行だけ 0 にし、
+- **準備保持**（`準備／<経由点>／holding`）: 予定時間+5秒で未到達なら、その経由点で保持する。
+  誤差と関節indexを確認し、Rで**同じ経由点だけ**再試行できる。遅れて到達すると`ready`になり、
+  新しいEnterで準備を続ける。このEnterはPolicy開始のEnterとは別。モデルを読み直す必要はない。
+  未到達のEnter/Nで先へ飛ばすことはできない。戻し動作中も同じ方式。
+- **安全停止**（カメラ・関節の状態が途切れた、想定外の例外）: 歩行だけ 0 にし、
   腕と Dex1 は最後の指令を保持して、`フェーズ：安全停止／保持中・判断待ち` で止まる（勝手に腕を動かさない）。
   持っている脚と周りを確かめてから、`Enter` = 戻し動作（上の Ctrl+C と同じ）、`Ctrl+C` = 動かさずにその場で終える。
   危ない動きは待たずに E-stop。
@@ -197,6 +211,7 @@ python wbc_driver.py --lane decoupled --actions-host <THOR_IP> --live --engage-p
 | `…:8000 is already in use` | 前の VLM が残っている。`docker ps` で古い container を確かめる |
 | `[groot] waiting for the GR00T worker to load... Ns` | GR00T の model を読み込み中。待つ |
 | `[groot] integrated GPU: load headroom from MemAvailable=…` | 情報。GR00T を読む前の空きメモリ |
+| `[preparation] … error=…rad joint=… speed=…rad/s` | 準備の予定時間・実測誤差・速度。`holding`なら同じ経由点をRで再試行、`ready`ならEnterで準備を続行 |
 | `sender clock offset ~ ±x.xxxs` | 情報。PC2 と Thor の時計の差（指令の送信時刻をこの分だけ直している） |
 | `[boundary] gravity sag offset: on (kp=… scale=1 …)` | 情報。運営 WBC の重力の垂れの分を腕に足している（joint lane の既定） |
 | `Official boundary configuration rejected: gravity sag offset could not be built` | 重力の垂れ補正を作れない。起動を中止し、image・URDF・設定を確認する。`--boundary-gravity-offset off` は検証用であり、自動回避に使わない |

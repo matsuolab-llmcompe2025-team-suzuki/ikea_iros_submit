@@ -22,7 +22,7 @@ SAFETY_STOP_PHASE = "安全停止"
 class OperatorConsole:
     def __init__(self) -> None:
         self._events: queue.Queue[tuple[int, str]] = queue.Queue()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._generation = 0
         self._view: tuple[int, str, tuple[str, ...]] | None = None
         self._stop = threading.Event()
@@ -95,11 +95,11 @@ class OperatorConsole:
                 ):
                     self._events.put((self._generation, key))
 
-    def show(self, stage: int, phase: str, allowed: tuple[str, ...]) -> None:
+    def show(self, stage: int, phase: str, allowed: tuple[str, ...]) -> int:
         view = (stage, phase, allowed)
         with self._lock:
             if view == self._view:
-                return
+                return self._generation
             self._generation += 1
             self._view = view
             self._accept_after = time.monotonic() + 0.15
@@ -110,7 +110,11 @@ class OperatorConsole:
                     break
             if self._fd is not None:
                 termios.tcflush(self._fd, termios.TCIFLUSH)
+            generation = self._generation
         labels = {"n": "N 次へ", "r": "R やり直し", "enter": "Enter 開始"}
+        if phase.startswith("準備／"):
+            labels["r"] = "R この経由点を再試行"
+            labels["enter"] = "Enter 到達確認・準備を続行"
         stop_label = "Ctrl+C 終了"
         if phase.endswith("腕保持・ハンド全開"):
             labels["r"] = "R 初期姿勢へ"
@@ -121,6 +125,7 @@ class OperatorConsole:
             stop_label = "Ctrl+C その場で終了"
         controls = " ｜ ".join([*(labels[key] for key in allowed), stop_label])
         print(f"Stage {stage}\nフェーズ：{phase}\n操作：{controls}", file=sys.stderr)
+        return generation
 
     def poll(self) -> str | None:
         if self._stop.is_set():
@@ -144,18 +149,30 @@ class OperatorConsole:
                 )
 
     def wait_for(
-        self, key: str, *, stage: int, phase: str, detail: str | None = None
+        self, key: str, *, stage: int, phase: str, detail: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
-        self.show(stage, phase, (key,))
+        with self._lock:
+            if cancel_event is not None and cancel_event.is_set():
+                raise EOFError("operator confirmation cancelled")
+            generation = self.show(stage, phase, (key,))
         if detail:
             # 例: 開始姿勢に届いたか・一番ずれた関節 (gate が実測から作る 1 行)
             print(detail, file=sys.stderr)
         while not self._stop.is_set():
-            try:
-                generation, received = self._events.get(timeout=0.1)
-            except queue.Empty:
-                continue
             with self._lock:
-                if generation == self._generation and received == key:
+                if generation != self._generation or (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    raise EOFError("operator confirmation replaced or cancelled")
+                # Check ownership before dequeuing; an old waiter must not steal
+                # a new view's Enter/R, even when both views accept the same key.
+                try:
+                    event_generation, received = self._events.get_nowait()
+                except queue.Empty:
+                    received = None
+                    event_generation = None
+                if event_generation == generation and received == key:
                     return received
+            self._stop.wait(0.02)
         raise EOFError("operator terminal closed")

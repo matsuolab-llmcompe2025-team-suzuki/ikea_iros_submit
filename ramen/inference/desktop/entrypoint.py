@@ -287,6 +287,7 @@ def _return_arms_and_open_hand(
     open_only: bool = False,
     policy_initial_arm: Optional["np.ndarray"] = None,
     retreat_waypoints: Sequence["np.ndarray"] = (),
+    boundary_preparation_args: Optional[dict] = None,
 ) -> None:
     """run の終わりに手を開き、腕を下ろしてから解放する (Issue #152)。
 
@@ -311,6 +312,19 @@ def _return_arms_and_open_hand(
         if recorder is not None:
             recorder.write_event(payload)  # type: ignore[attr-defined]
 
+    def _start_return_motion(skill):
+        if boundary_preparation_args is None:
+            skill.start({})
+            return
+        skill.configure_boundary_preparation(**boundary_preparation_args)
+        skill.start({})
+        try:
+            while not skill.is_complete:
+                skill.step({"joint_state": joint_state_source.get()})
+                sleep_fn(1.0 / hz)
+        finally:
+            skill.stop()
+
     print(
         "[return] opening Dex1 only; no arm motion was commanded"
         if open_only else "[return] returning to policy frame zero, opening Dex1, then lowering",
@@ -327,7 +341,7 @@ def _return_arms_and_open_hand(
             published_target_provider=lambda: arm_actuator.read_last_published_targets()[0],
             **(lowering_settings or {}),
         )
-        restore.start({})
+        _start_return_motion(restore)
         restore_started = time_fn()
         while not restore.is_complete:
             if time_fn() - restore_started > timeout_s:
@@ -382,7 +396,7 @@ def _return_arms_and_open_hand(
                 measured_convergence_checker=measured_convergence_checker,
                 **(lowering_settings or {}),
             )
-            skill.start({})
+            _start_return_motion(skill)
             while not skill.is_complete:
                 if time_fn() - started > timeout_s:
                     raise TimeoutError("reverse startup route did not converge")
@@ -405,7 +419,7 @@ def _return_arms_and_open_hand(
         measured_convergence_checker=measured_convergence_checker,
         **(lowering_settings or {}),
     )
-    skill.start({})
+    _start_return_motion(skill)
     started = time_fn()
     while not skill.is_complete:
         if time_fn() - started > timeout_s:
@@ -556,6 +570,7 @@ def _return_before_release(
     open_only: bool = False,
     policy_initial_arm: Optional["np.ndarray"] = None,
     retreat_waypoints: Sequence["np.ndarray"] = (),
+    boundary_preparation_args: Optional[dict] = None,
 ) -> None:
     """解放の直前に必ず通る後始末 (Issue #152)。何があっても例外を出さない。
 
@@ -585,6 +600,7 @@ def _return_before_release(
             open_only=open_only,
             policy_initial_arm=policy_initial_arm,
             retreat_waypoints=retreat_waypoints,
+            boundary_preparation_args=boundary_preparation_args,
         )
     except KeyboardInterrupt:
         print("[return] interrupted; releasing from the current pose", file=sys.stderr)
@@ -2139,15 +2155,28 @@ def make_boundary_sender(
             measured_waist3=body_q29[12:15],
             fallback_hand2=fallback_hand2,
         )
-        sink.send_action(
+        return bool(sink.send_action(
             action19,
             body_q29,
             navigate_cmd=walk_actuator.latest,
             state_stale=state_stale,
-        )
-        return True
+        ))
 
     return _send
+
+
+def _cancel_boundary_preparations(registry):
+    from inference.desktop.lower_policy.skills.boundary_preparation import cancel_boundary_preparations
+
+    cancel_boundary_preparations(registry)
+
+
+def _cancel_operator_confirmations(registry):
+    from inference.desktop.lower_policy.skills.operator_gate import OperatorConfirmationHoldSkill
+
+    for skill in registry.values():
+        if isinstance(skill, OperatorConfirmationHoldSkill):
+            skill.stop()
 
 
 def validate_boundary_publish_args(args: argparse.Namespace) -> None:
@@ -3161,16 +3190,20 @@ def main() -> None:
                 arrival = _gate_arrival_check(
                     _effective_initial_pose(policy).arm_position_rad,
                     _boundary_convergence_checker(policy),
-                    float(arm_settings.get("measured_tolerance_rad", 0.10)),
+                    float(
+                        skill_cfg_raw["boundary_preparation"]["arrival_error_rad"]
+                        if args.action_sink == "boundary" and args.boundary_lane == "joint"
+                        else arm_settings.get("measured_tolerance_rad", 0.10)
+                    ),
                 )
                 skill_registry[gate] = OperatorConfirmationHoldSkill(
                     name=gate,
                     next_skill_name=policy,
-                    input_fn=(
+                    cancellable_input_fn=(
                         # prompt = 到達したか・一番ずれた関節 (実測から gate が作る)
-                        lambda prompt, name=policy: operator_console.wait_for(
+                        lambda prompt, cancel, name=policy: operator_console.wait_for(
                             "enter", stage=operator_console.stage,
-                            phase=f"{name}／開始待ち", detail=prompt,
+                            phase=f"{name}／開始待ち", detail=prompt, cancel_event=cancel,
                         )
                     ),
                     arrival_check=arrival,
@@ -3194,10 +3227,10 @@ def main() -> None:
                 skill_registry[wait_name] = OperatorConfirmationHoldSkill(
                     name=wait_name,
                     next_skill_name=arm_name,
-                    input_fn=(
-                        lambda _prompt, name=policy: operator_console.wait_for(
+                    cancellable_input_fn=(
+                        lambda _prompt, cancel, name=policy: operator_console.wait_for(
                             "r", stage=operator_console.stage,
-                            phase=f"{name}／腕保持・ハンド全開"
+                            phase=f"{name}／腕保持・ハンド全開", cancel_event=cancel,
                         )
                     ),
                     hold_arm_target_provider=_last_published_arm,
@@ -3230,10 +3263,10 @@ def main() -> None:
                     skill_registry[first_enter] = OperatorConfirmationHoldSkill(
                         name=first_enter,
                         next_skill_name=hand_name,
-                        input_fn=(
-                            lambda _prompt, name=policy: operator_console.wait_for(
+                        cancellable_input_fn=(
+                            lambda _prompt, cancel, name=policy: operator_console.wait_for(
                                 "enter", stage=operator_console.stage,
-                                phase=f"{name}／脚配置・ハンド初期幅待ち"
+                                phase=f"{name}／脚配置・ハンド初期幅待ち", cancel_event=cancel,
                             )
                         ),
                         hold_arm_target_provider=_last_published_arm,
@@ -3375,6 +3408,7 @@ def main() -> None:
     joint_state_source: Optional[object] = None
     dex1_state_source: Optional[object] = None
     _boundary_sink: Optional[object] = None
+    boundary_preparation_args: Optional[dict] = None
     arm_actuator_started = False
     # finally が読むので try の外で初期化する (センサや記録の構築で落ちても
     # _safe_shutdown まで到達させる)。
@@ -3548,6 +3582,29 @@ def main() -> None:
                     arm_actuator.read_last_published_targets()[0]
                 )
             )
+            if args.boundary_lane == "joint":
+                from inference.desktop.lower_policy.skills.boundary_preparation import (
+                    PreparationSettings,
+                )
+                from inference.desktop.lower_policy.skills.operator_gate import OperatorConfirmationHoldSkill
+
+                preparation_settings = PreparationSettings.from_config(skill_cfg_raw)
+                boundary_preparation_args = dict(
+                    sink=_boundary_sink, settings=preparation_settings,
+                    record_hold=arm_actuator.record_preparation_hold,
+                    state_getter=sensors.joint.get, console=operator_console,
+                    stop_navigation=lambda: actuator.set_velocity(0.0, 0.0, 0.0),
+                )
+                for prepared_skill in skill_registry.values():
+                    if isinstance(prepared_skill, OperatorConfirmationHoldSkill):
+                        prepared_skill.require_fresh_state(
+                            sensors.joint.get,
+                            max_age_s=preparation_settings.state_max_age_s,
+                            max_speed_rad_s=preparation_settings.arrival_speed_rad_s,
+                        )
+                    configure = getattr(prepared_skill, "configure_boundary_preparation", None)
+                    if callable(configure):
+                        configure(**boundary_preparation_args)
         source = sensors.head
         wrist_left_source = sensors.wrist_left
         wrist_right_source = sensors.wrist_right
@@ -3680,7 +3737,10 @@ def main() -> None:
                 f"({', '.join(policies)})",
                 file=sys.stderr,
             )
-            manager = ModelResidency(sequence, policies, resident=resident)
+            manager = ModelResidency(
+                sequence, policies, resident=resident,
+                preparation_loads_only_at_hold=args.action_sink == "boundary",
+            )
 
             # model の境界で起きる順序:
             #   前の model を保持したまま次の frame-zero へ腕・手を寄せる
@@ -4204,11 +4264,15 @@ def main() -> None:
         # 必ず通す (Codex #7)。以前は model 解放 (`queue.join()` は無期限) と録画の
         # 終了が解放の前にあり、そこで止まる・例外が出ると解放に届かなかった。
         try:
+            # Cancel the in-flight goto before any ordinary hold/return chunk.
+            # Its final destination is not the pose to hold after interruption.
             shutdown_hand_actuator = (
                 _shared_mock_hand_instance
                 if args.action_sink == "boundary"
                 else _real_hand_instance
             )
+            _cancel_operator_confirmations(skill_registry)
+            _cancel_boundary_preparations(skill_registry)
             if phase3_active and args.actuate and arm_actuator_started:
                 # 腕を下ろす前に歩行を止める。boundary では毎 row が
                 # `navigate_cmd=actuator.latest` を運ぶので、歩行中に落ちると
@@ -4296,6 +4360,7 @@ def main() -> None:
                             ),
                             open_only=not arm_motion_published,
                             retreat_waypoints=retreat,
+                            boundary_preparation_args=boundary_preparation_args,
                         )
                 else:
                     print(

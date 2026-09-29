@@ -9,8 +9,7 @@
 # started with --actions-host <THOR_IP> (the adapter's own option for where :5556 is bound).
 #
 # The image is a private GHCR package: the organizer account needs read access.
-# The previous rebuild5 GB10 checks are recorded in GB10_REBUILD5_REPORT.md.
-# This insert-Diffusion image has passed the arm64 CI build, but not a new GB10/Thor/G1 test.
+# Current GB10 checks are recorded in GB10_PREPARATION_REPORT.md. Physical tracking is not verified.
 # Client/transport loss is NOT certified as a safe stop: see Issue #14 and INSTRUCTIONS.md.
 # The adapter mode is decoupled; on it our arms go by default on the joint
 # lane ((T,22) joint targets on :5556, interface package 609f61d+), and --boundary-lane pose
@@ -22,8 +21,8 @@ platform: linux/arm64
 
 images:
   thor:
-    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:20260927-insert-dp100k-01"
-    digest: "sha256:c98c80c70dccafd418910fe84a2e1ab1685b46d6106a5c77b2a54ce30ff77923"
+    repo_tag: "ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-preparation-10b8d73"
+    digest: "sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
     run: >-
@@ -50,11 +49,11 @@ organizer_stack_on_pc2:
 
 runtime:
   network: >-
-    none at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
+    no external Internet required at run time: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, YOLO_OFFLINE=true (no ultralytics
     online check or analytics), the VLM runs with usage stats off and every outbound endpoint
-    pointed at a closed local port; weights are read from the mounted cache. Rebuild5 GB10 strace
-    found no connect() outside loopback/Unix during continuous Stages 0-5, 11 model variants and a 600s soak
-  # Mounted read-only as a Hugging Face cache (~78 GB estimate). Prefetch and offline check:
+    pointed at a closed local port; weights are read from the mounted cache. PC2 camera/state/action
+    traffic remains necessary. Current connect() audit results are in GB10_PREPARATION_REPORT.md
+  # Mounted read-only as a Hugging Face cache (~80 GB). Prefetch and offline check:
   # tools/prefetch_weights.py (list derived from policy_config.yaml: defaults + variant_sets);
   # details in WEIGHTS.md.
   weights:
@@ -70,9 +69,9 @@ runtime:
     - "Qwen/Qwen3-VL-8B-Instruct@main"
     # Candidate only (variant set all6_400k, selected with --policy-variant-set); not a default.
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546 (ckpt_step_400000.pt)"
-  # Planning estimate, NOT a Thor measurement/upper bound. Rebuild5 on 128-GB GB10,
-  # continuous Stages 0-5 with the previous insert GR00T: 49.46 GiB GPU-process peak and
-  # 31.99 GiB minimum MemAvailable. Rounded reserve below; re-measure with insert DP on Thor.
+  # Planning estimate, NOT a Thor measurement/upper bound. Source 10b8d73 on GB10,
+  # continuous Stages 0-5 with all experts resident: 44.36 GiB GPU-process peak and
+  # 39.78 GiB minimum MemAvailable. Rounded reserve below is not a guarantee.
   peak_memory_thor_gb: 55
 
 conformance: >-

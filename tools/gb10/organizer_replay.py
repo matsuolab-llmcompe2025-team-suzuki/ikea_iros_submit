@@ -50,11 +50,12 @@ def main():
         raise ValueError("Unexpected organizer revision")
     sys.path.insert(0, str(args.organizer / "reference/wbc_adapter/tests"))
     import test_joint_lane as official
-    from wire_probe import decode_joint
+    from wire_probe import decode_joint, decode_goto
 
     dex1 = official.FakeDex1()
     ctx = official.make_ctx(dex1=dex1)
     count = 0
+    goto_count = 0
 
     def legacy_packets():
         with np.load(args.rows_capture, allow_pickle=False) as data:
@@ -71,6 +72,30 @@ def main():
 
     packets = read_packets(args.capture) if args.capture else legacy_packets()
     for packet in packets:
+        if packet.startswith(b"goto"):
+            target, speed, stamp = decode_goto(packet)
+            official.boundary_wire.decode_goto(packet)
+            ctx.backend.goals.clear()
+            dex1.sent.clear()
+            official.wbc_driver._handle_goto(
+                ctx, official.goto_msg(target[:7], target[7:], max_speed=speed, issued_at=time.time())
+            )
+            if len(ctx.backend.goals) != 1 or dex1.sent:
+                raise AssertionError("Goto was not accepted once with hands preserved")
+            goal = ctx.backend.goals[0]
+            upper = np.asarray(goal["target_upper_body_pose"])
+            actual = np.c_[upper[:, :7], upper[:, 14:21]]
+            np.testing.assert_allclose(actual[-1], target, atol=1e-6, rtol=0)
+            if len(actual) > 1 and np.max(np.abs(np.diff(actual, axis=0))) > speed / ctx.args.chunk_hz + 1e-6:
+                raise AssertionError("Goto velocity exceeded requested bound")
+            np.testing.assert_allclose(goal["navigate_cmd"], 0.0, atol=1e-6)
+            if len(actual) / ctx.args.chunk_hz > 15:
+                raise AssertionError("Goto duration exceeded organizer limit")
+            # Offline fake arrival, not a claim about the captured robot's motion.
+            ctx.backend.q[15:22] = target[:7]
+            ctx.backend.q[29:36] = target[7:]
+            goto_count += 1
+            continue
         rows, stamp = decode_joint(packet)
         if stamp <= 0:
             raise ValueError("Invalid original timestamp")
@@ -95,9 +120,9 @@ def main():
         )
         np.testing.assert_allclose(np.diff(goal["target_time"]), 1 / ctx.args.chunk_hz, atol=1e-8)
         count += 1
-    if not count:
+    if not count and not goto_count:
         raise ValueError("Empty capture")
-    result = {"passed": True, "messages": count, "organizer_revision": revision,
+    result = {"passed": True, "messages": count, "goto_messages": goto_count, "organizer_revision": revision,
               "physical_commands_sent": False, "physics_validated": False,
               "tracking_error_modelled": False, "timestamp_refreshed_for_offline_replay": True,
               "original_wire_envelope": args.capture is not None,

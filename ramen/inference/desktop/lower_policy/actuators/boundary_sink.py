@@ -404,6 +404,18 @@ class BoundaryArmActuator:
         """Whether an arm target distinct from the initial hold was published."""
         return self._has_motion_target
 
+    def record_preparation_hold(self, intent: Sequence[float]) -> None:
+        """Record an externally published, reached (or interrupted) goto hold.
+
+        An in-flight goto destination must never become the ordinary hold target.
+        The value here is uncompensated intent, not the wire joint angles.
+        """
+        target = np.asarray(intent, dtype=np.float64)
+        if target.shape != (14,) or not np.isfinite(target).all():
+            raise ValueError("preparation hold must be finite arms[14]")
+        self._last = target.copy()
+        self._has_motion_target = True
+
     def read_arm_positions(self) -> np.ndarray:
         if self._state_getter is None:
             raise RuntimeError("boundary state source is not configured")
@@ -637,7 +649,7 @@ class BoundaryActionSink:
         self._last_row: Optional[np.ndarray] = None
         self._last_publish_at: Optional[float] = None
         self._gravity_offset = gravity_offset
-        self._gravity_offset_error_logged = False
+        self._preparation_owner = None
         # EE の計算に使っている腰角 (EE_WAIST_REFRESH_RAD 以上動いたときだけ更新)。
         self._ee_waist: Optional[np.ndarray] = None
         # 運営 IK の可動域へ寄せた回数 (clamp_arms_to_organizer_ik)。
@@ -683,6 +695,92 @@ class BoundaryActionSink:
     def sent_count(self) -> int:
         return self._sent
 
+    def acquire_preparation(self, owner: object) -> None:
+        if self._lane != "joint":
+            raise RuntimeError("official joint goto requires the joint lane")
+        if self._preparation_owner not in (None, owner):
+            raise RuntimeError("another preparation owns the boundary publisher")
+        self._preparation_owner = owner
+
+    def release_preparation(self, owner: object) -> None:
+        if self._preparation_owner is owner:
+            self._preparation_owner = None
+            self._last_row = None
+            self._last_publish_at = None
+
+    def preparation_event(self, event: str, **fields) -> None:
+        if self._log_fn is not None:
+            self._log_fn({"event": event, "monotonic_ns": time.monotonic_ns(), **fields})
+
+    def send_preparation_goto(
+        self, owner: object, intent: Sequence[float], measured: Sequence[float],
+        *, max_speed: float, max_duration: float, adapter_hz: float,
+    ) -> dict:
+        """Publish one official goto segment; publication is not an adapter ACK.
+
+        Split both intent and corrected wire along the same starting line. Leave
+        one adapter tick of margin for ceil/float rounding of the 15 s limit.
+        Hands are omitted so the organizer preserves its last hand command.
+        """
+        if self._preparation_owner is not owner:
+            raise RuntimeError("preparation publisher is not owned")
+        target = np.asarray(intent, dtype=np.float64)
+        start = np.asarray(measured, dtype=np.float64)
+        if any(a.shape != (14,) or not np.isfinite(a).all() for a in (target, start)):
+            raise ValueError("goto requires finite intent and measured arms[14]")
+        if not (0 < max_speed <= 0.3 and 0 < max_duration <= 15 and adapter_hz > 0):
+            raise ValueError("goto exceeds the preparation/organizer contract")
+        wire = target.copy()
+        if self._gravity_offset is not None:
+            wire, _ = self._gravity_offset.apply(target)
+        distance = float(np.max(np.abs(wire - start)))
+        span = max_speed * (max_duration - 1 / adapter_hz)
+        if span <= 0:
+            raise ValueError("goto duration must exceed one adapter tick")
+        fraction = min(1.0, span / distance) if distance else 1.0
+        segment_intent = start + fraction * (target - start)
+        segment_wire = start + fraction * (wire - start)
+        duration = max(1, int(np.ceil(distance * fraction / max_speed * adapter_hz))) / adapter_hz
+        offset = None if self._sender_clock_offset_fn is None else self._sender_clock_offset_fn()
+        issued_at = None if offset is None else time.time() + float(offset)
+        self._sink.send_goto(
+            segment_wire[:7], segment_wire[7:], max_speed=max_speed,
+            hands=None, issued_at=issued_at,
+        )
+        self._sent += 1
+        record = {
+            "seq": self._sent, "intent": segment_intent.tolist(),
+            "requested_intent": target.tolist(), "wire": segment_wire.tolist(),
+            "measured_start": start.tolist(), "planned_duration_s": duration,
+            "max_speed_rad_s": max_speed, "final_segment": fraction == 1.0,
+            "issued_at": issued_at, "acceptance": "unacknowledged",
+        }
+        self.preparation_event("preparation_goto_sent", **record)
+        return record
+
+    def interrupt_preparation(self, owner: object, measured_body: Sequence[float]) -> None:
+        """Replace an active trajectory by a measured-position hold, never its endpoint."""
+        if self._preparation_owner is not owner:
+            return
+        body = np.asarray(measured_body, dtype=np.float64)
+        if body.shape != (29,) or not np.isfinite(body).all():
+            raise ValueError("cannot interrupt goto without a measured body pose")
+        # A one-row zero-displacement goto cancels the queued trajectory and,
+        # unlike an ordinary chunk, preserves the last hand command verbatim.
+        # This emergency hold deliberately uses RAW measured angles. It is not
+        # a silent gravity-model fallback and is never recorded as a reached pose.
+        offset = None if self._sender_clock_offset_fn is None else self._sender_clock_offset_fn()
+        self._sink.send_goto(
+            body[15:22], body[22:29], max_speed=0.3, hands=None,
+            issued_at=None if offset is None else time.time() + float(offset),
+        )
+        self._sent += 1
+        self.preparation_event(
+            "preparation_interrupted", seq=self._sent,
+            hold_raw_measured=body[15:29].tolist(), gravity_compensated=False,
+            acceptance="unacknowledged",
+        )
+
     def send_action(
         self,
         action19: Sequence[float],
@@ -706,6 +804,8 @@ class BoundaryActionSink:
             この呼び出しで publish したか。
         """
 
+        if self._preparation_owner is not None:
+            return False
         navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
         if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
             raise ValueError("navigate_cmd must be finite 3-D")
@@ -837,21 +937,9 @@ class BoundaryActionSink:
         arms = slice(7 + 15, 7 + 29)  # root7 + body29 の腕 14-D
         intent = action38[arms].copy()
         offset = np.zeros(14, dtype=np.float64)
-        offset_error: Optional[str] = None
         if self._gravity_offset is not None:
-            try:
-                command, offset = self._gravity_offset.apply(intent)
-                action38[arms] = command
-            except Exception as exc:  # noqa: BLE001 - 補正が出せなくても従来の値で送る
-                offset = np.zeros(14, dtype=np.float64)
-                offset_error = f"{type(exc).__name__}: {exc}"
-                if not self._gravity_offset_error_logged:
-                    self._gravity_offset_error_logged = True
-                    print(
-                        f"[boundary] gravity sag offset failed ({offset_error}); "
-                        "publishing the policy's joint angles without it",
-                        file=sys.stderr,
-                    )
+            command, offset = self._gravity_offset.apply(intent)
+            action38[arms] = command
         row = action38_to_joint_row(action38, navigate_cmd=navigation)
         record = {
             "event": "boundary_joint",
@@ -868,8 +956,6 @@ class BoundaryActionSink:
                 "gravity_offset_rad": offset.tolist(),
                 "gravity_offset_scale": self._gravity_offset.scale,
             })
-            if offset_error is not None:
-                record["gravity_offset_error"] = offset_error
         return row[None, :], record
 
     def _stabilize_waist(self, action19: Sequence[float]) -> np.ndarray:
