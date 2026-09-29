@@ -28,7 +28,7 @@ class GuardedStateStream:
     def decode_reply(self, nonce, reply, started_ns, received_ns):
         import math
         import msgpack
-        from inference.desktop.perception.boundary_state_source import gripper_aware_stream_class
+        from inference.desktop.perception.boundary_state_source import decode_gripper_aware
         if len(reply) != 2 or reply[0] != nonce:
             raise ValueError("state guard reply nonce mismatch")
         if not reply[1].startswith(STATE_TOPIC):
@@ -57,7 +57,7 @@ class GuardedStateStream:
             raise ValueError("state guard restarted; restart the Thor run after operator confirmation")
         if sequence <= self.sequence or (self.last_sample_ns is not None and sample_ns <= self.last_sample_ns):
             return None
-        state = gripper_aware_stream_class()._decode(None, reply[1])
+        state = decode_gripper_aware(reply[1])
         if state.gripper_q is None:
             raise ValueError("internal-hand measured state missing; synthetic fallback forbidden")
         # Conservative local-time lower bound; no PC2/Thor wall-clock sync needed.

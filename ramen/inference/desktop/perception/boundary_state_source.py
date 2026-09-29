@@ -61,26 +61,33 @@ def parse_gripper_q(message: Any) -> Optional[np.ndarray]:
     return np.asarray(values, dtype=np.float64)
 
 
+def decode_gripper_aware(blob: bytes):
+    """公式 ``StateStream._decode`` (契約 key の形・有限性の検証) の後に ``gripper_q`` も拾う。"""
+    from inference.desktop.boundary.states import STATE_TOPIC, StateStream
+
+    state = StateStream._decode(blob)  # 公式の検証 (staticmethod)
+    try:
+        import msgpack
+
+        prefix = STATE_TOPIC.encode("utf-8")
+        message = msgpack.unpackb(blob[len(prefix):], raw=False)
+    except Exception:  # noqa: BLE001 - 追加 key は best effort
+        message = None
+    state.gripper_q = parse_gripper_q(message)
+    return state
+
+
 def gripper_aware_stream_class():
     """公式 ``StateStream`` の decode を通したうえで ``gripper_q`` も拾う class。
 
     vendor の ``boundary/states.py`` は無改変。``read`` が呼ぶ ``_decode`` だけを
     subclass で包み、公式の検証 (契約 key の形・有限性) を先に通す。
     """
-    from inference.desktop.boundary.states import STATE_TOPIC, StateStream
+    from inference.desktop.boundary.states import StateStream
 
     class _GripperAwareStateStream(StateStream):
         def _decode(self, blob: bytes):  # type: ignore[override]
-            state = StateStream._decode(blob)  # 公式の検証 (契約 key)
-            try:
-                import msgpack
-
-                prefix = STATE_TOPIC.encode("utf-8")
-                message = msgpack.unpackb(blob[len(prefix):], raw=False)
-            except Exception:  # noqa: BLE001 - 追加 key は best effort
-                message = None
-            state.gripper_q = parse_gripper_q(message)
-            return state
+            return decode_gripper_aware(blob)
 
     return _GripperAwareStateStream
 

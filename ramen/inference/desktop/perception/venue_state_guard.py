@@ -187,20 +187,44 @@ def serve(guard, profile, bind_address, *, stop_event=None, ready=None):
 
     context = zmq.Context()
     upstream = context.socket(zmq.SUB)
-    server = context.socket(zmq.REP)
+    endpoint = f"tcp://{bind_address}:{profile['guard_port']}"
+
+    def bind_server():
+        socket = context.socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDTIMEO, 200)
+        for attempt in range(20):  # the closed socket may hold the port for a moment
+            try:
+                socket.bind(endpoint)
+                return socket
+            except zmq.ZMQError:
+                if attempt == 19:
+                    socket.close(linger=0)
+                    raise
+                time.sleep(0.05)
+
+    server = None
     try:
         upstream.setsockopt(zmq.SUBSCRIBE, STATE_TOPIC)
         upstream.setsockopt(zmq.CONFLATE, 1)
         upstream.setsockopt(zmq.LINGER, 0)
         upstream.connect(profile["upstream_endpoint"])
-        server.setsockopt(zmq.LINGER, 0)
-        server.setsockopt(zmq.SNDTIMEO, 200)
-        server.bind(f"tcp://{bind_address}:{profile['guard_port']}")
+        server = bind_server()
         if ready is not None:
             ready.set()
         poller = zmq.Poller()
         poller.register(upstream, zmq.POLLIN)
         poller.register(server, zmq.POLLIN)
+
+        def rebuild_server(exc):
+            # A REP socket whose request/reply cycle failed cannot be reused.
+            # Rebuild it so one failed reply does not end the guard.
+            nonlocal server
+            print(f"[state-guard] request socket failed ({exc}); rebuilding {endpoint}", flush=True)
+            poller.unregister(server)
+            server.close(linger=0)
+            server = bind_server()
+            poller.register(server, zmq.POLLIN)
         payload, received = None, 0.0
         last_error = None
         print("[state-guard] read-only: DDS subscriber + state relay; NO actuator/publisher", flush=True)
@@ -216,7 +240,11 @@ def serve(guard, profile, bind_address, *, stop_event=None, ready=None):
                     payload = None
             if server not in events:
                 continue
-            request = server.recv_multipart()
+            try:
+                request = server.recv_multipart()
+            except zmq.ZMQError as exc:
+                rebuild_server(exc)
+                continue
             nonce = request[0] if request else b""
             try:
                 if len(request) != 1 or len(nonce) != 32:
@@ -232,10 +260,14 @@ def serve(guard, profile, bind_address, *, stop_event=None, ready=None):
                 if error != last_error:
                     print(f"[state-guard] withholding state: {error}", flush=True)
                     last_error = error
-            server.send_multipart([nonce, response])
+            try:
+                server.send_multipart([nonce, response])
+            except zmq.ZMQError as exc:
+                rebuild_server(exc)
     finally:
         upstream.close(linger=0)
-        server.close(linger=0)
+        if server is not None:
+            server.close(linger=0)
         context.term()
 
 
