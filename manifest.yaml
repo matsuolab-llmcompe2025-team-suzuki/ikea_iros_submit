@@ -44,6 +44,7 @@ sockets:
   "5557": "state (body_q, base_quat, gripper_q) — subscribed by the Thor container directly from PC2"
   "5556": "actions — BOUND by the Thor container on all interfaces; the adapter dials in with --actions-host <THOR_IP>"
   "8000": "VLM server inside the Thor container, bound to 127.0.0.1 only (Stage 1-4)"
+  "5558": "OPTIONAL, not used by default: read-only RAMEN state guard on PC2 (pc2_read_only_guard below)"
 
 # On the event PC2 (G1 (3)) every organizer process runs after `source ~/iros_g1_3/iros_env.sh`
 # (cameras: iros_env_teleimager.sh). That env carries this robot's Dex1 calibration
@@ -90,3 +91,16 @@ runtime:
 conformance: >-
   docker run --rm --network host <image>
   pixi run --as-is -e runtime python /app/conformance.py --lane decoupled
+
+# OPTIONAL and off by default (INSTRUCTIONS.md section 7). A read-only process on PC2 that
+# confirms each :5557 payload with a fresh rt/lowstate tick and serves it on :5558; the Thor
+# uses it only when the run adds --boundary-state-guard --boundary-state-port 5558. Requires an
+# image built with it (not gb10-preparation-10b8d73) and the organizer's approval on PC2.
+# Without it the Thor reads :5557 directly, as declared above.
+pc2_read_only_guard:
+  enabled_by_default: false
+  bundle: "python3 tools/package_pc2_guard.py /tmp/ramen-pc2-guard.tar.gz"
+  preflight: "python venue_state_guard.py --check-only"
+  run: "python venue_state_guard.py --bind-address <PC2_IP>"
+  thor_option: "--boundary-state-guard --boundary-state-port 5558"
+  commands_to_robot: false

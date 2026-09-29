@@ -19,6 +19,7 @@ commit と同じなのかも分からなくなる）。
 | 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
 | 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
 | 焼き直さずに会場で変える値（Dex1 の到達の許容・Stage 0 の前進時間） | `venue/skill_config_venue.yaml`（image の skill_config から作る。`tests/test_venue_skill_config.py` が差を固定。焼き直したら作り直す） |
+| 任意の PC2 読み取り専用 state guard（既定では使わない） | PC2 用 bundle は `tools/package_pc2_guard.py`（`ramen/` の guard から作る）。手順は `INSTRUCTIONS.md` §7、焼き直したときの確認は `VERIFY.md` §9 |
 | 接続テスト（09-27）の記録と、切り替えの option の説明 | `CONNECTION_TEST.md`（履歴。本番は `INSTRUCTIONS.md` の起動だけで、option は足さない） |
 | conformance の受け口 | `components/` |
 
@@ -34,6 +35,8 @@ flowchart LR
 ```
 
 - コピー元の commit は `ramen/RAMEN_SOURCE.txt` に残る。コピーしたら差分を読んでから commit する。
+  `tests/test_manifest.py` は、この commit と manifest の image の tag が合うまで通らない（写し直したら焼き直す）。
+- 未 commit の変更は `tools/sync_ramen.sh --worktree` で手元の試験にだけ写せる。この写しは Dockerfile と CI が build を拒む。
 - image を焼き直したら、会場の前に `VERIFY.md` の手順（Vast.ai の GB10 で image を起動し、ネット無しで全 stage が
   立ち上がるか・外に接続しないか）で確かめる。
 

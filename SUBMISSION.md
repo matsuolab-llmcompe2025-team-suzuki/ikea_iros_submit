@@ -39,6 +39,10 @@ ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835f
    and the WBC is `~/wbc_adapter/deploy/run_wbc_with_dex1.py` (per-robot Dex1 calibration).
    [CONNECTION_TEST.md](CONNECTION_TEST.md) is the 09-27 connection-test record.
 
+An optional read-only PC2 state guard (`:5558`, RAMEN issue #184) is declared in the manifest as
+`pc2_read_only_guard` and is off by default; the submitted image does not contain it, and using it
+requires a rebuilt image and the organizer's approval (INSTRUCTIONS.md section 7).
+
 The default action contract is the joint lane `(T,22)`; the organizer adapter is launched
 with `--lane decoupled`. Do not switch to the pose lane: on 2026-09-29 the organizer IK on this
 robot accepted 0% of 602 waypoints for another team, while the joint lane rejected none. Ports and launch commands are declared in [manifest.yaml](manifest.yaml).

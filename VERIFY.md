@@ -321,3 +321,18 @@ Stage結果をmerge判定へ使うときは`--require-trace`を指定し、trace
 運営テスト依存とWBCの固定commit・LFS資産が必要（版は検証レポート参照）。
 実測姿勢をpacket先頭targetに設定し時刻だけ更新するため、実機追従誤差や実ホスト間の時計精度は検証しない。
 旧記録用`--rows-capture <wire.npz>`ではenvelopeを再構成するので、元wireそのものの試験とは区別する。
+
+## 9. 任意の PC2 state guard を含む image を焼き直したとき
+
+本体 [#184](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/issues/184) の guard は任意の経路で、
+既定の経路（Thor が `:5557` を直接読む）は変えない。`gb10-preparation-10b8d73` には入っていない。焼き直したら、上の手順に加えて:
+
+1. `ramen/` は push 済みの commit から通常の `tools/sync_ramen.sh <commit>` で写す（`--worktree` の写しは Dockerfile・CI が拒む）。
+   `tests/test_manifest.py` は `ramen/RAMEN_SOURCE.txt` の commit と manifest の tag が合うまで通らない。
+2. **既定の経路**（option 無し）で、これまでと同じ Stage の確認を通す（guard の追加で既定の経路が変わっていないこと）。
+3. **guard の経路**: 模擬の camera/state に加えて、同じ loopback に guard（`venue_state_guard.serve` と模擬 DDS）を立て、
+   `--boundary-state-guard --boundary-state-port 5558` で Stage を通す。DDS の停止・bridge だけの停止・tick の逆行・guard の再起動・
+   往復の遅れで、古い state で準備が進まず、安全停止に入ることを確かめる。実機への故障注入はしない。
+4. PC2 用 bundle（`tools/package_pc2_guard.py`）を同じ commit から作り、bundle の SHA256・image の digest・本体 commit・結果を記録する。
+5. 実機の DDS の負荷・タイミングは GB10 では確かめられない。運営の許可を得て、会場で `--check-only` と短い試運転から使う。
+

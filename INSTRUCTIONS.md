@@ -348,3 +348,45 @@ python conformance.py --lane decoupled
 ## 6. 接続テスト（09-27）の記録
 
 `CONNECTION_TEST.md`（09-27 の接続テストの計画と、その後に会場で分かったこと。本番の手順はこの文書）。
+
+## 7. 任意: PC2 の読み取り専用 state guard（今の image では使えない）
+
+運営 bridge（`~/real_orin_state.py`）は最後に受けた `rt/lowstate` を 50 Hz で配り直し、DDS の時刻・tick を載せない。
+ロボットが止まっているのか、DDS が止まって bridge が古い値を配り直しているのかを、Thor 側では区別できない。
+guard はこれを補う**任意の**経路（本体 [#184](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/issues/184)）。
+**既定の経路（Thor が `:5557` を直接読む）は変えない。**
+
+使える条件（全部そろうまで使わない）:
+
+- guard の code を含む image を焼き直し、GB10 で既定経路と guard 経路の両方を確かめ、`manifest.yaml` の tag・digest を
+  差し替えた後（`VERIFY.md` §9）。今の image（`gb10-preparation-10b8d73`）には無く、option を付けると引数の誤りで起動しない。
+- PC2 に私たちのプロセスを 1 つ足し、`:5558` を開けることを運営の PC2 担当が許可したとき。
+
+PC2 に置く物（手元の submit repo の直下で作り、`scp` で PC2 の `~/ramen-state-guard/` に展開する。運営の file は上書きしない）:
+
+```bash
+python3 tools/package_pc2_guard.py /tmp/ramen-pc2-guard.tar.gz   # guard・G1 (3) の profile・SHA256SUMS・RAMEN_SOURCE.txt
+```
+
+PC2 の新しい tmux window で（Step 0〜1 の状態 bridge を起動した後）:
+
+```bash
+source ~/iros_g1_3/iros_env.sh
+cd ~/ramen-state-guard
+sha256sum -c SHA256SUMS
+grep '^commit:' RAMEN_SOURCE.txt       # Thor の image の本体 commit と同じであること
+python venue_state_guard.py --check-only   # 運営の 6 file の hash と環境変数だけを確かめる（DDS・socket は開かない）
+python venue_state_guard.py --bind-address <PC2_IP>
+```
+
+- `--bind-address` は PC2 のロボット側の IP（`192.168.123.164`）。既定の `127.0.0.1` のままでは Thor から読めない。
+- 確かめる行: `[state-guard] profile=G1(3) internal, …; organizer files/environment verified` と
+  `[state-guard] read-only: DDS subscriber + state relay; NO actuator/publisher`。
+- Thor では Step 4 の `docker run` の最後に `--boundary-state-guard --boundary-state-port 5558` を足す。
+- guard は DDS の tick が進んでいる間だけ state を返す（止まっている姿勢でも tick が進めば正常）。bridge の値は、guard 自身が
+  0.25 s 以内に受けた DDS の値と照合する（ぴったり一致、無ければ全値 0.01 以内）。guard が返さない間、Thor は古い state で
+  到達判定を進めず、state が古くなると鮮度の検査で安全停止する。手の実測が無いときも指令のエコーには戻らない。
+- `[state-guard] …` が続いて run が始まらないとき: 表示された理由を確かめる（`waiting for advancing DDS ticks` = DDS が来ない、
+  `upstream :5557 missing or stale` = 状態 bridge が止まった、`DDS tick regressed` = ロボットの再起動。guard の再起動が要る）。
+  guard を使えないときは、**Thor の run を option 無しで起動し直せば既定の `:5557` の経路に戻る**（run の途中で切り替えない）。
+- guard を起動し直したら、Thor の run も起動し直す（`state guard restarted` で止まる。自動で再開しない）。
