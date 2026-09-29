@@ -118,6 +118,29 @@ def test_a_variant_outside_the_sets_is_added_only_on_request() -> None:
         raise AssertionError("unknown --variant must be rejected")
 
 
+FLIP_FT_SLOTS = {
+    # 本体 #183 の flip の追加学習 2 本 (既定・variant_sets には入らない。実機の評価で採用を決める)
+    "flip_table_ramen_ori_flip_ft_fk_20k": (
+        "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk",
+        "ebc1410996e1cd666ef8a7df079691c80a37c49c",
+    ),
+    "flip_table_ramen_ori_flip_ft_fk_progress_20k": (
+        "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk_progress",
+        "6c4f30c683528f6b3954dabae3df5834ddc94e76",
+    ),
+}
+
+
+def test_the_flip_ft_slots_are_fetched_only_on_request() -> None:
+    """会場で `--policy-variant-flip` で選ぶ 2 本。USB・GB10 の prefetch に `--variant` で足す (Issue #22)。"""
+    module = _module()
+    assert not any(slot in item.label for item in module.build_items() for slot in FLIP_FT_SLOTS)
+    items = module.build_items(list(FLIP_FT_SLOTS))
+    for slot, (repo_id, revision) in FLIP_FT_SLOTS.items():
+        (item,) = [item for item in items if slot in item.label]
+        assert (item.repo_id, item.revision, item.scope) == (repo_id, revision, "ckpt_step_020000.pt")
+
+
 def test_the_groot_base_default_matches_the_policy() -> None:
     source = (RAMEN / "inference/desktop/lower_policy/policies/groot.py").read_text()
     assert _module().GROOT_BASE_DEFAULT_REVISION in source
