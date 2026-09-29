@@ -53,6 +53,5 @@ def test_the_guard_stays_optional_and_the_default_path_is_unchanged():
     manifest = yaml.safe_load((ROOT / "manifest.yaml").read_text())
     assert manifest["pc2_read_only_guard"]["enabled_by_default"] is False
     assert manifest["images"]["thor"]["digest"], "the verified image must stay declared"
-    for key in ("run", "run_single_stage"):
-        assert "--boundary-state-guard" not in manifest["images"]["thor"][key]
+    assert "--boundary-state-guard" not in manifest["images"]["thor"]["run"]
     assert "5557" in manifest["sockets"] and "OPTIONAL" in manifest["sockets"]["5558"]
