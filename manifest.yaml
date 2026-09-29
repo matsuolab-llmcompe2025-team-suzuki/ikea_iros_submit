@@ -25,13 +25,18 @@ images:
     digest: "sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4"
     # What the operator types per run; everything that never changes at the venue is added
     # by the image entry (docker/venue_entry.sh). Needs -it for N/R/Enter controls.
+    # <skill_config_venue.yaml> is venue/skill_config_venue.yaml: the image's own skill_config
+    # with only the Dex1 arrival tolerance widened (0.05 -> 0.20 rad), made on the Thor from
+    # this image (INSTRUCTIONS.md section 1). Without it, a Dex1 that settles short of the
+    # commanded opening ends the run before the policy starts.
     run: >-
       docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --network host
       -e IROS_ORIN_HOST=<PC2_IP>
       -v <hf_cache>:/root/.cache/huggingface:ro
       -v <outputs>:/app/ramen/outputs
       -v <vlm_cache>:/cache
-      <image> --stage <0-5> --actuate
+      -v <skill_config_venue.yaml>:/app/venue_skill_config.yaml:ro
+      <image> --stage <0-5> --actuate --skill-config /app/venue_skill_config.yaml
   orin: null   # no PC2-side container (see the header)
 
 sockets:

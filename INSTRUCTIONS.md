@@ -59,6 +59,16 @@ docker pull ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b
 
 # 重みの事前取得（ネットのある所で。会場の実行中は取りに行かない）と、ネット無しの確認
 #   → WEIGHTS.md（一覧・取り方・USB に入れる物・会場での確認）
+
+# 会場用の skill_config（毎 run の docker run で mount する。理由は 4 章の「会場用の skill_config」）。
+# image の設定から Dex1 の到達の許容だけを 0.05 → 0.20 rad にした物（repo の venue/skill_config_venue.yaml と同じ）
+docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+  cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml \
+  | sed 's/^  tolerance_rad: 0\.05 .*$/  tolerance_rad: 0.20  # venue: Dex1 air arrival, ~3.3 mm (INSTRUCTIONS.md sec. 4)/' \
+  > $RAMEN_HOST_DIR/skill_config_venue.yaml
+sha256sum $RAMEN_HOST_DIR/skill_config_venue.yaml
+# → 9cc4496426c1b80deea6644aa6ab34c606595cf6875469bca6a843b3a5e30c22 と同じであること。違えば使わない
+#   （手元の repo の venue/skill_config_venue.yaml を scp で $RAMEN_HOST_DIR に置いても同じ物になる）
 ```
 
 - `vlm_cache` は VLM の compile 結果の置き場。1 回目の run だけ小さな kernel の compile が走り、2 回目以降は再利用する。
@@ -102,6 +112,15 @@ sequenceDiagram
   docker image inspect ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 --format '{{.Id}}'
   ```
   エラーなら run の前に pull（約 9 GB）か USB から `docker load`。
+- **Thor に会場用の skill_config があるか**（1 章で作った物。無いと Step 4 で docker が同じ名前の空の directory を作り、
+  起動が `IsADirectoryError` で止まる）。image の設定との違いが、許容の 1 行（と 4 章の手順で直した行）だけであること:
+  ```bash
+  docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
+    cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml | diff - $RAMEN_HOST_DIR/skill_config_venue.yaml
+  ```
+- **Stage 0 の歩く距離を運営に確かめる。** Stage 0 は目で見て止まらず、決めた時間だけ前進する
+  （`skills.move_to_table` の `vx` 0.185 m/s × `max_dwell_sec` 1.0 s ≈ 0.19 m。加減速で実際はこれより短い）。
+  スタート位置が台からそれより遠いなら、4 章の手順で `max_dwell_sec` だけを変える（`vx` は変えない）。
 - IP: Thor のロボット側は `192.168.123.222`（`ip -4 addr show`）、PC2 は `192.168.123.164`。以下の `<THOR_IP>` / `<PC2_IP>` はこの値。
 
 ### Step 0〜1 [PC2] カメラ・状態の配信
@@ -176,15 +195,18 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
   -v $RAMEN_HOST_DIR/hf_cache:/root/.cache/huggingface:ro \
   -v $RAMEN_HOST_DIR/outputs:/app/ramen/outputs \
   -v $RAMEN_HOST_DIR/vlm_cache:/cache \
+  -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro \
   ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
-  --stage N --actuate
+  --stage N --actuate --skill-config /app/venue_skill_config.yaml
 ```
 
 - `-it` 必須（Enter・N・R を押すため。対話端末でないと `--actuate` は
   `N/R/Enter production controls require an interactive TTY` で起動しない）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
 - **操作する端末は半角英数にしておく**（日本語入力が ON だと N / R / Enter は何も表示されずに無視される）。
 - 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
-  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate` だけ。大会本番では option を足さない。**
+  （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate --skill-config /app/venue_skill_config.yaml` だけ
+  （会場用の skill_config。この image を使う間は毎回付ける）。大会本番ではほかの option を足さない。**
+  起動 log の `[init] topic=… skill_config=/app/venue_skill_config.yaml` で会場用の設定を読んだと分かる。
   接続テストで試す option（model・送り方・手首 roll の clamp・Stage 0 の確かめ方）は `CONNECTION_TEST.md` にまとめてあり、
   決めた値は既定にしてから本番に使う。
 - 起動すると model と（Stage 1〜4 では）VLM を読み込む。**読み込みは時間制限なしで待つ**（10 秒ごとに経過が出る）。
@@ -238,7 +260,9 @@ python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --en
 
 - **押す前に腕が開始姿勢にあるかを目で確かめる。**
 - Stage 0: go-live の直後に、現在の実測姿勢から腕を下ろし
-  （肩 roll ±0.2・肘 0.9）、台まで歩き、止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
+  （肩 roll ±0.2・肘 0.9）、決めた時間だけ前進し（目で見て止まらない。距離は「始める前に」）、
+  止まってから手を開いて pick の開始姿勢へ移る。Stage 0 の歩行中は N / R を受け付けない。
+  台に近づきすぎたら待たずに E-stop（歩行中に通信が切れても運営 adapter は歩き続ける）。
 - **準備保持**（`準備／<経由点>／holding`）: 予定時間+5秒で未到達なら、その経由点で保持する。
   誤差と関節indexを確認し、Rで**同じ経由点だけ**再試行できる。遅れて到達すると`ready`になり、
   新しいEnterで準備を続ける。このEnterはPolicy開始のEnterとは別。モデルを読み直す必要はない。
@@ -280,22 +304,28 @@ python wbc_driver.py --lane decoupled --actions-host 192.168.123.222 --live --en
 | `[gate] initial pose not reached (worst=… error=…); Enter ignored` | 開始姿勢に届いていないので Enter を捨てた。一番ずれた関節と量。腕を目で見て、届くのを待つ |
 | 重みが cache に無い（`LocalEntryNotFoundError` など） | 事前取得の漏れ。`WEIGHTS.md` の 4（`prefetch_weights.py --check`） |
 | `Address already in use`（`:5556`） | 前の run か他チームの container が `:5556` を掴んでいる。`docker ps` / `ss -ltnp` で確かめ、自分の古い container なら止める。他チームなら運営へ |
-| `operator transition 'hand_open_…' did not reach its target: hand_open_… did not reach [5.3, 5.3] before the deadline (measured=[…])` | Dex1 が全開（校正の端）まで 0.05 rad 以内に届かずに安全停止した。まず Step 1 の状態 bridge の Dex1 校正の 2 行を確かめる（無ければ bridge の起動し直し）。校正が正しいのに届かないなら、次の run は全開を 0.15 rad 手前にした設定で起動する（image は変えない。下の手順） |
+| `skill config not found` / `IsADirectoryError: … venue_skill_config.yaml` | 会場用の skill_config が Thor に無い（docker が同じ名前の空の directory を作った）。`rmdir $RAMEN_HOST_DIR/skill_config_venue.yaml` の後、1 章の手順で作り直す |
+| `operator transition 'hand_…' did not reach its target: hand_… did not reach [a, b] before the deadline (measured=[…])` | Dex1 が目標（全開 5.3、または開始時の開き幅）まで許容の 0.20 rad 以内に届かずに安全停止した。まず Step 1 の状態 bridge の Dex1 校正の 2 行を確かめる（無ければ bridge を起動し直す）。校正が正しく、`measured` と目標の差が 0.3 rad 未満なら、下の手順で許容を 0.30 にして次の run を始める。それ以上ずれるなら Dex1 の故障・干渉を疑い、運営に確かめる |
 | `[gate] … NOT reached` や `[preparation] … holding` が続き、`joint=` が同じ関節 | その関節が届いていない。腕を目で見て、干渉が無ければ R で同じ経由点を再試行（準備）か、届くまで待つ（開始待ち） |
 
-Dex1 の全開を手前にする手順（上の表の行のときだけ。image は変えずに設定だけ差し替える）:
+#### 会場用の skill_config
+
+image の skill_config と違うのは、Dex1 の到達の許容 `hand_pre_motion.tolerance_rad` だけ（0.05 → 0.20 rad。
+指先で約 3.3 mm）。会場の Dex1 は運営の中継（`~/wbc_adapter/deploy/run_wbc_with_dex1.py`）の柔らかい P 制御
+（kp 5.0、重力・摩擦の補償なし）で動き、全開は手で動かして測った機械の端。目標の手前で止まると、0.05 rad では
+時間切れになり、Dex1 の時間切れは腕の準備と違って保持の道が無く、その run が policy の前に終わる
+（本体の同じ code で、手前 0.08 / 0.12 rad で止まる Dex1 は 0.05 では時間切れ、0.20 では完了: `tests/test_venue_skill_config.py`）。
+完了は「許容の中に 5 回続けて入る」ことなので、大きく動いている途中では完了しない。
+全開の目標（5.3 rad）・開始時の開き幅・policy の手の指令は変えない。
+
+会場で直すとき（上の表の行のとき・Stage 0 の距離）。直した後は「始める前に」の `diff` で、直した行だけが違うことを確かめる:
 
 ```bash
-docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6db3fb0b23dcf9a1835fc5a8c82b2d50dd2046090b745a6132f09c03f84757f4 \
-  cat /app/ramen/inference/desktop/lower_policy/configs/skill_config.yaml > $RAMEN_HOST_DIR/skill_config_venue.yaml
-sed -i 's/^  open_rad: 5.4$/  open_rad: 5.15/' $RAMEN_HOST_DIR/skill_config_venue.yaml
-grep -n "open_rad" $RAMEN_HOST_DIR/skill_config_venue.yaml        # hand_pre_motion の open_rad: 5.15 を確かめる
-# Step 4 の docker run に次の 2 つを足す（-v は image の前、--skill-config は --actuate の後ろ）
-#   -v $RAMEN_HOST_DIR/skill_config_venue.yaml:/app/venue_skill_config.yaml:ro
-#   --skill-config /app/venue_skill_config.yaml
+# Dex1 の到達の許容を 0.30 rad へ
+sed -i 's/^  tolerance_rad: 0\.20 /  tolerance_rad: 0.30 /' $RAMEN_HOST_DIR/skill_config_venue.yaml
+# Stage 0 の前進時間（距離 ≈ 0.185 m/s × 秒。例: 約 0.6 m なら 3.2）。vx は変えない
+sed -i 's/^    max_dwell_sec: 1\.0$/    max_dwell_sec: 3.2/' $RAMEN_HOST_DIR/skill_config_venue.yaml
 ```
-
-起動 log の `[init] Dex1 preparation/release opening=5.15rad (boundary)` で効いたことが分かる。
 
 **pose lane（`--boundary-lane pose`）に切り替えない。** 2026-09-29 の他チームの実機 run では、この機体の運営 IK の受理が
 602 waypoint で左右とも 0% だった（joint lane は reject 0）。

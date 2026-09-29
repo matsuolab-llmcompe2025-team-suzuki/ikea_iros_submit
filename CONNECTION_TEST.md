@@ -5,6 +5,8 @@
 1. 会場の機材（運営の PC2・WBC・adapter と実機）で、私たちの image が最後まで動くかを確かめる。
 2. **迷っている設定を、実機で試して決める。** 決めた値はコードの既定にして焼き直し、**大会本番は
    `--stage N --actuate` だけで動かす**（引数が多いと本番で間違えるため）。
+   例外: image `6db3fb0b…` を使う間は、会場用の skill_config（Dex1 の到達の許容だけ広げた物、
+   `INSTRUCTIONS.md` の 1 章・4 章）の mount と `--skill-config /app/venue_skill_config.yaml` を毎回付ける。
 
 起動のしかた（Step 0〜5）は `INSTRUCTIONS.md` の §2 を使います。この手順書は「何を、どの順に試し、何を見て、どう決めるか」だけを書きます。
 
