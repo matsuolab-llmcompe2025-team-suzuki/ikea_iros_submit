@@ -346,3 +346,6 @@ PY=/root/gb10-validation/.venv/bin/python
 "$PY" /root/operator_probe.py --state-guard --case state --trace --output /root/runs/guard-bridge-stop
 "$PY" /root/operator_probe.py --state-guard --case guard-dds --trace --output /root/runs/guard-dds-stop
 ```
+
+会場の override を使う試験では各 command に `--skill-config /root/submission-validation/venue/skill_config_venue.yaml`
+を追加する（同じ commit の `venue/` を事前転送）。結果 JSON に採用した path を記録する。

@@ -116,5 +116,7 @@ def test_operator_probe_wires_both_ends_and_keeps_default_optional():
     assert 'guard_options = ["--boundary-state-guard", "--boundary-state-port", "5558"] if args.state_guard else []' in source
     assert '"state_guard": args.state_guard' in source
     assert 'args.case == "guard-dds" and not args.state_guard' in source
+    assert 'str(args.skill_config.resolve())' in source
+    assert '*guard_options, *config_options, "--actuate"' in source
     wrapper = (ROOT / "docker/venue_entry.sh").read_text()
     assert "--boundary-state-guard" not in wrapper
