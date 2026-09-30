@@ -207,7 +207,7 @@ docker run -it --rm --runtime nvidia --gpus all -e NVIDIA_DISABLE_REQUIRE=1 --ne
 - `-it` 必須（Enter・N・R を押すため。対話端末でないと `--actuate` は
   `N/R/Enter production controls require an interactive TTY` で起動しない）。`<PC2_IP>` は通常 `192.168.123.164`（会場で確認）。
 - **操作する端末は半角英数にしておく**（日本語入力が ON だと N / R / Enter は何も表示されずに無視される）。
-- 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models all` など）は image の起動口
+- 会場で変わらない option（boundary 経路・`:5556` の bind・VLM の起動・`--gpu-models plan` など）は image の起動口
   （`docker/venue_entry.sh`）が付ける。**打つのは `--stage N --actuate --skill-config /app/venue_skill_config.yaml` だけ
   （会場用の skill_config。この image を使う間は毎回付ける）。大会本番ではほかの option を足さない。**
   起動 log の `[init] topic=… skill_config=/app/venue_skill_config.yaml` で会場用の設定を読んだと分かる。

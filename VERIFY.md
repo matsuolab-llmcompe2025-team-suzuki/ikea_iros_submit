@@ -28,7 +28,7 @@ GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証と�
 | 重みの事前取得と、ネット無しの `--check` | 実機・実カメラ・運営の WBC / adapter |
 | Stage 0〜5 の起動（VLM・YOLO・全 model の読み込み）が**ネット無しで**通るか | Thor の disk の速さ（重みの読み込み秒は変わる） |
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
-| `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
+| `--gpu-models plan`（#188 の既定）の読み込み: 各 model の秒数・VLM の起動時間・空きメモリ・読み込み中の制御の周期（orch log の `model_load`）、R の候補も含めた GPU の使用量・共有メモリの余裕 | |
 | 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
 | `--actuate` の経路: 準備goto・到達待ち・Enter/N/R・安全停止の判断待ち・後始末 | 実機の追従・干渉・接触（遅れ付き模擬追従でも物理応答は証明できない） |
 | conformance | |

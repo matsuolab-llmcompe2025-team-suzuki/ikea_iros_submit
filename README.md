@@ -18,7 +18,7 @@ commit と同じなのかも分からなくなる）。
 |---|---|
 | 推論の中身（skill・model の読み込み・VLM・設定の YAML・`policy_config.yaml` の model の選択） | **本体**を直して push → この repo で `./tools/sync_ramen.sh <commit>` → commit |
 | image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
-| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
+| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models plan` など） | `docker/venue_entry.sh`（image の起動口） |
 | 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
 | 焼き直さずに会場で変える値（Dex1 の到達の許容・Stage 0 の前進時間） | `venue/skill_config_venue.yaml`（image の skill_config から作る。`tests/test_venue_skill_config.py` が差を固定。焼き直したら作り直す） |
 | 任意の PC2 読み取り専用 state guard（既定では使わない） | PC2 用 bundle は `tools/package_pc2_guard.py`（`ramen/` の guard から作る）。手順は `INSTRUCTIONS.md` §7、焼き直したときの確認は `VERIFY.md` §9 |

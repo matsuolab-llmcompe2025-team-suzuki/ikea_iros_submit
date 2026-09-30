@@ -9,9 +9,11 @@
 #                                gripper_q があればそれを使う (BoundaryDex1StateSource)
 #     --boundary-host 0.0.0.0    :5556 は自分が bind し、PC2 の運営 adapter がつないでくる
 #     --spawn-vlm-server         hybrid pick の run では VLM をこの run の中で起動する
-#     --gpu-models all           stage の model を全部、起動時に GPU に載せる (run の途中で読み込み
-#                                待ちをしない)。GB10 (arm64・128 GB 共有メモリ) で VLM 込み最大 42 GB、
-#                                共有メモリは 48 GB 残ることを確認 (2026-09-25)
+#     --gpu-models plan          起動時は最初の skill の model だけを待ち、残り (R の後に選ぶ候補を含む)
+#                                を腕が止まっている間に 1 本ずつ読む (本体 #188)。R の候補を読むのは plan
+#                                のときだけ。前の既定 all (stage の model を全部起動時に載せる) は、GB10
+#                                (arm64・128 GB 共有メモリ) で VLM 込み最大 42 GB (2026-09-25)。戻すときは
+#                                後ろに --gpu-models all
 #   PC2 (カメラ :5555 と状態 :5557 の配信元) は -e IROS_ORIN_HOST=<PC2 の IP> で渡す
 #   (entrypoint の configure_official_endpoints が読む)。
 #   後ろに付けた option は上書きになる (argparse は後勝ち)。例: --gpu-models 2
@@ -40,5 +42,5 @@ exec pixi run --as-is -e runtime python -m inference.desktop.entrypoint \
   --synthetic-hand-state \
   --boundary-host 0.0.0.0 \
   --spawn-vlm-server \
-  --gpu-models all \
+  --gpu-models plan \
   "$@"
