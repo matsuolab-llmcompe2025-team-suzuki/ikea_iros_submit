@@ -87,7 +87,10 @@ alternatives_by_skill:
     - {variant: pick_table_leg_ramen_ori_venue_all6_20k, pick_leg_hybrid: true}  # hybrid の区間 1 を RAMEN-Ori に
   insert_table_leg: [insert_table_leg_diffusion_optimal_100k]  # 前の既定 (Diffusion 100k)
   rotate_leg_to_tighten: []
-  flip_table: [flip_table_ramen_ori_venue_all6_20k]
+  flip_table:  # flip の学び直し 3 本 (区間の選別 + 腕のずらし、ユーザー決定 09-30)。既定の GR00T は変えない
+    - flip_table_ramen_ori_flip_sel_a_n15_20k
+    - flip_table_ramen_ori_flip_sel_a_n30_20k
+    - flip_table_ramen_ori_flip_sel_c_n15_20k
 
 # Stage 1〜4 の pick を hybrid (VLM → 学習 policy で掴む → IK で運ぶ → ルールで持ち替え) で動かすか
 # (Issue #188)。false = default_variant_by_skill.pick_table_leg の学習 policy に pick 全部を任せる。
@@ -1199,6 +1202,65 @@ policies:
     dtype: fp32
     action_space: abs
     skill_id: 0                          # insert_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  # ---- flip の学び直し (Issue #188、2026-09-30) の slot ---- #
+  # venue_flip_all6 20k は実機で左腕だけで傾けて右腕が持ち上げに入らず、台が戻るのを繰り返した。教師の手順の揃った
+  # 区間だけ (data.episode_select) で、学習の腕の状態を教師からずらし (data.state_noise、正解の指令は教師のまま)、
+  # all6 150k から 2 万 step 追加学習した 20k。それ以外 (手先は FK・会場の腕の置き換え) は venue_flip_all6 と同じ
+  # (docs/handoff/issue_188_venue_arm_training.md §10)。skills.flip_table.wrist_tool_offset を変えないこと。
+  flip_table_ramen_ori_flip_sel_a_n15_20k:
+    # A: 左が先に最高点・右肩 pitch < -0.8 の 301 区間 + 腕の状態のずらし σ0.15 (上限 0.4 rad)
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_a_n15@072c3757b781cfd547eefaead8e2c55de705d25b
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_flip_sel_a_n30_20k:
+    # A (同じ 301 区間) + 腕の状態のずらし σ0.3 (上限 0.6 rad)
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_a_n30@01c5d9fe2dbef823006865ddbc133ea01d392ea9
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_flip_sel_c_n15_20k:
+    # C: A かつ左右の最高点の差 ≤ 2 s の 213 区間 + 腕の状態のずらし σ0.15 (上限 0.4 rad)
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_c_n15@b9c0aab1db6c0d69708ca10efbe825aae2ff0ad6
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
     replan_family: ramen_ori_flow_v1
     execution_steps: 8                   # chunk 32 に対する重なり
     temporal_lambda: -0.1

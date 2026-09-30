@@ -1,5 +1,5 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: 6fd62101edabcbfd4a30a344a5db05fefaef6044
-subject: #188 docs:describe_the_venue_ramen_ori_insert_default
+commit: 1b34e827c88bec1b23a20225428b9200583cac9a
+subject: #188 update:make_the_flip_retrains_the_flip_candidates
 state: published
