@@ -112,6 +112,8 @@ def main():
                         help="choose: the digit pressed after R (a candidate from alternatives_by_skill)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dwell-seconds", type=float, default=30)
+    parser.add_argument("--venue-arg", action="append", default=[],
+                        help="extra ramen-venue option, repeatable (e.g. --venue-arg=--gpu-models --venue-arg=all)")
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
     if args.case == "guard-dds" and not args.state_guard:
@@ -299,7 +301,7 @@ def main():
         guard_options = ["--boundary-state-guard", "--boundary-state-port", "5558"] if args.state_guard else []
         config_options = ["--skill-config", str(args.skill_config.resolve())] if args.skill_config else []
         venue = launch([sys.executable, str(here / "pty_run.py"), *traced,
-                        "/usr/local/bin/ramen-venue", *stage_args, *guard_options, *config_options, "--actuate"], "run.log", stdin=subprocess.PIPE,
+                        "/usr/local/bin/ramen-venue", *stage_args, *guard_options, *config_options, "--actuate", *args.venue_arg], "run.log", stdin=subprocess.PIPE,
                        env={**os.environ, "IROS_ORIN_HOST": "127.0.0.1"})
         wait_for("Enter starts", 900)
         key(b"\n")
@@ -424,6 +426,7 @@ def main():
                 error = error or "Missing network observations or outbound connection attempt"
         result = {"case": args.case, "stage": args.stage, "skill": args.skill,
                   "choice_key": args.choice_key if args.case == "choose" else None,
+                  "venue_args": args.venue_arg,
                   "state_guard": args.state_guard,
                   "skill_config": str(args.skill_config.resolve()) if args.skill_config else None,
                   "passed": error is None, "error": error,
