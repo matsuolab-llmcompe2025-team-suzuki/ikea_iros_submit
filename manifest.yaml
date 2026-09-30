@@ -85,8 +85,11 @@ runtime:
     - "Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a (checkpoint-40000 runtime files)"
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b (ckpt_step_100000.pt)"
     - "Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion@6c9911b8185ea185e6c929fbe9ede7d586c1bf09"
+    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_a_n15@072c3757b781cfd547eefaead8e2c55de705d25b (ckpt_step_020000.pt)"
+    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_a_n30@01c5d9fe2dbef823006865ddbc133ea01d392ea9 (ckpt_step_020000.pt)"
+    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_c_n15@b9c0aab1db6c0d69708ca10efbe825aae2ff0ad6 (ckpt_step_020000.pt)"
+    # Candidates only (variant sets venue_arm / all6_400k, selected with --policy-variant-set); not defaults.
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_flip_all6@2cbf2ce750d9cf711b63ac5d82ccca5cf17acfe7 (ckpt_step_020000.pt)"
-    # Candidate only (variant set all6_400k, selected with --policy-variant-set); not a default.
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546 (ckpt_step_400000.pt)"
   # Planning estimate, NOT a Thor measurement/upper bound. Source 10b8d73 on GB10,
   # continuous Stages 0-5 with all experts resident: 44.36 GiB GPU-process peak and
