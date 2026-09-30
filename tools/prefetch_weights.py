@@ -9,10 +9,12 @@
   RAMEN-Ori  resolve_hf_ckpt                   GR00T 53D  _resolve_groot_checkpoint_root (+ base model)
   pick       _PickLegsWorkerClient._resolve_checkpoint                YOLO  resolve_yolo_ckpt_ref
   DP         act_diffusion._resolve_checkpoint_root
-どの model を使うかの正本は policy_config.yaml (default_variant_by_skill・variant_sets・yolo) と hybrid の
-YAML (vlm.model) なので、model を差し替えてもこの一覧は自動で追従する。取るのは既定の model と、
-**variant_sets の全部の組み合わせ** (会場で起動の引数 --policy-variant-set / --policy-variant-<slot> で
-切り替える候補。ネット無しなので、切り替え先の重みも前もって要る)。同じ file を指す slot は 1 つにまとめる。
+どの model を使うかの正本は policy_config.yaml (default_variant_by_skill・variant_sets・alternatives_by_skill・
+pick_leg_hybrid・yolo) と hybrid の YAML (vlm.model) なので、model を差し替えてもこの一覧は自動で追従する。
+取るのは既定の model と、**variant_sets の全部の組み合わせ** (会場で起動の引数 --policy-variant-set /
+--policy-variant-<slot> で切り替える候補)、**alternatives_by_skill の全部** (本体 #188: run の途中で R の後に
+選ぶ候補、--gpu-models plan)。ネット無しなので、切り替え先の重みも前もって要る。同じ file を指す slot は
+1 つにまとめる。VLM は pick が hybrid になりうるとき (既定の pick_leg_hybrid か、hybrid の R の候補) に取る。
 外部の package の中で読まれる物 (lingbot・Cosmos・VLM) は、実行時と同じく main を丸ごと取る
 (ネット無しで main を引くには refs/main も要る)。
 
@@ -96,11 +98,12 @@ def _groot_base_item(revision: str) -> Item:
 
 
 def _selected_variants(extra_variants: Sequence[str]) -> list[tuple[str, str]]:
-    """(表示名, variant) の列。既定 → variant_sets (既定と違う slot だけ) → --variant の順。"""
+    """(表示名, variant) の列。既定 → variant_sets (既定と違う slot だけ) → R の候補 → --variant の順。"""
     import yaml
 
     from inference.desktop.lower_policy.policies.config_loader import (
         list_variants,
+        load_alternatives_by_skill,
         load_default_variant_by_skill,
     )
 
@@ -112,6 +115,11 @@ def _selected_variants(extra_variants: Sequence[str]) -> list[tuple[str, str]]:
         for skill, variant in loaded.items():
             if variant != defaults.get(skill):
                 selected.append((f"{skill} ({variant}, set {set_name})", variant))
+    # 本体 #188: R の後に選ぶ候補 (--gpu-models plan)。同じ variant の hybrid あり・なしは 1 つ
+    for skill, alternatives in load_alternatives_by_skill(POLICY_CONFIG).items():
+        for variant in dict.fromkeys(alternative.variant for alternative in alternatives):
+            if variant != defaults.get(skill):
+                selected.append((f"{skill} ({variant}, R の候補)", variant))
     known = set(list_variants(POLICY_CONFIG))
     for variant in extra_variants:
         if variant not in known:
@@ -248,7 +256,7 @@ def build_items(extra_variants: Sequence[str] = ()) -> list[Item]:
                 _snapshot_main(COSMOS_REPO),
             )
         )
-    if "groot_pick_legs" in types:  # hybrid pick の区間 1→2 の判定
+    if _pick_can_be_hybrid():  # hybrid pick の区間 1→2 の判定
         vlm_repo = yaml.safe_load(HYBRID_CONFIG.read_text(encoding="utf-8"))["vlm"][
             "model"
         ]
@@ -262,6 +270,21 @@ def build_items(extra_variants: Sequence[str] = ()) -> list[Item]:
             )
         )
     return items
+
+
+def _pick_can_be_hybrid() -> bool:
+    """会場の pick が hybrid になりうるか (VLM を取るか)。既定が hybrid か、hybrid の R の候補がある。"""
+    from inference.desktop.lower_policy.policies.config_loader import (
+        load_alternatives_by_skill,
+        load_pick_leg_hybrid_default,
+    )
+
+    if load_pick_leg_hybrid_default(POLICY_CONFIG):
+        return True
+    return any(
+        alternative.pick_leg_hybrid is True
+        for alternative in load_alternatives_by_skill(POLICY_CONFIG).get("pick_table_leg", ())
+    )
 
 
 def _base_revision(checkpoint_root: Path) -> str:
