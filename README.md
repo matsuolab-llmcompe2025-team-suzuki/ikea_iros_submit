@@ -1,12 +1,11 @@
 # Team RAMEN — IKEA IROS 提出物
 
-提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。提出 image は `gb10-guard-1cd5fdf`（本体 `1cd5fdf`）で、
+提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。提出 image は `gb10-test-1b34e82`（本体 `1b34e82`）で、
 [manifest.yaml](manifest.yaml) の digest 固定版を使います。会場では image に加えて、image の設定から Dex1 の到達の許容だけを
 広げた会場用の skill_config（[venue/skill_config_venue.yaml](venue/skill_config_venue.yaml)）を mount します。
-重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、image の検証結果は
-[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md) を参照してください。
+重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md) を参照してください。
 
-**検証範囲:** 新imageのGB10通し検証は依頼により中断しています。mainへの統合は全Stage・guard経路・実機の検証完了を意味しません。完了分と未実施分は上記レポートに記載しています。
+**検証範囲:** 新imageのARM64ビルドとGHCRへのpushは成功していますが、このdigestでのGB10全Stage・実機の検証結果はありません。[VERIFY.md](VERIFY.md)と[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md)は旧imageの検証手順・記録です。
 
 ## Team RAMEN の部分と直す場所
 
