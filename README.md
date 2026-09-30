@@ -1,12 +1,11 @@
 # Team RAMEN — IKEA IROS 提出物
 
-提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。提出 image は `gb10-guard-1cd5fdf`（本体 `1cd5fdf`）で、
+提出情報は [SUBMISSION.md](SUBMISSION.md) に集約しています。提出 image は `gb10-test-1b34e82`（本体 `1b34e82`）で、
 [manifest.yaml](manifest.yaml) の digest 固定版を使います。会場では image に加えて、image の設定から Dex1 の到達の許容だけを
 広げた会場用の skill_config（[venue/skill_config_venue.yaml](venue/skill_config_venue.yaml)）を mount します。
-重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md)、image の検証結果は
-[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md) を参照してください。
+重みの取得は [WEIGHTS.md](WEIGHTS.md)、会場での起動は [INSTRUCTIONS.md](INSTRUCTIONS.md) を参照してください。
 
-**検証範囲:** 新imageのGB10通し検証は依頼により中断しています。mainへの統合は全Stage・guard経路・実機の検証完了を意味しません。完了分と未実施分は上記レポートに記載しています。
+**検証範囲:** 新imageのARM64ビルドとGHCRへのpushは成功していますが、このdigestでのGB10全Stage・実機の検証結果はありません。[VERIFY.md](VERIFY.md)と[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md)は旧imageの検証手順・記録です。
 
 ## Team RAMEN の部分と直す場所
 
@@ -18,7 +17,7 @@ commit と同じなのかも分からなくなる）。
 |---|---|
 | 推論の中身（skill・model の読み込み・VLM・設定の YAML・`policy_config.yaml` の model の選択） | **本体**を直して push → この repo で `./tools/sync_ramen.sh <commit>` → commit |
 | image の中身（apt・環境・container 全体の環境変数 `HF_HUB_OFFLINE` / `YOLO_OFFLINE` など） | `docker/Dockerfile.thor` |
-| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models all` など） | `docker/venue_entry.sh`（image の起動口） |
+| 会場で毎回同じ起動の option（boundary 経路・`--spawn-vlm-server`・`--gpu-models plan` など） | `docker/venue_entry.sh`（image の起動口） |
 | 会場の手順・運営に出す宣言・重みの一覧 | `INSTRUCTIONS.md`・`manifest.yaml`・`WEIGHTS.md`（重みの一覧は `tools/prefetch_weights.py` が正本） |
 | 焼き直さずに会場で変える値（Dex1 の到達の許容・Stage 0 の前進時間） | `venue/skill_config_venue.yaml`（image の skill_config から作る。`tests/test_venue_skill_config.py` が差を固定。焼き直したら作り直す） |
 | 任意の PC2 読み取り専用 state guard（既定では使わない） | PC2 用 bundle は `tools/package_pc2_guard.py`（`ramen/` の guard から作る）。手順は `INSTRUCTIONS.md` §7、焼き直したときの確認は `VERIFY.md` §9 |

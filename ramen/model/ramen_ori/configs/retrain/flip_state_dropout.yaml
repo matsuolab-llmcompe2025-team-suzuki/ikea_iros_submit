@@ -1,0 +1,24 @@
+# @package _global_
+# flip_table の 1 skill だけで RAMEN-Ori を学習する。学習手法は #144 で確定した c32 + state group dropout
+# (all6_state_dropout と同じ継承元)。
+# 起動: pixi run train --config-name=retrain/flip_state_dropout
+#
+# `c32_state_dropout` を継承するので、dropout の率・chunk 32・FK aux loss・AdamW・vision freeze・
+# memory なし・task_uniform・batch 32・max_steps 100k・val (20 batch = 640 sample を 1000 step ごと) は
+# **何も書かなくても同じ**。ここで変えるのは data と保存先だけ。
+#
+# step 数の目安: all6 で flip が最良だった 150k は、task_uniform で flip を 6 回に 1 回しか引かないので、
+# flip だけの学習の約 25k 相当。100k まで回し、走行後に val 曲線 (10k の移動中央値) から ckpt を選ぶ
+# (ckpt は 5k ごと、HF push は 10k ごと)。1 skill なので task_uniform は均等に引くだけになる。
+defaults:
+  - /retrain/c32_state_dropout
+  - override /data: unified_flip
+  - _self_
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_flip_state_dropout
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_state_dropout
+
+wandb:
+  run_name: ramen_ori_flip_state_dropout

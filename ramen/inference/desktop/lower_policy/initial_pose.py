@@ -18,6 +18,7 @@ skill_config.yaml:skills.<skill_name>.initial_pose の schema:
 from __future__ import annotations
 
 import copy
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,67 @@ def apply_policy_variant_profile(
 
     _merge(skill, profile)
     return result
+
+
+#: `boundary_profile` で上書きしてよい項目 (Issue #188)。開始姿勢の腕だけ。``source`` は必須で、
+#: 上書きの値をどの開始姿勢 (``initial_pose`` の ``dataset_repo_id@dataset_revision``) から作ったか。
+_BOUNDARY_PROFILE_KEYS = frozenset({"initial_pose", "source"})
+_BOUNDARY_INITIAL_POSE_KEYS = frozenset({"arm_position_rad"})
+
+
+def apply_boundary_profiles(cfg: dict) -> tuple[dict, tuple[str, ...]]:
+    """会場の経路 (`--action-sink boundary`) だけの開始姿勢の上書きを重ねる (Issue #188)。
+
+    運営 WBC では胴が学習時より前に傾くなど立ち方が違い、同じ関節角でも手の位置が変わる。
+    その分を直した腕の関節角を `skills.<skill>.boundary_profile.initial_pose.arm_position_rad`
+    に書いておき、boundary のときだけ開始姿勢に重ねる (書いた関節だけ差し替え)。自前の
+    実機 (SDK) では呼ばないので、学習時と同じ開始姿勢のまま。
+
+    ``source`` が今の開始姿勢の出どころ (variant_profiles で別のデータの開始姿勢に差し替え
+    た variant など) と違うときは、重ねずに警告を出す (別の姿勢に関節角を混ぜないため)。
+
+    Returns:
+        (重ねた後の設定の写し, 上書きした skill 名の組)。
+    """
+
+    result = copy.deepcopy(cfg)
+    applied: list[str] = []
+    for skill_name, skill in (result.get("skills") or {}).items():
+        if not isinstance(skill, dict) or "boundary_profile" not in skill:
+            continue
+        where = f"skills.{skill_name}.boundary_profile"
+        profile = skill["boundary_profile"]
+        if not isinstance(profile, dict) or set(profile) - _BOUNDARY_PROFILE_KEYS:
+            raise ValueError(f"{where} may only override {sorted(_BOUNDARY_PROFILE_KEYS)}")
+        source = profile.get("source")
+        if not isinstance(source, str) or "@" not in source:
+            raise ValueError(f"{where}.source must name the start pose as 'dataset_repo_id@revision'")
+        pose = profile.get("initial_pose") or {}
+        if not isinstance(pose, dict) or set(pose) - _BOUNDARY_INITIAL_POSE_KEYS:
+            raise ValueError(
+                f"{where}.initial_pose may only override {sorted(_BOUNDARY_INITIAL_POSE_KEYS)}"
+            )
+        arms = pose.get("arm_position_rad") or {}
+        unknown = sorted(set(arms) - set(ARM_JOINT_ORDER)) if isinstance(arms, dict) else arms
+        if not isinstance(arms, dict) or unknown:
+            raise ValueError(f"{where}.initial_pose.arm_position_rad has unknown joints: {unknown}")
+        values = np.asarray([float(v) for v in arms.values()], dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{where}.initial_pose.arm_position_rad must be finite")
+        base = skill.get("initial_pose")
+        if not isinstance(base, dict) or not isinstance(base.get("arm_position_rad"), dict):
+            raise ValueError(f"{where} needs skills.{skill_name}.initial_pose.arm_position_rad")
+        current = f"{base.get('dataset_repo_id')}@{base.get('dataset_revision')}"
+        if current != source:
+            print(
+                f"[init] WARNING: {where} was made for the start pose of {source}, but the "
+                f"start pose now comes from {current} (another variant); not applied",
+                file=sys.stderr,
+            )
+            continue
+        base["arm_position_rad"].update({name: float(v) for name, v in arms.items()})
+        applied.append(str(skill_name))
+    return result, tuple(applied)
 
 
 @dataclass(frozen=True)

@@ -21,7 +21,7 @@ FIXED = [
     "--synthetic-hand-state",
     "--boundary-host", "0.0.0.0",
     "--spawn-vlm-server",
-    "--gpu-models", "all",
+    "--gpu-models", "plan",
 ]
 DOCKERFILE = SUBMIT_ROOT / "docker" / "Dockerfile.thor"
 

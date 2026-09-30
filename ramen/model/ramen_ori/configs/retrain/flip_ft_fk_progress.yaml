@@ -1,0 +1,31 @@
+# @package _global_
+# Issue #183: flip_ft_fk + 画像の token だけから「区間の進み」(0〜1) を当てる補助 head (aux_progress.ProgressHead)。
+# 起動: pixi run train --config-name=retrain/flip_ft_fk_progress
+#
+# 狙い: flip の実機 (2026-09-27) では台が倒れきる前に左手を離した。デモでは「台が倒れた」ときと「腕がある姿勢まで
+# 上がった」ときが重なるので、model は読み取りやすい腕の姿勢 (state) を合図にしがち。画像の表現に
+# 「どこまで進んだか」を持たせて、画像で判断する方向へ押す。推論では head を使わない (行動の経路は flip_ft_fk と同じ)。
+#
+# aux_weight 0.5: 進みの L1 は学習の初めで約 0.25、BC は約 0.1〜0.15。0.5 倍で BC と同じくらいの大きさにする
+defaults:
+  - /retrain/flip_ft_fk
+  - _self_
+
+data:
+  progress_target: true
+
+model:
+  aux_head:
+    _target_: model.ramen_ori.aux_progress.ProgressHead
+    d_model: ${model.d_model}
+    hidden_dim: 256
+    num_heads: 8
+  aux_weight: 0.5
+
+training:
+  ckpt_dir: /nvme/train_outputs/ramen_ori_flip_ft_fk_progress
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_ft_fk_progress
+
+wandb:
+  run_name: ramen_ori_flip_ft_fk_progress

@@ -28,7 +28,7 @@ GB10/mockでの成功を、Thor/G1の実機動作やタスク成功の保証と�
 | 重みの事前取得と、ネット無しの `--check` | 実機・実カメラ・運営の WBC / adapter |
 | Stage 0〜5 の起動（VLM・YOLO・全 model の読み込み）が**ネット無しで**通るか | Thor の disk の速さ（重みの読み込み秒は変わる） |
 | **外へ一度も接続しないか**（strace で全 process の `connect()`） | |
-| `--gpu-models all` と VLM を合わせた GPU の使用量・共有メモリの余裕 | |
+| `--gpu-models plan`（#188 の既定）の読み込み: 各 model の秒数・VLM の起動時間・空きメモリ・読み込み中の制御の周期（orch log の `model_load`）、R の候補も含めた GPU の使用量・共有メモリの余裕 | |
 | 会場で切り替える候補（`policy_config.yaml` の `variant_sets`）と DP が、ネット無しで読めるか | 候補の model の動きの良し悪し |
 | `--actuate` の経路: 準備goto・到達待ち・Enter/N/R・安全停止の判断待ち・後始末 | 実機の追従・干渉・接触（遅れ付き模擬追従でも物理応答は証明できない） |
 | conformance | |
@@ -157,7 +157,20 @@ PY=/root/gb10-validation/.venv/bin/python
 "$PY" /root/operator_probe.py --case retry-camera --trace --output /root/runs/retry-camera
 "$PY" /root/operator_probe.py --case soak --dwell-seconds 600 \
   --trace --output /root/runs/soak
+# R の後に数字キーで候補へ切り替え、候補の model で policy を始める (本体 #188、既定の --gpu-models plan)。
+# --choice-key は alternatives_by_skill の順 (1 = 最初の候補)。読み込み中なら 10 秒おきに押し直す
+"$PY" /root/operator_probe.py --case choose --stage 2 --trace --output /root/runs/choose-rotate
+"$PY" /root/operator_probe.py --case choose --stage 2 --skill insert_table_leg --trace --output /root/runs/choose-insert
+"$PY" /root/operator_probe.py --case choose --stage 1 --choice-key 1 --trace --output /root/runs/choose-pick-hybrid
+"$PY" /root/operator_probe.py --case choose --stage 5 --trace --output /root/runs/choose-flip
+# 開始待ちの U / D (本体 #188): 1 段上げて戻し、着いてから Enter (pick は右手、flip は両手)
+"$PY" /root/operator_probe.py --case lift --stage 1 --trace --output /root/runs/lift-pick
+"$PY" /root/operator_probe.py --case lift --stage 5 --trace --output /root/runs/lift-flip
 ```
+
+`--gpu-models plan` では、開始待ちの Enter の後に読みかけの model 1 本を待ってから動き出す
+（`[gate] …: holding until …`）。probe の待ちの上限は 600 秒。読み込みの順番・秒数・空きメモリ・
+読み込み中の制御の周期は orch log の `model_load` で見る。policy が動いている間に読み込みが始まっていないこと。
 
 同じ方法で個別Stage 0〜5、`retry` / `next` / `camera` / `state` / `worker` を逐次確認する。
 出力先は毎回新しいdirectoryにする。各`result.json`の`passed`、wireと外向きconnectを確認する。

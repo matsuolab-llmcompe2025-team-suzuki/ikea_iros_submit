@@ -79,6 +79,21 @@ class SkillDispatchLowerPolicy:
         self._skills[skill].start(params)
         self._active = self._skills[skill]
 
+    def replace_skill(self, name: str, skill: Skill) -> None:
+        """登録済みの skill の中身を差し替える (Issue #188、R の後に model を選ぶ)。
+
+        名前は変えない (遷移・記録・読み込みは名前で引く)。動いている skill は替えない。
+        """
+        if name not in self._skills:
+            raise KeyError(f"unknown skill {name!r}")
+        if skill.name != name:
+            raise ValueError(
+                f"skill.name mismatch: registry key {name!r} vs skill.name {skill.name!r}"
+            )
+        if self._active is not None and self._active.name == name:
+            raise RuntimeError(f"cannot replace {name!r} while it is running")
+        self._skills[name] = skill
+
     def stop(self) -> None:
         if self._active is None:
             return

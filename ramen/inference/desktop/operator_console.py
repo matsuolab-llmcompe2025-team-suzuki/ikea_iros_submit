@@ -95,7 +95,10 @@ class OperatorConsole:
                 ):
                     self._events.put((self._generation, key))
 
-    def show(self, stage: int, phase: str, allowed: tuple[str, ...]) -> int:
+    def show(
+        self, stage: int, phase: str, allowed: tuple[str, ...],
+        labels: dict[str, str] | None = None,
+    ) -> int:
         view = (stage, phase, allowed)
         with self._lock:
             if view == self._view:
@@ -111,7 +114,12 @@ class OperatorConsole:
             if self._fd is not None:
                 termios.tcflush(self._fd, termios.TCIFLUSH)
             generation = self._generation
-        labels = {"n": "N 次へ", "r": "R やり直し", "enter": "Enter 開始"}
+        names = dict(labels or {})
+        labels = {
+            "n": "N 次へ", "r": "R やり直し", "enter": "Enter 開始",
+            # 開始待ちで手先を上げ下げする (Issue #188、会場の pick だけ)
+            "u": "U 手を1cm上げる", "d": "D 1cm下げる",
+        }
         if phase.startswith("準備／"):
             labels["r"] = "R この経由点を再試行"
             labels["enter"] = "Enter 到達確認・準備を続行"
@@ -123,6 +131,8 @@ class OperatorConsole:
         if phase.startswith(SAFETY_STOP_PHASE):
             labels["enter"] = "Enter 戻す（初期姿勢→ハンド全開→腕下ろし）"
             stop_label = "Ctrl+C その場で終了"
+        # 呼び出し側の名前が優先 (R の後に model を選ぶ数字キーなど、Issue #188)
+        labels.update(names)
         controls = " ｜ ".join([*(labels[key] for key in allowed), stop_label])
         print(f"Stage {stage}\nフェーズ：{phase}\n操作：{controls}", file=sys.stderr)
         return generation
@@ -152,10 +162,26 @@ class OperatorConsole:
         self, key: str, *, stage: int, phase: str, detail: str | None = None,
         cancel_event: threading.Event | None = None,
     ) -> str:
+        return self.wait_for_any(
+            (key,), stage=stage, phase=phase, detail=detail, cancel_event=cancel_event
+        )
+
+    def wait_for_any(
+        self, keys: tuple[str, ...], *, stage: int, phase: str, detail: str | None = None,
+        cancel_event: threading.Event | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> str:
+        """``keys`` のどれかが押されるまで待ち、押されたキーを返す (表示の並びも ``keys`` の順)。
+
+        ``labels`` はキーの表示名の上書き (既定の表に無いキーは必須)。
+        """
+        keys = tuple(keys)
+        if not keys:
+            raise ValueError("wait_for_any needs at least one key")
         with self._lock:
             if cancel_event is not None and cancel_event.is_set():
                 raise EOFError("operator confirmation cancelled")
-            generation = self.show(stage, phase, (key,))
+            generation = self.show(stage, phase, keys, labels)
         if detail:
             # 例: 開始姿勢に届いたか・一番ずれた関節 (gate が実測から作る 1 行)
             print(detail, file=sys.stderr)
@@ -172,7 +198,7 @@ class OperatorConsole:
                 except queue.Empty:
                     received = None
                     event_generation = None
-                if event_generation == generation and received == key:
+                if event_generation == generation and received in keys:
                     return received
             self._stop.wait(0.02)
         raise EOFError("operator terminal closed")

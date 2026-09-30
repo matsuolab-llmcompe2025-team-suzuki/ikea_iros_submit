@@ -1,0 +1,30 @@
+# @package _global_
+# Issue #188: flip を「手順の揃った区間だけ + 腕の状態のずらし」で追加学習する (大きなずらし (右腕が教師から大きく外れた所からも戻る))。
+# 09-30 の実機: 今の flip (venue_flip_all6) は左腕だけで傾け、右腕が持ち上げに入らないまま左手を離して台が戻り、
+# それを繰り返した。教師は 85% の区間で両腕で持ち上げ、最高点から 4.9 秒 (中央値) 左手を保持するが、手順は区間ごとに
+# ばらつく (大まかに 39 通り)。手順を揃え (episode_select.py)、外れた腕から戻ることを学ばせる (state_noise.py)。
+# データ: A: 左腕が先に最高点・右腕も押す (301 / 429 区間)。それ以外 (all6 150k から、手先は FK、会場の腕の置き換え、2 万 step) は venue_flip_all6 と同じ。
+# 起動: pixi run train --config-name=retrain/flip_sel_a_n30
+defaults:
+  - /retrain/venue_ft_common
+  - override /data: unified_flip
+  - _self_
+
+data:
+  episode_select:
+    left_peak_first: true          # 左肩 pitch の最高点が右肩より前か同時
+    right_push_max_rad: -0.8       # 右肩 pitch の最小が -0.8 より小さい (右腕でも持ち上げて押す)
+    max_peak_gap_s: null            # 左右の最高点の時刻の差は見ない
+  state_noise:
+    prob: 0.5
+    sigma_rad: 0.3
+    max_rad: 0.6
+
+training:
+  init_from: /nvme/init/all6_state_dropout_17b5658/ckpt_step_150000.pt
+  ckpt_dir: /nvme/train_outputs/ramen_ori_flip_sel_a_n30
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_flip_sel_a_n30
+
+wandb:
+  run_name: ramen_ori_flip_sel_a_n30

@@ -73,11 +73,13 @@ def test_the_list_follows_the_config() -> None:
 
 
 def _selected_variants() -> set[str]:
-    """既定と variant_sets の全部 (会場で起動の引数だけで切り替えられる model)。"""
+    """既定と variant_sets の全部 (会場で起動の引数だけで切り替えられる model) と R の候補 (本体 #188)。"""
     config = yaml.safe_load(POLICY_CONFIG.read_text())
     variants = set(config["default_variant_by_skill"].values())
     for variant_set in config.get("variant_sets", {}).values():
         variants |= set(variant_set.values())
+    for entries in (config.get("alternatives_by_skill") or {}).values():
+        variants |= {entry["variant"] if isinstance(entry, dict) else entry for entry in entries}
     return variants
 
 
@@ -217,3 +219,37 @@ def test_check_passes_on_a_cache_laid_out_like_a_download(tmp_path) -> None:
     assert "MISSING" not in result.stdout
     assert "all present" in result.stdout
     assert DP_TRIAL_VARIANT in result.stdout
+
+
+def test_every_r_time_candidate_is_prefetched_once_per_file() -> None:
+    """本体 #188: run の途中で R の後に選ぶ候補 (alternatives_by_skill) も取る。同じ file は 1 回だけ。"""
+    module = _module()
+    items = module.build_items()
+    config = yaml.safe_load(POLICY_CONFIG.read_text())
+    for skill, entries in config["alternatives_by_skill"].items():
+        for entry in entries:
+            variant = entry["variant"] if isinstance(entry, dict) else entry
+            repo_id, _, revision = config["policies"][variant]["ckpt_ref"].rpartition("@")
+            matches = [item for item in items if (item.repo_id, item.revision) == (repo_id, revision)]
+            assert len(matches) == 1, (skill, variant)
+            assert variant in matches[0].label, (skill, variant)
+
+
+def test_the_vlm_is_fetched_when_the_pick_can_be_hybrid(tmp_path, monkeypatch) -> None:
+    """VLM は pick が hybrid になりうるとき (既定か、hybrid の R の候補) だけ取る。"""
+    module = _module()
+    config = yaml.safe_load(POLICY_CONFIG.read_text())
+
+    def vlm_listed(pick_leg_hybrid, pick_alternatives) -> bool:
+        data = dict(config)
+        data["pick_leg_hybrid"] = pick_leg_hybrid
+        data["alternatives_by_skill"] = {**config["alternatives_by_skill"], "pick_table_leg": pick_alternatives}
+        path = tmp_path / f"policy_config_{pick_leg_hybrid}_{len(pick_alternatives)}.yaml"
+        path.write_text(yaml.safe_dump(data))
+        monkeypatch.setattr(module, "POLICY_CONFIG", path)
+        return any(item.repo_id == "Qwen/Qwen3-VL-8B-Instruct" for item in module.build_items())
+
+    hybrid_gr00t = {"variant": "groot_pick_legs_v1", "pick_leg_hybrid": True}
+    assert vlm_listed(False, [hybrid_gr00t])  # 今の会場の設定: 既定は hybrid なし、hybrid の候補あり
+    assert vlm_listed(True, [])  # 既定が hybrid
+    assert not vlm_listed(False, [])  # hybrid にならない

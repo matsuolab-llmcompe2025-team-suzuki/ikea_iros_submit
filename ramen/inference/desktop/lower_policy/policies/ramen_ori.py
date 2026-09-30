@@ -1014,6 +1014,10 @@ class RamenOriPolicy:
             dim=ACTION_DIM, decay_lambda=cfg.temporal_lambda
         )
         self._current_step: int = 0
+        # この tick に ensembler から目標を取った step。先の予定 (preview_target) の起点。
+        # 同期経路 (replan_family=None) は chunk 全体を返すので VlaSkill が chunk から読む
+        # (Issue #188)。
+        self._preview_origin_step: int | None = None
         self._pipeline = None
         self._pipeline_lead_steps: int | None = None
         self._pipeline_max_age_s: float | None = None
@@ -1153,6 +1157,7 @@ class RamenOriPolicy:
         """
         self._ensembler.reset()
         self._current_step = 0
+        self._preview_origin_step = None
         if self._pipeline is not None:
             try:
                 self._pipeline.close(timeout_s=0.5)
@@ -1828,6 +1833,17 @@ class RamenOriPolicy:
         self._last_rtc_metadata = rtc_metadata
         return action_np, latency_ms
 
+    def preview_target(self, steps: int) -> tuple[np.ndarray, int] | None:
+        """この tick に返した目標から steps 先の予定 (Issue #188)。
+
+        会場の腕は指令から遅れるので、VlaSkill が腕だけをこの値に差し替えて送る。
+        予定が届いていない (直前の目標を保持している) tick は None。
+        返す組は (19D の目標, 実際に先を見た step 数)。
+        """
+        if self._preview_origin_step is None or steps < 1:
+            return None
+        return self._ensembler.peek_ahead(self._preview_origin_step, steps)
+
     def predict(self, obs: Observation) -> PolicyAction:
         """1 tick observation → PolicyAction。
 
@@ -1858,6 +1874,7 @@ class RamenOriPolicy:
             chunk_19d, latency_ms = self._sync_predict_chunk_19d(
                 obs, rtc_step=self._current_step
             )
+            self._preview_origin_step = None
             self._current_step += 1
             return PolicyAction(
                 action_chunk=chunk_19d,
@@ -1933,6 +1950,7 @@ class RamenOriPolicy:
 
         blended_target = self._ensembler.target(step=self._current_step)
         candidate_count = self._ensembler.candidate_count(self._current_step)
+        self._preview_origin_step = self._current_step
         self._current_step += 1
         return PolicyAction(
             action_chunk=blended_target[None, :].astype(np.float32, copy=False),

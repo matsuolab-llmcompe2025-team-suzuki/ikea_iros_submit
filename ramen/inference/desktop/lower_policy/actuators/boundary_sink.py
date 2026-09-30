@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -63,6 +63,9 @@ from inference.desktop.lower_policy.skills.vla_skill import (
     HAND_SLICE,
     WAIST_SLICE,
 )
+
+if TYPE_CHECKING:
+    from inference.desktop.lower_policy.actuators.arm_tracking_assist import ArmTrackingAssist
 
 # G1 canonical body order の脚 12 dof (G1JointIndex 0..11)。腰・腕は action で
 # 上書きするが、脚は policy が出さないので **実測値をそのまま使う**。
@@ -112,8 +115,10 @@ class ArmGravitySagOffset:
     Args:
         torque_fn: 腕 14-D → 重力を支えるトルク 14-D [Nm] (``OfficialG1ArmGravityCompensator.torque_nm``)。
         wbc_arm_kp: 運営 WBC の腕の kp 14-D (左 7 + 右 7)。
-        scale: 会場で測った垂れに合わせる倍率 (1.0 = kp どおり)。
+        scale: 会場で測った垂れに合わせる倍率 (1.0 = kp どおり)。全関節にかかる。
         max_offset_rad: 1 関節の補正の上限。
+        joint_scale: 関節ごとの倍率 14-D (``scale`` にさらに掛ける)。None なら全部 1。
+            09-29 の会場では肘だけ補正が半分ほど足りなかった (Issue #188)。
     """
 
     def __init__(
@@ -123,6 +128,7 @@ class ArmGravitySagOffset:
         *,
         scale: float = 1.0,
         max_offset_rad: float = 0.12,
+        joint_scale: Optional[Sequence[float]] = None,
     ) -> None:
         kp = np.asarray(wbc_arm_kp, dtype=np.float64).reshape(-1)
         if kp.shape != (14,) or not np.all(np.isfinite(kp)) or np.any(kp <= 0.0):
@@ -133,6 +139,12 @@ class ArmGravitySagOffset:
         max_offset_rad = float(max_offset_rad)
         if not (np.isfinite(max_offset_rad) and max_offset_rad > 0.0):
             raise ValueError(f"max_offset_rad must be > 0, got {max_offset_rad}")
+        joint = (
+            np.ones(14) if joint_scale is None
+            else np.asarray(joint_scale, dtype=np.float64).reshape(-1)
+        )
+        if joint.shape != (14,) or not np.all(np.isfinite(joint)) or np.any(joint <= 0.0) or np.any(joint > 3.0):
+            raise ValueError(f"joint_scale must be 14 values in (0, 3], got {joint}")
         from inference.desktop.lower_policy.actuators.g1_arm_sdk import (
             G1_ARM_POSITION_LOWER_RAD,
             G1_ARM_POSITION_UPPER_RAD,
@@ -142,6 +154,7 @@ class ArmGravitySagOffset:
         self._kp = kp
         self._scale = scale
         self._max_offset_rad = max_offset_rad
+        self._joint_scale = joint
         self._lower = G1_ARM_POSITION_LOWER_RAD + _GRAVITY_OFFSET_LIMIT_MARGIN_RAD
         self._upper = G1_ARM_POSITION_UPPER_RAD - _GRAVITY_OFFSET_LIMIT_MARGIN_RAD
 
@@ -151,7 +164,7 @@ class ArmGravitySagOffset:
         section = skill_config.get("boundary_gravity_offset")
         if not isinstance(section, dict):
             raise ValueError("skill_config.boundary_gravity_offset is missing")
-        unknown = sorted(set(section) - {"wbc_arm_kp", "max_offset_rad"})
+        unknown = sorted(set(section) - {"wbc_arm_kp", "max_offset_rad", "joint_scale"})
         if unknown:
             raise ValueError(f"boundary_gravity_offset has unknown keys: {unknown}")
         kp7 = np.asarray(section.get("wbc_arm_kp"), dtype=np.float64).reshape(-1)
@@ -164,12 +177,21 @@ class ArmGravitySagOffset:
             OfficialG1ArmGravityCompensator,
         )
 
+        joint7 = section.get("joint_scale")
+        if joint7 is not None:
+            joint7 = np.asarray(joint7, dtype=np.float64).reshape(-1)
+            if joint7.shape != (7,):
+                raise ValueError(
+                    "boundary_gravity_offset.joint_scale must list 7 values "
+                    "(same order as wbc_arm_kp; both arms)"
+                )
         model = OfficialG1ArmGravityCompensator.from_default_urdf()
         return cls(
             model.torque_nm,
             np.concatenate([kp7, kp7]),
             scale=scale,
             max_offset_rad=float(section.get("max_offset_rad", 0.12)),
+            joint_scale=None if joint7 is None else np.concatenate([joint7, joint7]),
         )
 
     @property
@@ -179,6 +201,7 @@ class ArmGravitySagOffset:
     def describe(self) -> str:
         return (
             f"kp={self._kp[:7].tolist()} (both arms) scale={self._scale:g} "
+            f"joint_scale={[round(float(v), 3) for v in self._joint_scale[:7]]} "
             f"max={self._max_offset_rad:g}rad"
         )
 
@@ -195,7 +218,9 @@ class ArmGravitySagOffset:
         if torque.shape != (14,) or not np.all(np.isfinite(torque)):
             raise RuntimeError("gravity model returned an invalid torque vector")
         offset = np.clip(
-            self._scale * torque / self._kp, -self._max_offset_rad, self._max_offset_rad
+            self._scale * self._joint_scale * torque / self._kp,
+            -self._max_offset_rad,
+            self._max_offset_rad,
         )
         inside = (arms >= self._lower) & (arms <= self._upper)
         command = np.where(inside, np.clip(arms + offset, self._lower, self._upper), arms)
@@ -578,6 +603,8 @@ class BoundaryActionSink:
         clock: 間隔を測る単調時計 (test 用)。
         gravity_offset: joint lane で送る腕に重力の垂れの分を足す (`ArmGravitySagOffset`)。
             None なら足さない (従来)。pose lane では使えない。
+        arm_tracking: joint lane の腕の遅れ・押し負けの補い (`ArmTrackingAssist`、Issue #188)。
+            先読みを足し、押している間は送る間隔を延ばす。None なら従来。pose lane では使えない。
     """
 
     def __init__(
@@ -596,11 +623,14 @@ class BoundaryActionSink:
         hold_refresh_s: float = DEFAULT_HOLD_REFRESH_S,
         clock: Callable[[], float] = time.monotonic,
         gravity_offset: Optional[ArmGravitySagOffset] = None,
+        arm_tracking: Optional[ArmTrackingAssist] = None,
     ) -> None:
         if lane not in BOUNDARY_LANES:
             raise ValueError(f"lane must be one of {BOUNDARY_LANES}, got {lane!r}")
         if gravity_offset is not None and lane != "joint":
             raise ValueError("the gravity sag offset applies to the joint lane only")
+        if arm_tracking is not None and lane != "joint":
+            raise ValueError("the arm tracking assist applies to the joint lane only")
         publish_period_s = float(publish_period_s)
         hold_refresh_s = float(hold_refresh_s)
         if not (np.isfinite(publish_period_s) and publish_period_s >= 0.0):
@@ -613,6 +643,12 @@ class BoundaryActionSink:
             raise ValueError(f"chunk_rows must be an int, got {chunk_rows!r}")
         if not 1 <= chunk_rows <= 64:
             raise ValueError(f"chunk_rows must be in [1, 64] (contract T <= 64), got {chunk_rows}")
+        if arm_tracking is not None and hold_refresh_s and (
+            arm_tracking.config.blocked_period_s > hold_refresh_s
+        ):
+            # 送り直し (hold_refresh) のたびに adapter が実測へ向かい直すので、押している間の
+            # 間隔はそれより長くできない
+            raise ValueError("arm tracking blocked_period_s must be <= hold_refresh_s")
         if lane == "pose":
             if fk is None:
                 from inference.desktop.perception.g1_urdf_fk import (
@@ -649,6 +685,11 @@ class BoundaryActionSink:
         self._last_row: Optional[np.ndarray] = None
         self._last_publish_at: Optional[float] = None
         self._gravity_offset = gravity_offset
+        self._arm_tracking = arm_tracking
+        # 最後に送った腕のうち、WBC が着くはずの腕 14-D (= 送った腕 − 重力の垂れ補正)。
+        # 押しているかの判定に使う。補正の分まで目標との差に数えると、補正が効いて
+        # 止まっている肘まで押していることになる (肘の 2.1 倍で 0.12〜0.14 rad、Issue #188)。
+        self._last_expected_arms: Optional[np.ndarray] = None
         self._preparation_owner = None
         # EE の計算に使っている腰角 (EE_WAIST_REFRESH_RAD 以上動いたときだけ更新)。
         self._ee_waist: Optional[np.ndarray] = None
@@ -674,6 +715,11 @@ class BoundaryActionSink:
             print(
                 "[boundary] gravity sag offset: "
                 + ("off" if gravity_offset is None else f"on ({gravity_offset.describe()})"),
+                file=sys.stderr,
+            )
+            print(
+                "[boundary] arm tracking: "
+                + ("off" if arm_tracking is None else arm_tracking.describe()),
                 file=sys.stderr,
             )
         print(
@@ -707,6 +753,10 @@ class BoundaryActionSink:
             self._preparation_owner = None
             self._last_row = None
             self._last_publish_at = None
+            # goto の後は指令の流れが途切れるので、先読みの速さと押している判定を捨てる
+            self._last_expected_arms = None
+            if self._arm_tracking is not None:
+                self._arm_tracking.reset()
 
     def preparation_event(self, event: str, **fields) -> None:
         if self._log_fn is not None:
@@ -809,12 +859,24 @@ class BoundaryActionSink:
         navigation = np.asarray(navigate_cmd, dtype=np.float64).reshape(-1)
         if navigation.shape != (3,) or not np.all(np.isfinite(navigation)):
             raise ValueError("navigate_cmd must be finite 3-D")
+        now = float(self._clock())
         if self._lane == "joint":
-            chunk, record = self._joint_chunk(action19, body_q29, navigation)
+            chunk, record = self._joint_chunk(action19, body_q29, navigation, now)
         else:
             chunk, record = self._pose_chunk(action19, body_q29, navigation)
         row = np.asarray(chunk[0], dtype=np.float64)
-        now = float(self._clock())
+        if self._arm_tracking is not None:
+            # 送らない tick も判定する (押している間は送る間隔を延ばす、Issue #188)
+            measured = np.asarray(body_q29, dtype=np.float64).reshape(-1)[15:29]
+            blocked = self._arm_tracking.update_blocked(
+                self._last_expected_arms, measured, now, stale=state_stale,
+                intent14=record.get("arms_intent"),
+            )
+            record.update({
+                "arm_blocked": blocked,
+                "arm_push_rad": self._arm_tracking.push.tolist(),
+                "publish_period_s": self._arm_tracking.publish_period(self._publish_period_s),
+            })
         reason = "force" if force else self._publish_reason(row, navigation, now)
         if reason is None:
             return False
@@ -836,6 +898,11 @@ class BoundaryActionSink:
         self._sent += 1
         self._last_row = row.copy()
         self._last_publish_at = now
+        if self._arm_tracking is not None:
+            # WBC が着くはずの腕 = policy の腕 + 先読み・押し込み (重力の垂れ補正は含めない)
+            self._last_expected_arms = np.asarray(
+                record["arms_intent"], dtype=np.float64
+            ) + np.asarray(record["arm_lead_rad"], dtype=np.float64)
         if self._log_fn is not None:
             self._log_fn(
                 {
@@ -872,7 +939,10 @@ class BoundaryActionSink:
         if not np.array_equal(self._last_row[18:21], navigation):
             return "navigate_changed"
         if not np.array_equal(self._last_row, row):
-            if since >= self._publish_period_s - _PUBLISH_PERIOD_TOLERANCE_S:
+            period = self._publish_period_s
+            if self._arm_tracking is not None:
+                period = self._arm_tracking.publish_period(period)
+            if since >= period - _PUBLISH_PERIOD_TOLERANCE_S:
                 return "changed"
             return None
         if since >= self._hold_refresh_s - _PUBLISH_PERIOD_TOLERANCE_S:
@@ -926,19 +996,25 @@ class BoundaryActionSink:
         action19: Sequence[float],
         body_q29: Sequence[float],
         navigation: np.ndarray,
+        now: float = 0.0,
     ) -> tuple[np.ndarray, dict]:
         """joint lane: (1,22) の腕の関節角の chunk と、log に足す項目。
 
         FK・運営 IK 用の clamp・腰角の据え置きは要らない (どれも運営 IK のため)。
+        送る腕 = policy の腕 + 先読み (`arm_tracking`) + 重力の垂れ補正。
         """
         action38 = assemble_action38(
             np.asarray(action19, dtype=np.float64).reshape(-1).copy(), body_q29
         )
         arms = slice(7 + 15, 7 + 29)  # root7 + body29 の腕 14-D
         intent = action38[arms].copy()
+        led = intent
+        if self._arm_tracking is not None:
+            led = self._arm_tracking.lead(intent, now)
+            action38[arms] = led
         offset = np.zeros(14, dtype=np.float64)
         if self._gravity_offset is not None:
-            command, offset = self._gravity_offset.apply(intent)
+            command, offset = self._gravity_offset.apply(led)
             action38[arms] = command
         row = action38_to_joint_row(action38, navigate_cmd=navigation)
         record = {
@@ -949,12 +1025,18 @@ class BoundaryActionSink:
             "joint_22": row.tolist(),
         }
         if self._gravity_offset is not None:
-            # joint_22 の腕 = arms_intent + gravity_offset_rad。保持中の「送った腕 − 実測」と
-            # 補正量の比が、会場の kp に合った倍率 (check_boundary_hold.py が出す)。
+            # joint_22 の腕 = arms_intent + arm_lead_rad + gravity_offset_rad。保持中の「送った腕
+            # − 実測」と補正量の比が、会場の kp に合った倍率 (check_boundary_hold.py が出す)。
             record.update({
                 "arms_intent": intent.tolist(),
                 "gravity_offset_rad": offset.tolist(),
                 "gravity_offset_scale": self._gravity_offset.scale,
+            })
+        if self._arm_tracking is not None:
+            record.update({
+                "arms_intent": intent.tolist(),
+                "arm_lead_rad": (led - intent).tolist(),
+                "arm_tracking_preset": self._arm_tracking.name,
             })
         return row[None, :], record
 

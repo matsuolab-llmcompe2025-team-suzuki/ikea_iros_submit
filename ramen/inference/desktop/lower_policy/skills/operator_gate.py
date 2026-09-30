@@ -69,6 +69,18 @@ class OperatorConfirmationHoldSkill(Skill):
     到達判定もこの gate で重ねて確認し、違う姿勢からの開始を防ぐ。
     判定は準備動作と同じもの (pose lane は手先、sdk・joint lane は関節角) を渡す。
     省略時は判定せずに従来の文言。
+
+    ``start_adjuster`` (`skills/start_lift.StartLiftAdjuster`、Issue #188) を渡すと、問いの間に
+    U / D キーで開始の手の高さを 1 段ずつ変えられる。保持している目標を関節の速さを抑えて
+    新しい目標へ近づけ、着いて止まってから Enter が効く (``arrival_check`` は同じ目標を見ること)。
+
+    ``choice`` (`skills/policy_choice.PolicyChoice`、Issue #188 ② 段 3) を渡すと、問いの間に数字キーで
+    skill の model を選べる。受け付けた選択は確認のキーと同じく先へ進み、受け付けない選択
+    (読み込み中など) は待ち続ける。
+
+    ``set_leave_barrier`` (Issue #188 ② 段 2) を渡すと、Enter の後もそれが True になるまで
+    保持を続けてから先へ進む。model の読み込みは腕が止まっている間だけ行う
+    (`policies/load_plan.LoadPlan`)。読みかけの 1 本は途中で止められないので、動き出す前に待つ。
     """
 
     #: 入力 thread が自分の問い (操作・到達の詳細) を出すので、orchestrator は
@@ -86,6 +98,8 @@ class OperatorConfirmationHoldSkill(Skill):
         arrival_check: Optional[ArrivalCheck] = None,
         require_arrival: bool = False,
         hold_arm_target_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
+        start_adjuster=None,
+        choice=None,
     ) -> None:
         super().__init__()
         self.name = name
@@ -105,6 +119,29 @@ class OperatorConfirmationHoldSkill(Skill):
         self._lock = threading.Lock()
         self._generation = 0
         self._live_state_getter = None
+        self._start_adjuster = start_adjuster
+        self._choice = choice
+        self._last_step_s: Optional[float] = None
+        self._leave_ready_fn: Optional[Callable[[], bool]] = None
+        self._leave_cancel_fn: Optional[Callable[[], None]] = None
+        self._leave_description = ""
+        self._leave_wait_logged = False
+
+    def set_leave_barrier(
+        self,
+        ready_fn: Callable[[], bool],
+        *,
+        description: str,
+        cancel_fn: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Enter の後、動き出す前に待つもの (Issue #188)。False の間は保持を続ける。
+
+        ``cancel_fn`` は Enter の確認を取り消したとき (到達・静止が崩れた) に呼ぶ
+        (`LoadPlan.stay`: 聞いた時点で止めた読み込みを続けさせる)。
+        """
+        self._leave_ready_fn = ready_fn
+        self._leave_cancel_fn = cancel_fn
+        self._leave_description = str(description)
 
     def require_fresh_state(self, getter, *, max_age_s, max_speed_rad_s):
         self._live_state_getter = getter
@@ -136,6 +173,8 @@ class OperatorConfirmationHoldSkill(Skill):
             self._confirmed.clear()
             self._reader_started = False
             self._failure_reason = None
+            self._last_step_s = None
+            self._leave_wait_logged = False
 
     def _on_stop(self) -> None:
         with self._lock:
@@ -144,6 +183,12 @@ class OperatorConfirmationHoldSkill(Skill):
             self._confirmed.clear()
 
     def _prompt(self, arm: np.ndarray) -> str:
+        prompt = self._base_prompt(arm)
+        if self._start_adjuster is not None:
+            prompt += "\n[start-lift] " + self._start_adjuster.status()
+        return prompt
+
+    def _base_prompt(self, arm: np.ndarray) -> str:
         if self._arrival_check is None:
             return (
                 f"[gate] {self._next_skill_name} initial arm/hand pose is reached and "
@@ -177,9 +222,27 @@ class OperatorConfirmationHoldSkill(Skill):
                 if cancel_event.is_set():
                     return
                 if self._cancellable_input_fn is None:
-                    self._input_fn(prompt)
+                    key = self._input_fn(prompt)
                 else:
-                    self._cancellable_input_fn(prompt, cancel_event)
+                    key = self._cancellable_input_fn(prompt, cancel_event)
+                if self._start_adjuster is not None and key in self._start_adjuster.keys:
+                    # 手の高さを変えるだけで、まだ始めない (着いてから Enter)
+                    print(self._start_adjuster.adjust(key), file=sys.stderr)
+                    with self._lock:
+                        if generation != self._generation:
+                            return
+                        latest = None if self._latest_arm is None else self._latest_arm.copy()
+                    prompt = self._prompt(latest if latest is not None else self._hold_arm)
+                    continue
+                if self._choice is not None and key in self._choice.keys:
+                    with self._lock:
+                        if generation != self._generation:
+                            return
+                    # model を選ぶ。受け付けたら確認のキーと同じく先へ、でなければ待ち続ける
+                    accepted, message = self._choice.choose(key)
+                    print(message, file=sys.stderr)
+                    if not accepted:
+                        continue
                 with self._lock:
                     if generation != self._generation:
                         return
@@ -241,6 +304,12 @@ class OperatorConfirmationHoldSkill(Skill):
             )
             if self._hold_arm.shape != (14,) or not np.isfinite(self._hold_arm).all():
                 raise RuntimeError(f"{self.name} cannot hold an invalid arm target")
+        if self._start_adjuster is not None:
+            # 開始待ちの目標 (U / D で変わる) へ、関節の速さを抑えて近づける
+            now = time.monotonic()
+            dt = 0.0 if self._last_step_s is None else now - self._last_step_s
+            self._last_step_s = now
+            self._hold_arm = self._start_adjuster.ramp(self._hold_arm, dt)
         if not self._reader_started:
             self._reader_started = True
             threading.Thread(
@@ -256,12 +325,25 @@ class OperatorConfirmationHoldSkill(Skill):
         if self._confirmed.is_set() and not self._live_arrival():
             self._confirmed.clear()
             self._reader_started = False
+            self._leave_wait_logged = False
+            if self._leave_cancel_fn is not None:
+                self._leave_cancel_fn()
             print(
                 "[gate] arrival/fresh stationary state changed before transition; "
                 "Enter ignored. Wait for the pose to settle, then press Enter again.",
                 file=sys.stderr,
             )
-        return self._confirmed.is_set()
+        if not self._confirmed.is_set():
+            return False
+        if self._leave_ready_fn is not None and not self._leave_ready_fn():
+            if not self._leave_wait_logged:
+                self._leave_wait_logged = True
+                print(
+                    f"[gate] {self.name}: holding until {self._leave_description}",
+                    file=sys.stderr,
+                )
+            return False
+        return True
 
     @property
     def failure_reason(self) -> Optional[str]:

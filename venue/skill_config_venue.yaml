@@ -130,9 +130,70 @@ boundary_gravity_offset:
   # GR00T-WholeBodyControl b042411 `decoupled_wbc/control/main/teleop/configs/
   # g1_29dof_gear_wbc.yaml`。会場の PC2 の同じファイルと照合すること。
   wbc_arm_kp: [100, 100, 40, 40, 20, 20, 20]
+  # 関節ごとの倍率 (左右同じ、wbc_arm_kp と同じ並び。Issue #188)。09-29 の会場 (G1 (3)) では、開始姿勢に
+  # 着いた後も肘だけ垂れが残った (補正 −3.2〜−3.9° に対して残り +1.9〜+5.0°、手先が 2〜3 cm 下がる)。
+  # 垂れが消える倍率は肘で 2.07 / 2.35 (pick)・1.54 / 2.28 (台を回す)・2.16 / 2.03 (flip) の中央値 2.1。
+  # 肩 pitch は 0.96〜1.33 で今のままでよい。model の腕の重さに手 (Dex1) が入っていない分とみられる。
+  # 会場の経路 (joint lane) だけで効き、全部の skill・準備動作・policy の間に効く。
+  joint_scale: [1.0, 1.0, 1.0, 2.1, 1.0, 1.0, 1.0]
   # 1 関節の補正の上限 [rad]。開始姿勢の予測は最大 0.068、可動域全体 (2 万姿勢の探索) でも
-  # 腕だけの重さでは最大 0.078。scale を 1.5 まで上げても収まる幅にする。
-  max_offset_rad: 0.12
+  # 腕だけの重さでは最大 0.078。肘の 2.1 倍 (最大 0.164) と scale 1.1 まで収まる幅にする。
+  max_offset_rad: 0.18
+
+# 会場 (boundary の joint lane) の腕の遅れ・押し負けを、送り方で補う (Issue #188)。
+#   09-29 の会場では、腕が指令から 270〜390 ms 遅れ (自前の arm_sdk は 80〜110 ms)、台を回すと
+#   右肘が 0.15 rad 押し返されたままだった。運営 adapter が chunk ごとに 1 行目を実測の腕に
+#   合わせ直し 1 rad/s までしか進めない (`wbc_driver.py:_step_clamp`) のに、私たちが 0.1 s おきに
+#   送り直していたため、WBC の目標が実測より約 0.1 rad しか先に出なかった (柔らかい PD では
+#   押す力 ∝ 目標が実測を越える量)。
+#   blocked_*: 送った指令と実測の差が blocked_gap_rad を超え、その関節が blocked_still_rad_s より
+#              遅い間 (台などを押している) は、送る間隔を blocked_period_s に延ばす (0 = 延ばさない)。
+#   push_*   : 押している関節にだけ push_gain × (policy の指令 − 実測) を足す (push_max_rad まで)。
+#   lead_*   : 先読み。指令の速さ (lead_window_s でならす) × lead_horizon_s を足す (lead_max_rad まで)。
+#              過去の指令だけで速さを出すので向きの変わり目で行き過ぎ、pick のずれを増やした。
+#   09-29 の log を本物の送り方に流した模擬 (evaluate/model_evaluation/tools/arm_tracking_sim.py、
+#   腕の反応 0.15 s・台は動かない壁) の押す力 (台を回す、平均): today 0.062 → standard 0.083 (+34%)、
+#   adapter の --max-joint-vel 1.5 を重ねて 0.108 (+74%)。pick のずれは変わらない (0.034)。
+#   起動の `--arm-tuning <束>` で選ぶ (省略時は default_preset)。`--arm-blocked-period-s` /
+#   `--arm-push-max-rad` / `--arm-lead-horizon-s` は会場で合わせるための上書き。
+#   経緯と会場での合わせ方は docs/handoff/venue_arm_tracking.md。
+boundary_arm_tracking:
+  default_preset: standard
+  presets:
+    # 09-29 と同じ送り方 (ずっと 0.1 s おき、補いなし)。会場で新しい送り方が悪いときに戻す先
+    today:
+      lead_horizon_s: 0.0
+      lead_window_s: 0.2
+      lead_max_rad: 0.0
+      blocked_period_s: 0.0
+      blocked_gap_rad: 0.08
+      blocked_still_rad_s: 0.05
+      push_gain: 0.0
+      push_max_rad: 0.0
+      preview_s: 0.0
+    # 押している間は 0.3 s おき + 押し込み + 腕だけ policy の予定の 0.2 s 先を送る (Issue #188)。
+    # 先の予定は 09-29 の log の模擬 (上限) で pick の遅れ 340→130 ms・台を回す 250→40 ms
+    standard:
+      lead_horizon_s: 0.0
+      lead_window_s: 0.2
+      lead_max_rad: 0.0
+      blocked_period_s: 0.3
+      blocked_gap_rad: 0.08
+      blocked_still_rad_s: 0.05
+      push_gain: 0.7
+      push_max_rad: 0.10
+      preview_s: 0.2
+    # standard + 先読み。台を回すの遅れを縮めたいときに試す (pick では行き過ぎるので使わない)
+    lead:
+      lead_horizon_s: 0.15
+      lead_window_s: 0.2
+      lead_max_rad: 0.10
+      blocked_period_s: 0.3
+      blocked_gap_rad: 0.08
+      blocked_still_rad_s: 0.05
+      push_gain: 0.7
+      push_max_rad: 0.10
+      preview_s: 0.2
 
 skills:
   # SetupSkill: entrypoint 起動直後に腕を安全 clearance 姿勢へ持っていく (Issue #81)。
@@ -346,6 +407,22 @@ skills:
       training_episode_count: 531
       statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
 
+    # 会場 (運営 WBC、--action-sink boundary) だけの開始姿勢の上書き (Issue #188、handoff の 10-2)。自前の実機 (SDK) では使わない。
+    # 肘の重力補正 (boundary_gravity_offset.joint_scale) を入れた後も、09-29 の G1 (3) の開始の手が学習の開始の中央値より
+    # 1.5 cm 以上低い手を、向きを保ったまま真上へその分 (0.5 cm 刻み) 上げた腕 7 関節 (G1 URDF の IK、胴基準)。
+    # 学習の範囲と URDF の限界の内側。source と違う開始姿勢 (別のデータの variant) には重ねない。
+    # 左手 +2.5 cm (補正後の差 右 −0.1 / 左 −2.7 cm)。
+    boundary_profile:
+      source: "BitRobot/G1_WBT_Dex1_Building-Children-Table@4b5961c6f8b97ececa75ee73041b30bcbf463ae2"
+      initial_pose:
+        arm_position_rad:
+          L.shoulder_pitch: -0.5169881206
+          L.shoulder_roll:   0.4735451566
+          L.shoulder_yaw:   -0.0660594363
+          L.elbow:           0.1146306602
+          L.wrist_roll:      0.0712235057
+          L.wrist_pitch:     0.5936782714
+          L.wrist_yaw:      -0.6227451888
   # insert_table_leg: issue-70 の INSERT_LEG_OPTIMAL_FRAME0 転写。
   #   dataset: Team-RAMEN/IROS2026_RAMEN_takada_insert_table_leg_curated_optimal (1510 ep)。
   #   本番既定 Model: insert_table_leg_diffusion_optimal_100k (100k step)。
@@ -476,6 +553,22 @@ skills:
       requires_separate_hand_initialization: true
       hand_initialization_instruction: "Place the inserted table leg as recorded, then close both Dex1 hands to the dataset-matched rotate-to-tighten grasp before inference."
 
+    # 会場 (運営 WBC、--action-sink boundary) だけの開始姿勢の上書き (Issue #188、handoff の 10-2)。自前の実機 (SDK) では使わない。
+    # 肘の重力補正 (boundary_gravity_offset.joint_scale) を入れた後も、09-29 の G1 (3) の開始の手が学習の開始の中央値より
+    # 1.5 cm 以上低い手を、向きを保ったまま真上へその分 (0.5 cm 刻み) 上げた腕 7 関節 (G1 URDF の IK、胴基準)。
+    # 学習の範囲と URDF の限界の内側。source と違う開始姿勢 (別のデータの variant) には重ねない。
+    # 右手 +2.5 cm (補正後の予測 右 −2.6 / 左 −0.3 cm)。insert から移るときは手を開いてから動くので、脚を握る位置が上になるだけ。
+    boundary_profile:
+      source: "Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_curated_optimal@ec6e3a01bb587be5b491d8cbda636b717749078a"
+      initial_pose:
+        arm_position_rad:
+          R.shoulder_pitch: -0.4104820988
+          R.shoulder_roll:  -0.4916186099
+          R.shoulder_yaw:    0.1541818370
+          R.elbow:           0.1703265425
+          R.wrist_roll:      0.2473646063
+          R.wrist_pitch:     0.3213839014
+          R.wrist_yaw:       1.1206852025
   # insert_and_tighten: curated task 8 (source task sequence 0 -> 3, gap=0)。
   # arm/hand initial pose is the exact frame-0 median over the 531 episode IDs
   # sealed in both 140k/200k checkpoint train_config.json files.  The current
@@ -586,6 +679,37 @@ skills:
       dataset_revision: "0dc47877dfb2efbea796a059c81290c649bc773c"
       training_episode_count: 156
       statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2;episode_indices_0_through_155_from_checkpoint_train_config;reconstruction_sha256=df3f888c8d8be373884427532d5b41c04d39aaac0d717d63024c75735844fb8c"
+    # 会場 (運営 WBC、--action-sink boundary) だけの開始姿勢の上書き (Issue #188、handoff の 10-2)。自前の実機 (SDK) では使わない。
+    # 肘の重力補正 (boundary_gravity_offset.joint_scale) を入れた後も、09-29 の G1 (3) の開始の手が学習の開始の中央値より
+    # 1.5 cm 以上低い手を、向きを保ったまま真上へその分 (0.5 cm 刻み) 上げた腕 7 関節 (G1 URDF の IK、胴基準)。
+    # 学習の範囲と URDF の限界の内側。source と違う開始姿勢 (別のデータの variant) には重ねない。
+    # 右手 +3.0・左手 +4.0 cm (補正後の差 右 −3.1 / 左 −4.2 cm。実測の run は胴の前傾 6.3° と大きめなので、開始待ちの U / D で合わせる)。
+    boundary_profile:
+      source: "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_2@0dc47877dfb2efbea796a059c81290c649bc773c"
+      initial_pose:
+        arm_position_rad:
+          L.shoulder_pitch: -0.0059938860
+          L.shoulder_roll:   0.2267913091
+          L.shoulder_yaw:    0.2849547693
+          L.elbow:          -0.3066554659
+          L.wrist_roll:     -0.1919023891
+          L.wrist_pitch:     0.3632418915
+          L.wrist_yaw:      -0.1868250140
+          R.shoulder_pitch: -0.0720758515
+          R.shoulder_roll:  -0.3065872097
+          R.shoulder_yaw:    0.0484427003
+          R.elbow:          -0.2507574134
+          R.wrist_roll:      0.3801160907
+          R.wrist_pitch:     0.4655117760
+          R.wrist_yaw:       0.6418033597
+    # 開始待ちで U / D キーで両手を同じ量ずつ上げ下げする (会場の経路だけ)。量は右手の元の開始姿勢からの量で表す。
+    start_lift_keys:
+      hand: both
+      step_m: 0.01
+      base_lift_m: 0.03
+      min_lift_m: 0.0
+      max_lift_m: 0.07
+      joint_speed_rad_s: 0.2
     # Explicit comparisons with n17_4 must restore that artifact's own
     # flip_table_4 pose/range instead of inheriting the Phase 3 baseline.
     variant_profiles:
@@ -731,6 +855,43 @@ skills:
       training_episode_count: 2114
       statistic: "median_action_robot_q_desired_frame0_arms14;median_action_hand_cmd_frame0_dex1_2"
       requires_separate_hand_initialization: false
+    # 会場 (運営 WBC、--action-sink boundary) だけの開始姿勢の上書き (Issue #188)。自前の実機 (SDK) では使わない。
+    # 09-29 の G1 (3) では上の開始姿勢のままだと右手先が学習の開始 (腰基準 z の中央値 9.8 cm、10〜90% 7.0〜12.6)
+    # より約 4.3 cm 低い 5.6 cm になり、指先が台に接して手首を下に向けられず、斜めに入って脚を一部しか掴めなかった。
+    # 学習では開始から約 7 cm 下げながら手首を −53° まで下に向けて掴む (suzuki_pick_leg_1 file-000 の 152 episode)。
+    # 低さの内訳は肘の垂れ (約 1.9 cm。boundary_gravity_offset.joint_scale の肘 2.1 倍で消える) と、運営 WBC の
+    # 胴の前傾 (腰 pitch 3.8〜6.3°、学習の中央値 3.1°) などの残り約 2.3 cm。肘の補正と合わせて学習の中央値に来るよう、
+    # 右手先を向きを保ったまま真上へ 2.5 cm 上げた右腕 7 関節 (G1 URDF の IK、胴基準)。左腕・手の開きはそのまま。
+    # 7 関節とも teacher_joint_range と URDF の限界の内側。test_boundary_start_pose.py が上げた量と向きを確かめる。
+    # 左手も +2.5 cm (補正後の差 左 −2.4 cm)。
+    boundary_profile:
+      source: "Team-RAMEN/IROS2026_RAMEN_suzuki_pick_leg_1@4a5aef3bc43470b636f5c9d4f9102a30311b79a5"
+      initial_pose:
+        arm_position_rad:
+          L.shoulder_pitch: -0.3825123534
+          L.shoulder_roll:   0.4658745763
+          L.shoulder_yaw:   -0.1312596035
+          L.elbow:          -0.2581565800
+          L.wrist_roll:     -0.2028109815
+          L.wrist_pitch:     0.6514608046
+          L.wrist_yaw:      -0.8113332421
+          R.shoulder_pitch: -0.7056719611
+          R.shoulder_roll:  -0.2998807724
+          R.shoulder_yaw:   -0.0642482036
+          R.elbow:           0.3070188935
+          R.wrist_roll:      0.0999761831
+          R.wrist_pitch:     0.8426688793
+          R.wrist_yaw:       0.2274917550
+    # 開始待ちで U / D キーで右手先を 1 cm ずつ上げ下げする (会場の経路だけ、Issue #188)。台や脚に合わせる。
+    # 量は元の開始姿勢 (上の initial_pose = 学習の中央値) から上げた量。base_lift_m は boundary_profile で
+    # 上げた量 (test_boundary_start_pose.py が FK と突き合わせる)。変えた量はその run の中だけ効く。
+    start_lift_keys:
+      hand: right
+      step_m: 0.01
+      base_lift_m: 0.025
+      min_lift_m: 0.0
+      max_lift_m: 0.08
+      joint_speed_rad_s: 0.2
     max_grasp_retries: 2
 
     # 把持判定しきい値。dataset 実測: 自由運動時の追従誤差は ±0.02、脚を噛むと

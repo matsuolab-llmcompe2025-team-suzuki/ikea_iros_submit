@@ -361,7 +361,9 @@ for skill in ("rotate_table_base", "pick_table_leg", "insert_table_leg",
               "rotate_leg_to_tighten", "flip_table"):
     _, added = offset.apply(initial_pose_from_config(config, skill).arm_position_rad)
     worst = max(worst, float(np.max(np.abs(added))))
-assert 0.03 <= worst <= 0.12, worst
+# 肘は会場の WBC で重力補正が半分ほど足りないので 2.1 倍 (本体 #188) → 開始姿勢で 0.11〜0.144 rad。
+# 1 倍に戻った (~0.07) ら止める。上限は skill_config の max_offset_rad (0.18)。
+assert 0.10 <= worst <= 0.18, worst
 print(f"[build] gravity sag offset OK ({offset.describe()}; start poses up to {worst:.3f} rad)")
 PY
 RUN pixi run --as-is -e runtime python /tmp/probe_gravity_offset.py && rm /tmp/probe_gravity_offset.py

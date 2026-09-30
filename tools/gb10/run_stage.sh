@@ -5,7 +5,7 @@
 # 状態) を立てる。既定は指令を出さない (--actuate 無し) 起動確認だけ。
 #
 #   run_stage.sh <stage> <出力名> [ramen-venue へ足す option ...]
-#   run_stage.sh 2 stage2_all --gpu-models 2         # 例: 会場の既定 (all) を上書き
+#   run_stage.sh 2 stage2_all --gpu-models all       # 例: 会場の既定 (plan) を上書き
 #   NOSTRACE=1 run_stage.sh 1 stage1_plain            # 起動秒だけを測る (strace は起動を遅くする)
 #   ACTUATE_HOLD=60 run_stage.sh 0 stage0_actuate     # --actuate の経路 (下)
 #

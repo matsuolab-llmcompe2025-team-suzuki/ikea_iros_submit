@@ -2,26 +2,25 @@
 
 Branch: `main` of https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit
 
-The runtime is RAMEN `develop` as of
-[PR #185](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/185)
-(source `1cd5fdf` in the image, including the opt-in guard's separate measurement clock).
+The image contains RAMEN source `1b34e827c88bec1b23a20225428b9200583cac9a`
+from [PR #189](https://github.com/matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen/pull/189).
+Later commits on that PR change documentation only; the image retains the pinned source.
 
 ## Image
 
 - Platform: `linux/arm64`; one container on Thor, no team container on Orin/PC2.
-- Tag: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-guard-1cd5fdf`
+- Tag: `ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor:gb10-test-1b34e82`
 - Use this immutable reference for pull and execution:
 
 ```text
-ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19ebe27030179aa04bc9d6f8c167971699fcc6417cbc3a5f23b2d2ae7a0f8262
+ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:6ee78c2f84fe1301d74208b887bb3ab1b29eff7d30a0449dee9909435085ede2
 ```
 
-- Image config ID: `sha256:a2fcf98773e4ca738c083cb36f5dec5024867817e4d7a685d3735166e5cf1e87`.
-- RAMEN source: `1cd5fdf4d37b29edbccc5a0f0434f6d379d1a469`.
-- Image build input: `55c1a55db45a4117f761a99200d4a1977644dbf9`.
+- RAMEN source: `1b34e827c88bec1b23a20225428b9200583cac9a`.
+- Image build input: `abead33ca61cf6a2e735bfb963bd7088607feea0`.
 - Tested organizer interface: `497f3ab93e5baa706311daebd31c7a9798258450`.
 - Private GHCR read access is required. Do not put credentials in this repository.
-- [Arm64 build and push](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36567638842) succeeded. GB10 results and untested conditions are recorded below; physical Thor/G1 motion is not verified.
+- [Arm64 build and push](https://github.com/matsuolab-llmcompe2025-team-suzuki/ikea_iros_submit/actions/runs/36726824877) succeeded. This exact image has no completed GB10 Stage matrix or physical Thor/G1 verification.
 - Merge-time documentation updates do not change the built image or its build inputs.
 
 ## Preparation And Operation
@@ -51,15 +50,16 @@ Runtime reads the preloaded weights offline; the camera/state/action network rem
 
 ## Verification And Limits
 
-GB10 end-to-end validation was interrupted at the owner's request. The owner then
-requested main integration without resuming it. Default-path Stage 0 passed;
-Stage 1 was interrupted during model preparation. Remaining Stage/guard-path
-end-to-end and forward-matrix checks are pending, not passed.
+The venue arm tracking update includes a 2.1x elbow gravity offset, a bounded
+joint-lane tracking assist and new default rotate/pick/insert checkpoints. The
+tracking estimates in the source handoff are offline simulations and evaluations.
+The image build succeeded, but this digest has not completed the GB10 Stage
+matrix, model forward checks, operator-key sequence or a Thor/G1 run. Check
+the prefetched weights and venue skill-config hash before use.
 
-[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md) records this image's identity,
-verification status, retained failed attempts and limitations. The earlier
-[preparation report](GB10_PREPARATION_REPORT.md) and
-[rebuild5 report](GB10_REBUILD5_REPORT.md) are historical evidence, not proof for this image.
+[GB10_STATE_GUARD_REPORT.md](GB10_STATE_GUARD_REPORT.md), the
+[preparation report](GB10_PREPARATION_REPORT.md) and the
+[rebuild5 report](GB10_REBUILD5_REPORT.md) describe older images.
 
 These are software and non-actuating tests, not a guarantee of physical task success on Thor/G1.
 Client/transport-loss navigation retention remains tracked in

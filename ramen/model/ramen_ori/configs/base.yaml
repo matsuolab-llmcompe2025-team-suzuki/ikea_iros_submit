@@ -295,6 +295,8 @@ val:
   # 捨てられる (例: 6 skill で 40 → 1 skill 6 batch = 36 batch しか回らない)。
   # 実測 1 batch 0.41s (H100、batch 32)、val 1 回 = batch 数 × 0.41s。
   val_max_batches: 20
+  # Issue #183: 学習の前にも 1 回 val を取る (init_from の重みそのままの値を、追加学習と比べる基準にする)
+  at_start: false
   # 手首の誤差 (ee_error_exec_mm) を測る先頭の行数 = 推論の execution_steps。埋め草の行は除く (Issue #141)
   ee_error_rows: 8
   val_batch_size: null       # null → training.batch_size と同じ
@@ -342,6 +344,10 @@ training:
   # model / optim (Adam m/v) / ema shadow / lr_scheduler._step を restore して連続 train。
   # 対応 wandb resume は wandb.resume_run_id で指定 (同 run に append)。
   resume_from: null
+  # Issue #183: 学習済みの ckpt の重みだけを初期値にして新しく始める (optimizer・LR の予定・step・EMA は引き継がない、
+  # 正規化の統計は ckpt のもの)。resume_from とは同時に使えない。ckpt に無い key は補助 head (aux_head.*) だけ許す
+  init_from: null
+  init_from_weights: ema       # ema = 推論で使う EMA の重み / model = model_state_dict
   # Issue #122: ckpt を HF に push する (/nvme は Sakura の停止で消える)。every_n_ckpt × ckpt_every step ごと。
   # Issue #141: push は別 process で流し、学習は待たない (最後の push だけ学習の終わりに待つ、background_push.py)
   hf_autopush:

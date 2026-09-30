@@ -101,6 +101,15 @@ class DeferredPolicy:
     def predict(self, observation: Any) -> Any:
         return self._load().predict(observation)
 
+    def preview_target(self, steps: int) -> Any:
+        """読み込んだ policy の先の予定 (Issue #188)。未読込・口が無い policy は None。
+
+        読み込みは起こさない (predict の後に呼ぶので、通常は読み込み済み)。
+        """
+        inner = self._inner
+        preview = getattr(inner, "preview_target", None)
+        return preview(steps) if callable(preview) else None
+
     def release_after_skill(self) -> None:
         # ModelResidency owns release/load timing while a production stage is
         # active.  Closing here used to block the 30 Hz control thread for

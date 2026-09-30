@@ -196,11 +196,34 @@ class VlaSkill(Skill):
         self.last_action: PolicyAction | None = None
         self._action_queue: list[np.ndarray] = []
         self._action_queue_next_index = 0
+        # Issue #188: 会場の腕は指令から遅れるので、腕だけ予定の何 step 先を送るか。
+        # 0 = 今の step (従来どおり)。entrypoint が boundary の joint lane でだけ設定する。
+        self._arm_preview_steps = 0
+        # この tick に実際に先を見た step 数 (0 = 先の予定を送っていない)。記録用
+        self.last_arm_preview_steps = 0
+        # queue 経路 (EXECUTION_HORIZON > 1) で、実行しない chunk の残りの行。先の予定を
+        # 覗くためだけに持つ (実行する行数は変えない)。
+        self._action_lookahead: list[np.ndarray] = []
         self._operator_interrupt_pending: Callable[[], bool] = lambda: False
 
     def set_operator_interrupt_pending(self, pending: Callable[[], bool]) -> None:
         """Suppress side-channel hand/waist sends while N/R awaits the loop."""
         self._operator_interrupt_pending = pending
+
+    def set_arm_preview_steps(self, steps: int) -> None:
+        """腕だけ、予定の何 step 先を送るか (Issue #188)。0 = 今の step。
+
+        会場の運営 WBC では腕が指令から 270〜390 ms 遅れるので、少し先の予定を今送って
+        遅れを打ち消す。手 (Dex1) と腰は今の step のまま (手まで先にすると、遅れて着く
+        腕より先にグリッパが閉じる)。
+        """
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError(f"arm preview steps must be an int >= 0, got {steps!r}")
+        self._arm_preview_steps = steps
+
+    @property
+    def arm_preview_steps(self) -> int:
+        return self._arm_preview_steps
 
     def _on_start(self, params: dict) -> None:
         """episode 開始時: frame buffer + state buffer reset + policy/limiter reset。"""
@@ -231,6 +254,7 @@ class VlaSkill(Skill):
         self._hold_target_19d = None
         self._action_queue.clear()
         self._action_queue_next_index = 0
+        self._action_lookahead.clear()
 
     def _on_stop(self) -> None:
         """episode 終了時: buffersを消去し、deferred policyだけを解放する。"""
@@ -240,6 +264,7 @@ class VlaSkill(Skill):
         self._prev_action_19d = None
         self._action_queue.clear()
         self._action_queue_next_index = 0
+        self._action_lookahead.clear()
         release = getattr(self._policy, "release_after_skill", None)
         if callable(release):
             release()
@@ -289,6 +314,9 @@ class VlaSkill(Skill):
             if decision.flush_execution_state:
                 self._flush_execution_state()
 
+        # 先の予定を送った tick の、予定の今の腕 (次 tick の状態の入力に使う)
+        plan_arms: np.ndarray | None = None
+        self.last_arm_preview_steps = 0
         if decision is not None and decision.phase is not RetryPhase.RUNNING:
             current_step = self._non_policy_target(obs, decision)
             self.last_action = PolicyAction(
@@ -319,6 +347,13 @@ class VlaSkill(Skill):
                     raise ValueError("policy action_chunk must contain at least one step")
                 current_step = chunk[0]
                 self.last_action = policy_action
+                if self._arm_preview_steps:
+                    current_step, plan_arms = self._apply_arm_preview(
+                        current_step,
+                        self._preview_from_rows(list(chunk[1:]))
+                        if chunk.shape[0] > 1
+                        else self._preview_from_policy(),
+                    )
             else:
                 replanned = not self._action_queue
                 replan_action: PolicyAction | None = None
@@ -338,10 +373,21 @@ class VlaSkill(Skill):
                         for index in range(queued_steps)
                     ]
                     self._action_queue_next_index = 0
+                    self._action_lookahead = [
+                        chunk[index].astype(np.float32, copy=True)
+                        for index in range(queued_steps, chunk.shape[0])
+                    ]
 
                 current_index = self._action_queue_next_index
                 current_step = self._action_queue.pop(0)
                 self._action_queue_next_index += 1
+                if self._arm_preview_steps:
+                    current_step, plan_arms = self._apply_arm_preview(
+                        current_step,
+                        self._preview_from_rows(
+                            self._action_queue + self._action_lookahead
+                        ),
+                    )
                 source = replan_action if replan_action is not None else self.last_action
                 if source is None:  # defensive; a non-empty queue always has a source
                     raise RuntimeError("action queue has no originating PolicyAction")
@@ -428,6 +474,20 @@ class VlaSkill(Skill):
                 )
             ),
         })
+        # Issue #188: 先の予定を送る run では、予定の今の腕と実際に先を見た step 数を残す
+        # (`tracking_summary.py` は予定の今の値と実測で遅れを出す。送った値と比べると、
+        # わざと先に出した分まで遅れに見える)。先の予定を送らない run では key ごと出さない。
+        if self._arm_preview_steps:
+            action_metadata.update({
+                "arm_preview_steps": int(self._arm_preview_steps),
+                "arm_preview_used_steps": int(self.last_arm_preview_steps),
+                "plan_target_arms": [
+                    float(v)
+                    for v in (
+                        plan_arms if plan_arms is not None else current_step[ARMS_SLICE]
+                    )
+                ],
+            })
         # Issue #141 (1-4): 補正が効いた tick・関節・はみ出した量を残す (実機の記録で
         # 何回効いたかを見るため)。補正が無効な skill では key ごと出さない。
         if teacher_range_result is not None:
@@ -540,8 +600,49 @@ class VlaSkill(Skill):
             if hand.shape == (2,) and np.all(np.isfinite(hand)):
                 self._prev_hand_state = hand.copy()
         self._prev_action_19d = current_step.astype(np.float32, copy=True)
+        if plan_arms is not None:
+            # 状態の入力 (前 tick の指令) は予定の今の値。先の予定を入れると、指令と実測の
+            # 差が学習時より先の分だけ大きく見える (Issue #188)。
+            self._prev_action_19d[ARMS_SLICE] = plan_arms
 
         return arm_positions
+
+    # ---- 先の予定 (Issue #188) ---- #
+
+    def _preview_from_rows(
+        self, future_rows: list[np.ndarray]
+    ) -> tuple[np.ndarray, int] | None:
+        """今の行の後に続く予定の行から、k 先 (無ければ一番先) を選ぶ。"""
+        if not self._arm_preview_steps or not future_rows:
+            return None
+        ahead = min(self._arm_preview_steps, len(future_rows))
+        return np.asarray(future_rows[ahead - 1]), ahead
+
+    def _preview_from_policy(self) -> tuple[np.ndarray, int] | None:
+        """policy の中でならした予定 (1 行だけ返す policy) から k 先を聞く。"""
+        if not self._arm_preview_steps:
+            return None
+        preview = getattr(self._policy, "preview_target", None)
+        return preview(self._arm_preview_steps) if callable(preview) else None
+
+    def _apply_arm_preview(
+        self,
+        current_step: np.ndarray,
+        preview: tuple[np.ndarray, int] | None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """腕だけ先の予定に差し替える。(送る 19D, 予定の今の腕 or None) を返す。"""
+        self.last_arm_preview_steps = 0
+        if preview is None:
+            return current_step, None
+        row, ahead = preview
+        row = np.asarray(row).reshape(-1)
+        if row.shape != (ACTION_DIM_TOTAL,) or not np.all(np.isfinite(row[ARMS_SLICE])):
+            raise ValueError(f"preview target must be finite {ACTION_DIM_TOTAL}D, got {row.shape}")
+        plan_arms = np.asarray(current_step[ARMS_SLICE], dtype=np.float32).copy()
+        sent = np.array(current_step, copy=True)
+        sent[ARMS_SLICE] = row[ARMS_SLICE]
+        self.last_arm_preview_steps = int(ahead)
+        return sent, plan_arms
 
     # ---- private helpers ---- #
 
@@ -569,6 +670,7 @@ class VlaSkill(Skill):
             self._motion_limiter.reset()
         self._action_queue.clear()
         self._action_queue_next_index = 0
+        self._action_lookahead.clear()
         self._attempt_start_z_m = None
 
     def _return_target_19d(self, obs: dict) -> np.ndarray:

@@ -72,7 +72,7 @@ class RamenOriPolicy(nn.Module):
         skill: nn.Module,
         fusion: nn.Module,
         action_expert: nn.Module,
-        aux_head: nn.Module | None = None,   # I-6 Depth aux (Alt-3、None = I-1 baseline)
+        aux_head: nn.Module | None = None,   # 補助 head (Alt-3 の depth、Issue #183 の進み。None = なし)
         aux_weight: float = 0.1,             # aux loss weight (aux_head 有効時)
         # FK の loss (L4、Issue #129 Phase B → Issue #141 RO-16 で 3 項に作り直し)。
         # 1-step Euler で復元した予測 x̂1 を元の単位に戻し、教師の腰と合わせて 19D → URDF FK。
@@ -268,7 +268,8 @@ class RamenOriPolicy(nn.Module):
         Returns:
             {"loss": 合計 (backward する), "bc": flow matching の loss,
              FK の loss が on なら "fk_left" / "fk_right" / "fk_both" (各項) と
-             "w_left" / "w_right" / "w_both" (各項の重み), aux_head があれば "aux_depth"}
+             "w_left" / "w_right" / "w_both" (各項の重み), aux_head があれば "aux_depth" か "aux_progress",
+             "loss_action": 補助 loss を除いた合計 (補助 head の有無が違う run どうしを比べる用)}
             loss 以外は勾配を持たない
 
         batch["action_is_pad"] (B, chunk) の行 (区間末尾の埋め草) は BC と FK の loss から外す (Issue #141 RO-2)。
@@ -308,10 +309,19 @@ class RamenOriPolicy(nn.Module):
             )
             total = bc
 
-        if self.aux_head is not None and "depth_target" in batch:
-            aux_loss = self._depth_aux_loss(self.aux_head(vis_tokens), batch)
-            total = total + self.aux_weight * aux_loss
-            parts["aux_depth"] = aux_loss.detach()
+        parts["loss_action"] = total.detach()
+        # 補助 head は画像の token だけを見る。正解の key と loss を head が持っていればそれを使い
+        # (区間の進み、Issue #183 の aux_progress.ProgressHead)、持っていなければ depth (Alt-3)
+        if self.aux_head is not None:
+            target_key = getattr(self.aux_head, "target_key", "depth_target")
+            if target_key in batch:
+                aux_pred = self.aux_head(vis_tokens)
+                if hasattr(self.aux_head, "loss"):
+                    aux_loss = self.aux_head.loss(aux_pred, batch)
+                else:
+                    aux_loss = self._depth_aux_loss(aux_pred, batch)
+                total = total + self.aux_weight * aux_loss
+                parts[getattr(self.aux_head, "loss_name", "aux_depth")] = aux_loss.detach()
 
         parts["bc"] = bc.detach()
         parts["loss"] = total

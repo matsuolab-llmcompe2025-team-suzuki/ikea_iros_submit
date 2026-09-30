@@ -561,6 +561,10 @@ class ActDiffusionPolicy:
             },
         )
 
+    def preview_target(self, steps: int) -> tuple[np.ndarray, int] | None:
+        """この tick に返した目標から steps 先の予定 (会場の腕の遅れ用、Issue #188)。"""
+        return self._executor.preview_target(steps)
+
     def reset(self) -> None:
         """skill 遷移 / episode 開始時 (VlaSkill._on_start)。前 skill の chunk と観測を捨てる。"""
         self._executor.reset()

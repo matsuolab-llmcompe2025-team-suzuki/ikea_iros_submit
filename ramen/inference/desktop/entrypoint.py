@@ -137,6 +137,8 @@ _DEFAULT_PICK_LEG_HYBRID_CONFIG: Path = (
     / "configs"
     / "pick_leg_hybrid.yaml"
 )
+# hybrid pick の区間 1 の既定 (実機で確かめた GR00T)。使ってよい model の一覧は
+# pick_leg_hybrid.HYBRID_PHASE1_VARIANTS (先頭がこれ。Issue #188 で RAMEN-Ori を追加)
 PRODUCTION_HYBRID_PICK_VARIANT = "groot_pick_legs_v1"
 
 
@@ -719,6 +721,101 @@ def apply_default_policy_variants(
     return source
 
 
+def resolve_policy_alternatives(
+    args: argparse.Namespace, *, config_path: Path
+) -> dict[str, tuple]:
+    """この run の slot ごとに、R で選べる候補 (`PolicyAlternative`) を決める (Issue #188)。
+
+    `apply_default_policy_variants` の後に呼ぶ。既定 (CLI・`--policy-variant-set`
+    で決まった後の物) と同じ候補は除く。pick は「hybrid で使うか」まで同じときだけ除く
+    (`pick_leg_hybrid: false` の候補は、既定と同じ variant でも別のやり方)。この run が
+    使わない slot と、候補の無い slot は入れない。結果は `args.policy_alternatives` にも置く。
+
+    既定が hybrid でない run で hybrid を組めない (手首カメラ・手の経路など、`hybrid_pick_unavailable`)
+    ときは、hybrid の候補だけを WARNING を出して外す (既定の pick は動けるので止めない)。
+
+    Raises:
+        ValueError: hybrid で使う pick の候補が、hybrid の区間 1 に使えない variant
+            (`pick_leg_hybrid.HYBRID_PHASE1_VARIANTS` に無い) のとき (書き方の誤り)。
+    """
+
+    from inference.desktop.lower_policy.policies.config_loader import (
+        load_alternatives_by_skill,
+    )
+
+    required = required_policy_slots(args)
+    alternatives = load_alternatives_by_skill(config_path) if required else {}
+    hybrid_run = bool(getattr(args, "pick_leg_hybrid", False))
+    resolved: dict[str, tuple] = {}
+    for slot in required:
+        main_variant = getattr(args, _POLICY_SLOT_ATTRS[slot])
+        candidates = []
+        for alternative in alternatives.get(_POLICY_SLOT_SKILLS[slot], ()):
+            hybrid = slot == "pick" and alternative_uses_hybrid(alternative, hybrid_run)
+            if alternative.variant == main_variant and hybrid == (
+                hybrid_run and slot == "pick"
+            ):
+                continue
+            if hybrid:
+                from inference.desktop.pick_leg_hybrid import HYBRID_PHASE1_VARIANTS
+
+                if alternative.variant not in HYBRID_PHASE1_VARIANTS:
+                    raise ValueError(
+                        f"alternatives_by_skill.pick_table_leg has {alternative.variant!r}, "
+                        "which the hybrid cannot run in Phase 1 "
+                        f"({list(HYBRID_PHASE1_VARIANTS)}); write it as "
+                        "{variant: <name>, pick_leg_hybrid: false} to run it without the hybrid"
+                    )
+                if not hybrid_run:
+                    reason = hybrid_pick_unavailable(args)
+                    if reason is not None:
+                        # 既定の pick は動けるので止めない。hybrid の候補だけ外す (PR #189 の review)
+                        print(
+                            f"[init] WARNING: the hybrid pick candidate {alternative.variant!r} "
+                            f"is dropped: {reason}",
+                            file=sys.stderr,
+                        )
+                        continue
+            candidates.append(alternative)
+        if candidates:
+            resolved[slot] = tuple(candidates)
+    args.policy_alternatives = resolved
+    return resolved
+
+
+def alternative_uses_hybrid(alternative, hybrid_run: bool) -> bool:
+    """pick の候補を hybrid で使うか (名前だけの候補は既定と同じやり方、Issue #188)。"""
+    if alternative.pick_leg_hybrid is None:
+        return hybrid_run
+    return bool(alternative.pick_leg_hybrid)
+
+
+def without_hybrid_pick_alternatives(alternatives: dict, hybrid_run: bool) -> dict:
+    """pick の hybrid の候補を外した候補 (hybrid を用意できなかった run 用、Issue #188)。"""
+    result = dict(alternatives)
+    kept = tuple(
+        alternative
+        for alternative in result.get("pick", ())
+        if not alternative_uses_hybrid(alternative, hybrid_run)
+    )
+    if kept:
+        result["pick"] = kept
+    else:
+        result.pop("pick", None)
+    return result
+
+
+def describe_policy_alternative(alternative, *, slot: str, hybrid_run: bool) -> str:
+    """候補の表示名 (起動の log と R の画面、Issue #188)。
+
+    pick は、hybrid の run か hybrid の候補なら「hybrid」「hybrid なし」を添える。
+    """
+    hybrid = alternative_uses_hybrid(alternative, hybrid_run)
+    if slot != "pick" or not (hybrid_run or hybrid):
+        return alternative.variant
+    return f"{alternative.variant}（{'hybrid' if hybrid else 'hybrid なし'}）"
+
+
 def resolve_production_pick_mode(args: argparse.Namespace) -> bool:
     """Default Stage 1--4 SDK and boundary runs to the hybrid pick pipeline.
 
@@ -729,6 +826,10 @@ def resolve_production_pick_mode(args: argparse.Namespace) -> bool:
 
     Returns True when this function installed the production default.  An
     explicit ``--no-pick-leg-hybrid`` remains available for comparison tests.
+
+    Issue #188: whether the default is the hybrid comes from ``policy_config.yaml``'s
+    ``pick_leg_hybrid`` (``false`` = the learned pick policy does the whole pick; the
+    hybrid stays available as an R-time candidate).  ``--pick-leg-hybrid`` still wins.
     """
 
     if getattr(args, "phase3_full", False):
@@ -743,11 +844,38 @@ def resolve_production_pick_mode(args: argparse.Namespace) -> bool:
     needs_pick = bool(selected.intersection({1, 2, 3, 4}))
     # The production pick algorithm must not change merely because the venue
     # transport is selected.  The official rig omits Dex1 feedback, so the
-    # boundary lane uses the required command echo plus visual/VLM checks; it
-    # must not silently fall back to the obsolete learned-only pick expert.
-    enabled = needs_pick
+    # boundary lane uses the required command echo plus visual/VLM checks.
+    from inference.desktop.lower_policy.policies.config_loader import (
+        DEFAULT_CONFIG_PATH,
+        load_pick_leg_hybrid_default,
+    )
+
+    enabled = needs_pick and load_pick_leg_hybrid_default(
+        getattr(args, "policy_config", None) or DEFAULT_CONFIG_PATH
+    )
     args.pick_leg_hybrid = enabled
     return enabled
+
+
+def hybrid_pick_unavailable(args: argparse.Namespace) -> Optional[str]:
+    """この run で hybrid pick を組めない理由 (組めるなら None、Issue #188)。
+
+    hybrid の R の候補を、既定が hybrid でない run でも作るときに確かめる
+    (`_validate_phase3_config` が hybrid の run に求めるのと同じ条件)。
+    """
+    if getattr(args, "no_wrist_cameras", False):
+        return "the hybrid pick needs both wrist cameras"
+    boundary_hand = getattr(args, "action_sink", "sdk") == "boundary" and getattr(
+        args, "synthetic_hand_state", False
+    )
+    if not getattr(args, "use_real_hand", False) and not boundary_hand:
+        return (
+            "the hybrid pick needs --use-real-hand on the SDK lane or "
+            "--synthetic-hand-state on the boundary lane"
+        )
+    if getattr(args, "pick_leg_phase3_executor", "rule_based") != "rule_based":
+        return "the hybrid pick needs --pick-leg-phase3-executor rule_based"
+    return None
 
 
 def _validate_phase3_config(args: argparse.Namespace) -> None:
@@ -860,13 +988,15 @@ def _validate_phase3_config(args: argparse.Namespace) -> None:
         if variants["pick"] is None:
             raise ValueError(
                 "--pick-leg-hybrid requires --policy-variant-pick for its "
-                "Phase 1 GR00T expert"
+                "Phase 1 expert"
             )
-        if variants["pick"] != PRODUCTION_HYBRID_PICK_VARIANT:
+        from inference.desktop.pick_leg_hybrid import HYBRID_PHASE1_VARIANTS
+
+        if variants["pick"] not in HYBRID_PHASE1_VARIANTS:
             raise ValueError(
-                "production --pick-leg-hybrid is pinned to the physically "
-                f"validated variant {PRODUCTION_HYBRID_PICK_VARIANT!r}; got "
-                f"{variants['pick']!r}"
+                "--pick-leg-hybrid runs Phase 1 only with "
+                f"{list(HYBRID_PHASE1_VARIANTS)} (pick_leg_hybrid.HYBRID_PHASE1_VARIANTS; "
+                f"the first is the physically validated default); got {variants['pick']!r}"
             )
         if getattr(args, "pick_leg_phase3_executor", "rule_based") != "rule_based":
             raise ValueError(
@@ -1326,7 +1456,9 @@ def parse_args() -> argparse.Namespace:
             "GPU に置く learned model の数 (Issue #141 束 1-12)。1 (既定) = 実行中の"
             " 1 個だけ、2 = 実行中 + 次の 1 個を裏で先読み、all = stage の全部。"
             " 先読みは 1 本の thread で順番に行う。実機で tick の周期と GPU の使用量を"
-            " 測ってから上げること"
+            " 測ってから上げること。plan = 1 Stage の run で、最初の skill の main だけを"
+            " 起動時に待ち、残り (R で選ぶ候補を含む) を policy_config.yaml の"
+            " model_loading の順に、腕が止まっている間だけ 1 本ずつ読む (Issue #188)"
         ),
     )
     # Issue #125 Phase B-1/B-3: VLA actuator の real 化 flag (opt-in で mock fallback)。
@@ -1597,6 +1729,47 @@ def parse_args() -> argparse.Namespace:
         help=(
             "--boundary-gravity-offset の倍率 (既定 1.0 = YAML の kp どおり)。会場の保持で測った"
             "垂れに合わせる (check_boundary_hold.py が提案値を出す)。0..2"
+        ),
+    )
+    p.add_argument(
+        "--arm-tuning",
+        choices=("today", "standard", "lead"),
+        default=None,
+        help=(
+            "--action-sink boundary の joint lane で、腕の遅れ・押し負けを補う送り方の束"
+            " (skill_config.yaml の boundary_arm_tracking.presets、省略時は default_preset)。"
+            "today = 09-29 と同じ送り方、standard = 押している間の間隔と押し込み + 腕だけ"
+            " policy の予定の少し先を送る、lead = standard + 先読み。Issue #188"
+        ),
+    )
+    p.add_argument(
+        "--arm-lead-horizon-s",
+        type=float,
+        default=None,
+        help="--arm-tuning の先読みの時間 [s] を会場で合わせるための上書き (0 = 先読みしない、0..0.5)",
+    )
+    p.add_argument(
+        "--arm-push-max-rad",
+        type=float,
+        default=None,
+        help="--arm-tuning の押し込み補正の上限 [rad] を会場で合わせるための上書き (0 = 押し込まない、0..0.2)",
+    )
+    p.add_argument(
+        "--arm-preview-s",
+        type=float,
+        default=None,
+        help=(
+            "--arm-tuning の、腕だけ policy の予定の何秒先を送るか [s] を会場で合わせるための"
+            "上書き (0 = 今の予定のまま、0..0.5)。Issue #188"
+        ),
+    )
+    p.add_argument(
+        "--arm-blocked-period-s",
+        type=float,
+        default=None,
+        help=(
+            "--arm-tuning の、押している間の送る間隔 [s] を会場で合わせるための上書き"
+            " (0 = 延ばさない、0..1.0、--boundary-hold-refresh-s 以下)"
         ),
     )
     p.add_argument(
@@ -2073,15 +2246,22 @@ def _gate_arrival_check(target_arm, task_space_checker, tolerance_rad: float):
 
     ``task_space_checker`` は `_boundary_convergence_checker` の返り値 (pose lane は手先で比べる
     関数、sdk・joint lane は None)。None なら関節角で比べる (準備動作の許容と同じ)。
+    ``target_arm`` は腕 14 関節か、それを返す関数 (開始待ちで U / D により目標が変わる
+    skill、Issue #188)。関数なら毎回そのときの目標と比べる。
     """
     import numpy as np
 
     from inference.desktop.lower_policy.initial_pose import ARM_JOINT_ORDER
     from inference.desktop.lower_policy.skills.operator_gate import joint_space_arrival
 
-    target = np.asarray(target_arm, dtype=np.float64).reshape(-1).copy()
+    if callable(target_arm):
+        target_fn = target_arm
+    else:
+        fixed = np.asarray(target_arm, dtype=np.float64).reshape(-1).copy()
+        target_fn = lambda: fixed  # noqa: E731
 
     def _check(measured_arm):
+        target = np.asarray(target_fn(), dtype=np.float64).reshape(-1)
         if task_space_checker is not None:
             # 速さは gate では見ない (腕は保持中)。位置と向きだけ
             ok, detail = task_space_checker(target, measured_arm, np.zeros(14))
@@ -2238,6 +2418,247 @@ def build_boundary_gravity_offset(args: argparse.Namespace, skill_config: dict):
     )
 
 
+def build_boundary_arm_tracking(args: argparse.Namespace, skill_config: dict):
+    """会場の joint lane の腕の遅れ・押し負けの補いを作る。使わないときは None (Issue #188)。
+
+    作れない (YAML の不備・値の範囲外) ときは例外。起動の最初に呼び、指令を出す前に止める。
+    09-29 と同じ送り方に戻すなら `--arm-tuning today`。
+    """
+    if getattr(args, "action_sink", "sdk") != "boundary":
+        return None
+    if getattr(args, "boundary_lane", "joint") != "joint":
+        return None
+    from inference.desktop.lower_policy.actuators.arm_tracking_assist import (
+        ArmTrackingAssist,
+        ArmTrackingConfig,
+    )
+
+    config, name = ArmTrackingConfig.from_config(
+        skill_config,
+        getattr(args, "arm_tuning", None),
+        lead_horizon_s=getattr(args, "arm_lead_horizon_s", None),
+        blocked_period_s=getattr(args, "arm_blocked_period_s", None),
+        push_max_rad=getattr(args, "arm_push_max_rad", None),
+        preview_s=getattr(args, "arm_preview_s", None),
+    )
+    refresh = float(getattr(args, "boundary_hold_refresh_s", 0.0))
+    if refresh and config.blocked_period_s > refresh:
+        raise ValueError(
+            f"arm tracking blocked period {config.blocked_period_s:g}s must be <= "
+            f"--boundary-hold-refresh-s {refresh:g}s"
+        )
+    return ArmTrackingAssist(config, name=name)
+
+
+def apply_arm_preview(skill_registry: dict, arm_tracking, control_hz: float) -> int:
+    """学習済みの skill に、腕だけ予定の何 step 先を送るかを設定する (Issue #188)。
+
+    会場の joint lane (`arm_tracking` がある) でだけ効く。自前の実機 (SDK) では
+    `arm_tracking` が None なので 0 = 今の予定のまま。設定した step 数を返す。
+    """
+    from inference.desktop.orchestrator import LEARNED_STAGE_SKILLS
+
+    steps = 0 if arm_tracking is None else arm_tracking.config.preview_steps(control_hz)
+    if not steps:
+        return 0
+    applied = []
+    for name in sorted(LEARNED_STAGE_SKILLS):
+        setter = getattr(skill_registry.get(name), "set_arm_preview_steps", None)
+        if callable(setter):
+            setter(steps)
+            applied.append(name)
+    print(
+        f"[boundary] arm preview: arms get the policy plan {steps} ticks "
+        f"({arm_tracking.config.preview_s:g}s) ahead; hands/waist stay on the current step "
+        f"({', '.join(applied) or 'no learned skill'})",
+        file=sys.stderr,
+    )
+    return steps
+
+
+def build_start_lift_adjuster(skill_config: dict, skill_name: str, action_sink: str, base_arm14):
+    """開始待ちで U / D キーで手の高さを変える部品 (会場の経路の、設定のある skill だけ、Issue #188)。
+
+    ``base_arm14`` は会場の開始姿勢 (``boundary_profile`` を重ねた後)。無ければ None。
+    """
+    if action_sink != "boundary":
+        return None
+    from inference.desktop.lower_policy.skills.start_lift import (
+        StartLiftAdjuster,
+        StartLiftConfig,
+    )
+
+    section = skill_config["skills"].get(skill_name) or {}
+    config = StartLiftConfig.from_skill(section, skill_name)
+    if config is None:
+        return None
+    teacher = (section.get("teacher_joint_range") or {}).get("arm_position_rad")
+    return StartLiftAdjuster(base_arm14, config, teacher_range=teacher)
+
+
+def plan_models_for_stage(
+    sequence: Sequence[str],
+    main_policies: dict,
+    *,
+    main_variants: dict[str, str],
+    main_kinds: dict[str, str],
+    candidates: dict[str, Sequence[tuple[str, str, object]]],
+    before_main: Optional[dict[str, Sequence[object]]] = None,
+    ckpt_refs: Optional[dict[str, str]] = None,
+    before_candidates: Optional[dict[str, Sequence[object]]] = None,
+) -> list:
+    """`--gpu-models plan` で読む model を並べる (Issue #188 ② 段 2)。
+
+    skill は stage の列の順。skill ごとに main を先に、候補を `alternatives_by_skill` の
+    順に並べる。``candidates`` は skill → (variant 名, policy_type, policy) の列。
+    ``before_main`` は main の前に読む、main と同じく保持が待つ `PlannedModel`
+    (hybrid pick の VLM)。``before_candidates`` は候補の前に読む候補の一部 (既定が hybrid で
+    ない run の、hybrid の候補が使う VLM)。``ckpt_refs`` (variant 名 → ckpt_ref) があれば、
+    読み終わった重みの file をページキャッシュから落とす。
+    """
+    from inference.desktop.lower_policy.policies.load_plan import PlannedModel
+    from inference.desktop.lower_policy.policies.page_cache import ckpt_ref_files
+
+    def _weights(variant: str):
+        ref = (ckpt_refs or {}).get(variant)
+        return None if ref is None else (lambda: ckpt_ref_files(ref))
+
+    models = []
+    for skill in dict.fromkeys(sequence):
+        if skill not in main_policies:
+            continue
+        models.extend((before_main or {}).get(skill, ()))
+        models.append(
+            PlannedModel(
+                skill=skill,
+                label=f"{skill} main {main_variants[skill]}",
+                kind=main_kinds[skill],
+                policy=main_policies[skill],
+                variant=main_variants[skill],
+                weight_files=_weights(main_variants[skill]),
+            )
+        )
+        models.extend((before_candidates or {}).get(skill, ()))
+        for variant, kind, policy in candidates.get(skill, ()):
+            models.append(
+                PlannedModel(
+                    skill=skill,
+                    label=f"{skill} candidate {variant}",
+                    kind=kind,
+                    policy=policy,
+                    required=False,
+                    variant=variant,
+                    weight_files=_weights(variant),
+                )
+            )
+    return models
+
+
+def candidate_skill_config(
+    skill_config: dict,
+    yaml_config: dict,
+    skill_name: str,
+    variant_name: str,
+    action_sink: str,
+) -> dict:
+    """R で選ぶ候補の skill を組み立てる設定 (Issue #188 ② 段 3)。
+
+    全体の節 (手の開度など) はこの run の設定 (``skill_config``) のまま。その skill の節だけを、
+    main の variant の profile を重ねる前の yaml (``yaml_config``) から、候補の profile →
+    会場の開始姿勢 (boundary のとき) の順に作り直す。flip の既定 (legacy_fk) の手先の offset を
+    候補に引き継がない。pick の hybrid が外した腰の送りも yaml の値に戻る。
+    """
+    import copy
+
+    from inference.desktop.lower_policy.initial_pose import (
+        apply_boundary_profiles,
+        apply_policy_variant_profile,
+    )
+
+    rebuilt = apply_policy_variant_profile(yaml_config, skill_name, variant_name)
+    if action_sink == "boundary":
+        rebuilt, _ = apply_boundary_profiles(rebuilt)
+    result = copy.deepcopy(skill_config)
+    result["skills"][skill_name] = rebuilt["skills"][skill_name]
+    return result
+
+
+def start_pose_difference(main_pose, candidate_pose) -> Optional[str]:
+    """候補の開始姿勢が main と違えば、何が違うかの 1 行 (同じなら None、Issue #188 ② 段 3)。
+
+    R の後の戻る先・開始待ちの到達の判定・U / D の基準は main の開始姿勢で作るので、
+    候補は同じ開始姿勢でなければならない。
+    """
+    import numpy as np
+
+    main_arm = np.asarray(main_pose.arm_position_rad, dtype=np.float64)
+    candidate_arm = np.asarray(candidate_pose.arm_position_rad, dtype=np.float64)
+    if not np.allclose(main_arm, candidate_arm, rtol=0.0, atol=1e-9):
+        worst = int(np.argmax(np.abs(main_arm - candidate_arm)))
+        return (
+            f"arm joint {worst} differs by "
+            f"{abs(main_arm[worst] - candidate_arm[worst]):.4f} rad"
+        )
+    if not np.allclose(
+        main_pose.dex1_target_rad, candidate_pose.dex1_target_rad, rtol=0.0, atol=1e-9
+    ):
+        return (
+            f"Dex1 start {tuple(candidate_pose.dex1_target_rad)} vs "
+            f"{tuple(main_pose.dex1_target_rad)}"
+        )
+    if bool(main_pose.requires_separate_hand_initialization) != bool(
+        candidate_pose.requires_separate_hand_initialization
+    ):
+        return "requires_separate_hand_initialization differs"
+    return None
+
+
+def install_leave_barriers(
+    skill_registry: dict, policy_names, may_leave, stay=None
+) -> list[str]:
+    """止まっている区間から動き出す関所に「読みかけの 1 本を待つ」を付ける (Issue #188)。
+
+    `--gpu-models plan` は腕が止まっている間だけ model を読む。関所 (開始待ちの Enter・
+    R の後の待ち) は、読みかけの 1 本が終わってから先へ進む。関所が Enter の確認を
+    取り消したら ``stay`` を呼ぶ (読み込みを続けさせる)。付けた関所の名前を返す。
+    """
+    from inference.desktop.lower_policy.policies.load_plan import EXIT_GATE_PREFIXES
+
+    installed = []
+    for policy in policy_names:
+        for prefix in EXIT_GATE_PREFIXES:
+            gate = skill_registry.get(f"{prefix}{policy}")
+            setter = getattr(gate, "set_leave_barrier", None)
+            if callable(setter):
+                setter(
+                    may_leave,
+                    description="the model being loaded finishes",
+                    cancel_fn=stay,
+                )
+                installed.append(f"{prefix}{policy}")
+    return installed
+
+
+def apply_venue_start_poses(skill_config: dict, action_sink: str) -> dict:
+    """会場の経路でだけ、skill_config の `boundary_profile` の開始姿勢を重ねる (Issue #188)。
+
+    運営 WBC の立ち方 (胴の前傾) で下がる分を直した開始姿勢。自前の実機 (SDK) は学習時と
+    同じ開始姿勢のまま使う。
+    """
+    if action_sink != "boundary":
+        return skill_config
+    from inference.desktop.lower_policy.initial_pose import apply_boundary_profiles
+
+    profiled, skills = apply_boundary_profiles(skill_config)
+    if skills:
+        print(
+            "[init] venue start poses (boundary_profile, organizer WBC stance): "
+            + ", ".join(skills),
+            file=sys.stderr,
+        )
+    return profiled
+
+
 def resolve_include_hand_in_head(
     args: argparse.Namespace, selected_stages: Sequence[int]
 ) -> bool:
@@ -2280,16 +2701,38 @@ def main() -> None:
         validate_boundary_publish_args(args)
     except ValueError as exc:
         sys.exit(f"Official boundary configuration rejected: {exc}")
-    pick_mode_defaulted = resolve_production_pick_mode(args)
+    try:
+        pick_mode_defaulted = resolve_production_pick_mode(args)
+    except (ValueError, OSError) as exc:
+        sys.exit(f"Phase 3 configuration rejected: {exc}")
     rule_based_pick_active = args.rule_based_pick_table_leg
     phase3_active = args.stage is not None or args.phase3_full or rule_based_pick_active
     # stage の選び方はここで 1 回だけ決める。記録の metadata (7 節) や先読みの列 (8 節)
     # など、後の複数の場所から読むため、分岐の中で作らない。
     first_phase3_stage, selected_stages = resolve_stage_selection(args)
     include_hand_in_head = resolve_include_hand_in_head(args, selected_stages)
-    # --gpu-models: "all" は None (= stage の全部を GPU に置く)、それ以外は 1 以上の int。
-    if str(args.gpu_models).lower() == "all":
-        gpu_models: Optional[int] = None
+    # --gpu-models: "all" は None (= stage の全部を GPU に置く)、"plan" は決めた順に
+    # 1 本ずつ (Issue #188、1 Stage の run だけ)、それ以外は 1 以上の int。
+    load_plan_active = str(args.gpu_models).lower() == "plan"
+    model_loading = None
+    if load_plan_active:
+        if args.stage is None or args.phase3_full or rule_based_pick_active:
+            sys.exit(
+                "--gpu-models plan needs a single --stage N run "
+                "(not --phase3-full / --rule-based-pick-table-leg)"
+            )
+        from inference.desktop.lower_policy.policies.config_loader import (
+            load_model_loading,
+        )
+
+        try:
+            model_loading = load_model_loading(args.policy_config)
+        except (ValueError, OSError) as exc:
+            sys.exit(f"--gpu-models plan rejected: {exc}")
+        # plan でも model は DeferredPolicy に包む (読む・解放するのは LoadPlan)
+        gpu_models: Optional[int] = 1
+    elif str(args.gpu_models).lower() == "all":
+        gpu_models = None
     else:
         try:
             gpu_models = int(args.gpu_models)
@@ -2323,13 +2766,16 @@ def main() -> None:
         variant_source = apply_default_policy_variants(
             args, config_path=args.policy_config
         )
+        policy_alternatives = resolve_policy_alternatives(
+            args, config_path=args.policy_config
+        )
         _validate_phase3_config(args)
     except (ValueError, OSError) as exc:
         sys.exit(f"Phase 3 configuration rejected: {exc}")
     if pick_mode_defaulted:
         print(
             "[init] production pick mode defaulted to hybrid: "
-            "VLM -> groot_pick_legs_v1 -> IK/MP -> rule-based handover -> "
+            f"VLM -> {args.policy_variant_pick} -> IK/MP -> rule-based handover -> "
             "insert frame-zero",
             file=sys.stderr,
         )
@@ -2342,6 +2788,38 @@ def main() -> None:
             ),
             file=sys.stderr,
         )
+    if policy_alternatives:
+        print(
+            "[init] policy candidates: "
+            + " ".join(
+                f"{slot}="
+                + ",".join(
+                    describe_policy_alternative(
+                        candidate, slot=slot, hybrid_run=bool(args.pick_leg_hybrid)
+                    )
+                    for candidate in candidates
+                )
+                for slot, candidates in policy_alternatives.items()
+            ),
+            file=sys.stderr,
+        )
+        if not load_plan_active:
+            print(
+                "[init] WARNING: policy candidates are loaded only with "
+                "--gpu-models plan; this run uses the defaults only",
+                file=sys.stderr,
+            )
+    # 既定が hybrid でない run の、hybrid の R の候補 (Issue #188)。候補は plan のときだけ作るので、
+    # そのときだけ hybrid の設定・VLM を用意する。
+    hybrid_pick_candidates = (
+        load_plan_active
+        and not args.pick_leg_hybrid
+        and any(
+            alternative_uses_hybrid(alternative, False)
+            for alternative in policy_alternatives.get("pick", ())
+        )
+    )
+    needs_hybrid_pick = bool(args.pick_leg_hybrid or hybrid_pick_candidates)
     phase1_profile: str | None = None
     if args.phase1_11_arm_only:
         phase1_profile = "1.11"
@@ -2426,9 +2904,17 @@ def main() -> None:
         apply_policy_variant_profile,
     )
 
+    # R で選ぶ候補の skill は、main の variant の profile を重ねる前の yaml から作る
+    # (Issue #188 ② 段 3)。以下の書き換えはどれも新しい dict に対して行う
+    # (apply_policy_variant_profile が deepcopy を返す) ので、これは読んだままの値。
+    skill_cfg_yaml = skill_cfg_raw
     skill_cfg_raw = apply_policy_variant_profile(
         skill_cfg_raw, "flip_table", args.policy_variant_flip
     )
+    try:
+        skill_cfg_raw = apply_venue_start_poses(skill_cfg_raw, args.action_sink)
+    except ValueError as exc:
+        sys.exit(f"skill config invalid: {exc}")
     from inference.desktop.lower_policy.skills.hand_ramp import resolve_hand_opening_rad
 
     opening = resolve_hand_opening_rad(skill_cfg_raw, action_sink=args.action_sink)
@@ -2443,6 +2929,14 @@ def main() -> None:
             "Official boundary configuration rejected: gravity sag offset could not be "
             f"built ({type(exc).__name__}: {exc}). Fix it, or pass "
             "--boundary-gravity-offset off to run without it."
+        )
+    try:
+        boundary_arm_tracking = build_boundary_arm_tracking(args, skill_cfg_raw)
+    except Exception as exc:  # noqa: BLE001 - 起動前に止める
+        sys.exit(
+            "Official boundary configuration rejected: arm tracking could not be built "
+            f"({type(exc).__name__}: {exc}). Fix it, or pass --arm-tuning today to send "
+            "as on 09-29."
         )
     skills_section: dict = skill_cfg_raw["skills"]
 
@@ -2461,60 +2955,105 @@ def main() -> None:
         args.setup_hold_sec = _hold_assembly.hold_sec_from_config(skill_cfg_raw)
     hybrid_pick_cfg = None
     hybrid_pick_runtime: Optional[dict[str, object]] = None
-    if args.pick_leg_hybrid:
-        # Do the network/model/reference-image check before constructing any
-        # actuator.  A missing VLM can therefore never acquire arm_sdk/Dex1.
-        from inference.desktop.pick_leg_hybrid.real_skill import (
-            load_reference_images,
-            probe_vlm_endpoint,
-        )
-
-        hybrid_pick_cfg, references = load_reference_images(
-            args.pick_leg_hybrid_config,
-            endpoint_override=args.pick_leg_vlm_endpoint,
-            model_override=args.pick_leg_vlm_model,
-        )
-        if args.spawn_vlm_server:
-            # 会場: VLM をこの run の子 process として立てる。止めるのは終了時の
-            # _close_policy_resources (例外・Ctrl-C でも通る)。
+    # --gpu-models plan: VLM は起動時に待たず、読む順番の中 (pick の GR00T の前) で起動する
+    planned_vlm = None
+    if needs_hybrid_pick:
+        try:
+            # Do the network/model/reference-image check before constructing any
+            # actuator.  A missing VLM can therefore never acquire arm_sdk/Dex1.
             from inference.desktop.pick_leg_hybrid.real_skill import (
-                build_vlm_self_check_images,
-            )
-            from inference.desktop.pick_leg_hybrid.vlm_server import (
-                VenueVlmServer,
-                check_venue_endpoint,
-                warm_up_vlm,
+                load_reference_images,
+                probe_vlm_endpoint,
             )
 
-            try:
-                check_venue_endpoint(hybrid_pick_cfg.vlm.endpoint)
-            except ValueError as exc:
-                sys.exit(str(exc))
-            vlm_log_dir = args.log.parent if args.log is not None else _DEFAULT_LOG_DIR
-            vlm_server = VenueVlmServer(
-                vlm_log_dir / f"vlm_{time.strftime('%Y-%m-%dT%H-%M-%S')}.log"
+            hybrid_pick_cfg, references = load_reference_images(
+                args.pick_leg_hybrid_config,
+                endpoint_override=args.pick_leg_vlm_endpoint,
+                model_override=args.pick_leg_vlm_model,
             )
-            _register_policy_resource(vlm_server)
-            vlm_server.start()
-            vlm_server.wait_until_ready()
-            warm_up_vlm(
-                hybrid_pick_cfg,
-                build_vlm_self_check_images(hybrid_pick_cfg, references),
+            if args.spawn_vlm_server:
+                # 会場: VLM をこの run の子 process として立てる。止めるのは終了時の
+                # _close_policy_resources (例外・Ctrl-C でも通る)。
+                from inference.desktop.pick_leg_hybrid.real_skill import (
+                    build_vlm_self_check_images,
+                )
+                from inference.desktop.pick_leg_hybrid.vlm_server import (
+                    VenueVlmServer,
+                    check_venue_endpoint,
+                    warm_up_vlm,
+                )
+
+                try:
+                    check_venue_endpoint(hybrid_pick_cfg.vlm.endpoint)
+                except ValueError as exc:
+                    sys.exit(str(exc))
+                vlm_log_dir = args.log.parent if args.log is not None else _DEFAULT_LOG_DIR
+                vlm_server = VenueVlmServer(
+                    vlm_log_dir / f"vlm_{time.strftime('%Y-%m-%dT%H-%M-%S')}.log"
+                )
+                _register_policy_resource(vlm_server)
+                if load_plan_active:
+                    # VLM が起動しなければ pick の前の保持が止める (安全停止、Issue #188)。
+                    # Stage 1 は pick が最初の skill なので、今までどおり動かす前に待つ。
+                    # 既定が hybrid でない run では hybrid の候補の一部 (起動しなければ候補を選べないだけ)。
+                    from inference.desktop.pick_leg_hybrid.planned_vlm import PlannedVlm
+
+                    planned_vlm = PlannedVlm(vlm_server, hybrid_pick_cfg, references)
+                else:
+                    vlm_server.start()
+                    vlm_server.wait_until_ready()
+                    warm_up_vlm(
+                        hybrid_pick_cfg,
+                        build_vlm_self_check_images(hybrid_pick_cfg, references),
+                    )
+            if planned_vlm is not None:
+                hybrid_pick_runtime = {
+                    "config": str(args.pick_leg_hybrid_config.resolve()),
+                    "phase3_executor": args.pick_leg_phase3_executor,
+                    "reference_count": len(references),
+                    "vlm": (
+                        "started by the load plan before the pick main"
+                        if args.pick_leg_hybrid
+                        else "started by the load plan for the hybrid R-time candidates"
+                    ),
+                }
+                print(
+                    "[hybrid] VLM starts in the load plan (before the pick main); "
+                    "the hold before pick waits for it"
+                    if args.pick_leg_hybrid
+                    else "[hybrid] VLM starts in the load plan for the hybrid R-time pick "
+                    "candidates (the default pick does not wait for it)",
+                    file=sys.stderr,
+                )
+            else:
+                endpoint = probe_vlm_endpoint(hybrid_pick_cfg, references)
+                hybrid_pick_runtime = {
+                    "config": str(args.pick_leg_hybrid_config.resolve()),
+                    "phase3_executor": args.pick_leg_phase3_executor,
+                    "reference_count": len(references),
+                    **endpoint,
+                }
+                print(
+                    "[hybrid] production VLM/GR00T/MP preflight passed: "
+                    f"model={endpoint['model']} references={len(references)} "
+                    f"vlm_latency={endpoint.get('multimodal_latency_sec', float('nan')):.2f}s "
+                    "phase3=rule_based; pick waist/legs=Regular",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001 - 既定の pick が hybrid なら今までどおり止める
+            if args.pick_leg_hybrid:
+                raise
+            # 既定の pick が hybrid でない run: hybrid の候補を外して続ける (Issue #188、PR #189 の review)。
+            # 既定の pick は VLM も参照画像も使わない。
+            print(
+                "[init] WARNING: the hybrid pick cannot be prepared "
+                f"({type(exc).__name__}: {exc}); the hybrid R-time pick candidates are dropped",
+                file=sys.stderr,
             )
-        endpoint = probe_vlm_endpoint(hybrid_pick_cfg, references)
-        hybrid_pick_runtime = {
-            "config": str(args.pick_leg_hybrid_config.resolve()),
-            "phase3_executor": args.pick_leg_phase3_executor,
-            "reference_count": len(references),
-            **endpoint,
-        }
-        print(
-            "[hybrid] production VLM/GR00T/MP preflight passed: "
-            f"model={endpoint['model']} references={len(references)} "
-            f"vlm_latency={endpoint.get('multimodal_latency_sec', float('nan')):.2f}s "
-            "phase3=rule_based; pick waist/legs=Regular",
-            file=sys.stderr,
-        )
+            policy_alternatives = without_hybrid_pick_alternatives(policy_alternatives, False)
+            args.policy_alternatives = policy_alternatives
+            needs_hybrid_pick = hybrid_pick_candidates = False
+            hybrid_pick_cfg = hybrid_pick_runtime = planned_vlm = None
     if args.phase1_11_arm_only:
         try:
             _validate_phase1_11_config(args, skills_section)
@@ -2836,6 +3375,8 @@ def main() -> None:
         RotateTableBaseVlaSkill = None  # type: ignore[assignment]
 
     rule_based_gripper = None
+    # 既定の hybrid pick の引数。R で選ぶ hybrid の候補も同じ引数で作る (Issue #188)
+    hybrid_pick_kwargs = None
     if rule_based_pick_active:
         from inference.desktop.lower_policy.motion_limits import (
             load_motion_limits_for_skill,
@@ -2876,17 +3417,9 @@ def main() -> None:
     elif args.policy_variant_pick is not None:
         pick_skill_class = PickTableLegVlaSkill
         pick_extra_kwargs = None
-        if args.pick_leg_hybrid:
-            from inference.desktop.pick_leg_hybrid.real_skill import (
-                RealPickLegHybridVlaSkill,
-            )
-
+        if needs_hybrid_pick:
             insert_initial = _effective_initial_pose("insert_table_leg")
-            # The hybrid never dispatches waist.  Apply this before assembly so
-            # both its MotionLimiter and returned BuiltSkill contract agree.
-            skills_section["pick_table_leg"]["dispatch_waist"] = False
-            pick_skill_class = RealPickLegHybridVlaSkill
-            pick_extra_kwargs = {
+            hybrid_pick_kwargs = {
                 "hybrid_config_path": args.pick_leg_hybrid_config,
                 "hybrid_vlm_endpoint": args.pick_leg_vlm_endpoint,
                 "hybrid_vlm_model": args.pick_leg_vlm_model,
@@ -2895,9 +3428,19 @@ def main() -> None:
                 "next_initial_hand_target": insert_initial.dex1_target_rad,
                 "boundary_taskspace_arrival": _boundary_taskspace_arrival(args),
             }
+        if args.pick_leg_hybrid:
+            from inference.desktop.pick_leg_hybrid.real_skill import (
+                RealPickLegHybridVlaSkill,
+            )
+
+            # The hybrid never dispatches waist.  Apply this before assembly so
+            # both its MotionLimiter and returned BuiltSkill contract agree.
+            skills_section["pick_table_leg"]["dispatch_waist"] = False
+            pick_skill_class = RealPickLegHybridVlaSkill
+            pick_extra_kwargs = hybrid_pick_kwargs
             print(
                 "[hybrid] Stage 1-4 pick_table_leg replaced with "
-                "VLM -> GR00T -> G1 IK MP -> rule-based handover -> "
+                f"VLM -> {args.policy_variant_pick} -> G1 IK MP -> rule-based handover -> "
                 "insert initial pose",
                 file=sys.stderr,
             )
@@ -2940,6 +3483,122 @@ def main() -> None:
         "rotate_leg_to_tighten": rotate_leg_to_tighten_skill,
         "flip_table": flip_table_skill,
     }
+    # 会場の joint lane では、腕だけ policy の予定の少し先を送る (Issue #188)
+    arm_preview_steps = apply_arm_preview(skill_registry, boundary_arm_tracking, args.hz)
+
+    def _build_policy_choices() -> dict:
+        """R の後に選べる候補の skill を組み立てる (Issue #188 ② 段 3、plan のときだけ)。
+
+        候補の policy は DeferredPolicy (読むのは LoadPlan)。同じ variant は policy を 1 つだけ
+        作って共有する (pick の hybrid あり・なしは同じ RAMEN-Ori を 2 回読まない)。開始姿勢が
+        main と違う候補は起動時に止める (`start_pose_difference`)。
+        """
+        from inference.desktop.lower_policy.initial_pose import initial_pose_from_config
+        from inference.desktop.lower_policy.policies.config_loader import (
+            load_policy_variant as _load_candidate,
+        )
+        from inference.desktop.lower_policy.skills.policy_choice import (
+            ChoiceOption,
+            PolicyChoice,
+        )
+
+        classes = {
+            "rotate_table_base": RotateTableBaseVlaSkill,
+            "pick_table_leg": PickTableLegVlaSkill,
+            "insert_table_leg": InsertTableLegVlaSkill,
+            "rotate_leg_to_tighten": RotateLegToTightenVlaSkill,
+            "flip_table": FlipTableVlaSkill,
+        }
+        hybrid_run = bool(args.pick_leg_hybrid)
+        choices = {}
+        for slot, alternatives in policy_alternatives.items():
+            skill_name = _POLICY_SLOT_SKILLS[slot]
+            main_skill = skill_registry[skill_name]
+            if getattr(main_skill, "_policy", None) is None:
+                continue
+            main_variant = getattr(args, _POLICY_SLOT_ATTRS[slot])
+            # pick は、hybrid の run か hybrid の候補があれば「hybrid」「hybrid なし」を添える
+            pick_hybrid_note = slot == "pick" and (
+                hybrid_run
+                or any(alternative_uses_hybrid(a, hybrid_run) for a in alternatives)
+            )
+            options = [
+                ChoiceOption(
+                    main_variant,
+                    main_skill,
+                    note=("hybrid" if hybrid_run else "hybrid なし") if pick_hybrid_note else "",
+                )
+            ]
+            shared_policies = {main_variant: main_skill._policy}
+            main_pose = _effective_initial_pose(skill_name)
+            for alternative in alternatives:
+                name = alternative.variant
+                hybrid = slot == "pick" and alternative_uses_hybrid(alternative, hybrid_run)
+                try:
+                    cfg = candidate_skill_config(
+                        skill_cfg_raw, skill_cfg_yaml, skill_name, name, args.action_sink
+                    )
+                except ValueError as exc:
+                    sys.exit(
+                        f"skill config invalid for policy candidate {name!r} "
+                        f"({skill_name}): {exc}"
+                    )
+                difference = start_pose_difference(
+                    main_pose, initial_pose_from_config(cfg, skill_name)
+                )
+                if difference is not None:
+                    sys.exit(
+                        f"policy candidate {name!r} for {skill_name} starts from another "
+                        f"pose than the default ({difference}). R returns to the default's "
+                        "start pose, so a candidate must share it; remove it from "
+                        "alternatives_by_skill"
+                    )
+                variant = _load_candidate(args.policy_config, name)
+                if name not in shared_policies:
+                    shared_policies[name] = _register_policy_resource(
+                        assembly.load_policy(
+                            variant, deferred=True, label=f"{skill_name}:{name}"
+                        )
+                    )
+                skill_class, extra = classes[skill_name], None
+                if hybrid:
+                    from inference.desktop.pick_leg_hybrid.real_skill import (
+                        RealPickLegHybridVlaSkill,
+                    )
+
+                    # 既定の hybrid pick と同じ引数 (VLM・持ち替え・insert の開始姿勢)
+                    skill_class, extra = RealPickLegHybridVlaSkill, dict(hybrid_pick_kwargs)
+                    cfg["skills"][skill_name]["dispatch_waist"] = False
+                built = assembly.build_vla_skill(
+                    skill_name=skill_name,
+                    vla_skill_cls=skill_class,
+                    variant=variant,
+                    skill_config=cfg,
+                    waist_actuator=_build_waist_actuator(),
+                    hand_actuator=_build_hand_actuator(),
+                    fk_factory=fk_factory,
+                    policy=shared_policies[name],
+                    extra_skill_kwargs=extra,
+                )
+                if arm_preview_steps:
+                    built.skill.set_arm_preview_steps(arm_preview_steps)
+                note = ("hybrid" if hybrid else "hybrid なし") if pick_hybrid_note else ""
+                # 既定が hybrid でない run の hybrid の候補は、VLM も読めて初めて選べる
+                requires = (
+                    ("vlm",) if hybrid and not hybrid_run and planned_vlm is not None else ()
+                )
+                options.append(ChoiceOption(name, built.skill, note=note, requires=requires))
+            choices[skill_name] = PolicyChoice(skill_name, options)
+            print(
+                f"[init] {skill_name}: R can switch to "
+                + ", ".join(f"{i} {o.label}" for i, o in enumerate(options)),
+                file=sys.stderr,
+            )
+        return choices
+
+    policy_choices = (
+        _build_policy_choices() if load_plan_active and policy_alternatives else {}
+    )
     phase_transitions = None
     phase_enter_check = None
     policy_start_gate_stage: Optional[int] = None
@@ -3195,14 +3854,31 @@ def main() -> None:
             arm_settings = dict(skill_cfg_raw.get("arm_pre_motion") or {})
             arm_settings.pop("boundary_lift_rad", None)
             for policy in selected_policies:
-                interrupt_setter = getattr(
-                    skill_registry[policy], "set_operator_interrupt_pending", None
-                )
-                if callable(interrupt_setter):
-                    interrupt_setter(operator_console.has_pending)
+                choice = policy_choices.get(policy)
+                for candidate in (
+                    [skill_registry[policy]]
+                    + ([option.skill for option in choice.options[1:]] if choice else [])
+                ):
+                    interrupt_setter = getattr(
+                        candidate, "set_operator_interrupt_pending", None
+                    )
+                    if callable(interrupt_setter):
+                        interrupt_setter(operator_console.has_pending)
                 gate = f"operator_gate_for_{policy}"
-                arrival = _gate_arrival_check(
+                # 会場の pick は開始待ちで U / D で手の高さを変えられる (Issue #188)
+                start_adjuster = build_start_lift_adjuster(
+                    skill_cfg_raw, policy, args.action_sink,
                     _effective_initial_pose(policy).arm_position_rad,
+                )
+                if start_adjuster is not None:
+                    print(
+                        f"[init] {policy}: start height keys U/D ({start_adjuster.status()})",
+                        file=sys.stderr,
+                    )
+                gate_keys = ("enter",) + (start_adjuster.keys if start_adjuster else ())
+                arrival = _gate_arrival_check(
+                    start_adjuster.target if start_adjuster is not None
+                    else _effective_initial_pose(policy).arm_position_rad,
                     _boundary_convergence_checker(policy),
                     float(
                         skill_cfg_raw["boundary_preparation"]["arrival_error_rad"]
@@ -3215,9 +3891,11 @@ def main() -> None:
                     next_skill_name=policy,
                     cancellable_input_fn=(
                         # prompt = 到達したか・一番ずれた関節 (実測から gate が作る)
-                        lambda prompt, cancel, name=policy: operator_console.wait_for(
-                            "enter", stage=operator_console.stage,
-                            phase=f"{name}／開始待ち", detail=prompt, cancel_event=cancel,
+                        lambda prompt, cancel, name=policy, keys=gate_keys: (
+                            operator_console.wait_for_any(
+                                keys, stage=operator_console.stage,
+                                phase=f"{name}／開始待ち", detail=prompt, cancel_event=cancel,
+                            )
                         )
                     ),
                     arrival_check=arrival,
@@ -3225,6 +3903,7 @@ def main() -> None:
                     # 到達した指令を保持する (実測を保持すると重力の分だけ下がり、
                     # 到達判定を満たせなくなる)。
                     hold_arm_target_provider=_last_published_arm,
+                    start_adjuster=start_adjuster,
                 )
                 open_name = f"retry_open_{policy}"
                 wait_name = f"retry_wait_{policy}"
@@ -3246,8 +3925,21 @@ def main() -> None:
                             "r", stage=operator_console.stage,
                             phase=f"{name}／腕保持・ハンド全開", cancel_event=cancel,
                         )
+                    )
+                    if choice is None
+                    # R = いまの model のまま、数字 = model を選んでから初期姿勢へ (Issue #188)
+                    else (
+                        lambda _prompt, cancel, name=policy, choice=choice: (
+                            operator_console.wait_for_any(
+                                ("r",) + choice.keys, stage=operator_console.stage,
+                                phase=f"{name}／腕保持・ハンド全開",
+                                detail=choice.status(), cancel_event=cancel,
+                                labels=choice.labels(),
+                            )
+                        )
                     ),
                     hold_arm_target_provider=_last_published_arm,
+                    choice=choice,
                 )
                 skill_registry[arm_name] = CollisionAwareArmPreMotionSkill(
                     tuple(_effective_initial_pose(policy).arm_position_rad.tolist()),
@@ -3541,6 +4233,8 @@ def main() -> None:
                 hold_refresh_s=args.boundary_hold_refresh_s,
                 # 重力の垂れ補正 (joint lane、Issue #172)。None なら足さない
                 gravity_offset=boundary_gravity_offset,
+                # 腕の遅れ・押し負けの補い (joint lane、Issue #188)。None なら従来
+                arm_tracking=boundary_arm_tracking,
             )
             # WBC_RUNBOOK §1/§4 Step 5 の想定は「PC2 の client が :5556 を bind」。
             # Thor で動かすと bind 先が変わるので、運営側の設定が要ることを明示する。
@@ -3720,6 +4414,139 @@ def main() -> None:
 
             return _hook
 
+        def _log_load_event(record: dict) -> None:
+            """読み込み 1 本ごとの記録 ("model_load") を orch log に残す (Issue #188)。
+
+            LoadPlan は tick の thread (on_skill_started) からだけ呼ぶので、tick の記録と
+            同じ thread で書く。
+            """
+            if log_sink is None:
+                return
+            log_sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+            log_sink.flush()
+
+        def _replace_policy_skill(skill: str, new_skill) -> None:
+            """R の後に選んだ model の skill に差し替える (Issue #188 ② 段 3)。"""
+            dispatcher.replace_skill(skill, new_skill)
+            skill_registry[skill] = new_skill
+
+        def _build_load_plan(sequence: list[str], policies: dict):
+            """`--gpu-models plan` の読み方を作る (Issue #188 ② 段 2)。
+
+            main は各 skill の policy (DeferredPolicy)。R で選ぶ候補 (`alternatives_by_skill`)
+            の DeferredPolicy はここで作る (読むのは LoadPlan、R で選ぶのは段 3)。
+            """
+            from inference.desktop.lower_policy.policies.config_loader import (
+                load_policy_variant,
+            )
+            from inference.desktop.lower_policy.policies.load_plan import (
+                LoadPlan,
+                PlannedModel,
+            )
+            from inference.desktop.lower_policy.policies.page_cache import (
+                hf_snapshot_files,
+            )
+
+            main_variants = {
+                skill: getattr(args, _POLICY_SLOT_ATTRS[slot])
+                for slot, skill in _POLICY_SLOT_SKILLS.items()
+                if skill in policies
+            }
+            main_entries = {
+                skill: load_policy_variant(args.policy_config, variant)
+                for skill, variant in main_variants.items()
+            }
+            main_kinds = {skill: entry.policy_type for skill, entry in main_entries.items()}
+            ckpt_refs = {
+                entry.name: entry.policy_config.ckpt_ref for entry in main_entries.values()
+            }
+            # R で選ぶ候補の policy は候補の skill の中 (`_build_policy_choices` が作った物)
+            candidates: dict[str, list] = {}
+            for skill, choice in policy_choices.items():
+                if skill not in policies:
+                    continue
+                # 同じ policy を共有する候補 (pick の hybrid あり・なし) と既定は 1 本だけ読む
+                seen = {id(policies[skill])}
+                for option in choice.options[1:]:
+                    if id(option.skill._policy) in seen:
+                        continue
+                    seen.add(id(option.skill._policy))
+                    variant = load_policy_variant(args.policy_config, option.variant)
+                    candidates.setdefault(skill, []).append(
+                        (option.variant, variant.policy_type, option.skill._policy)
+                    )
+                    ckpt_refs[option.variant] = variant.policy_config.ckpt_ref
+            vlm_models = (
+                {
+                    "pick_table_leg": [
+                        PlannedModel(
+                            skill="pick_table_leg",
+                            label="pick_table_leg VLM",
+                            kind="vlm",
+                            policy=planned_vlm,
+                            # hybrid の run は main と一緒に保持が待つ。そうでなければ hybrid の候補の一部
+                            required=bool(args.pick_leg_hybrid),
+                            variant="vlm",
+                            # vLLM は served model 名 = HF の repo で cache から読む
+                            weight_files=lambda: hf_snapshot_files(
+                                hybrid_pick_cfg.vlm.model
+                            ),
+                        )
+                    ]
+                }
+                if planned_vlm is not None and "pick_table_leg" in policies
+                else {}
+            )
+            before_main = vlm_models if args.pick_leg_hybrid else {}
+            before_candidates = {} if args.pick_leg_hybrid else vlm_models
+            manager = LoadPlan(
+                sequence,
+                plan_models_for_stage(
+                    sequence,
+                    policies,
+                    main_variants=main_variants,
+                    main_kinds=main_kinds,
+                    candidates=candidates,
+                    before_main=before_main,
+                    before_candidates=before_candidates,
+                    ckpt_refs=ckpt_refs,
+                ),
+                preload_through_skill=model_loading.preload_through_skill,
+                load_while_policy_runs=model_loading.load_while_policy_runs,
+                event_fn=_log_load_event,
+            )
+            gates = install_leave_barriers(
+                skill_registry, list(policies), manager.may_leave, manager.stay
+            )
+            for skill, choice in policy_choices.items():
+                # 読み込みの状態を見て、選んだ skill を dispatcher に差し替える (名前はそのまま)
+                choice.state_fn = lambda variant, skill=skill: manager.model_state(
+                    skill, variant
+                )
+                choice.replace_fn = lambda new, skill=skill: _replace_policy_skill(skill, new)
+            if operator_console is not None:
+                # 動かす run で、動き出す関所が読みかけを待たないと、読み込みと policy が重なる
+                missing = [
+                    name
+                    for policy in policies
+                    for name in (f"operator_gate_for_{policy}", f"retry_wait_{policy}")
+                    if name not in gates
+                ]
+                if missing:
+                    raise RuntimeError(
+                        f"--gpu-models plan: these gates cannot wait for a model load: {missing}"
+                    )
+            print(
+                "[init] load plan: first main now, the rest one by one while the arms are "
+                f"still (preload through {model_loading.preload_through_skill}; while a "
+                "policy runs: "
+                f"{', '.join(model_loading.load_while_policy_runs) or 'nothing'}); "
+                f"candidates={sum(len(v) for v in candidates.values())} "
+                f"gates={len(gates)}",
+                file=sys.stderr,
+            )
+            return manager
+
         def _build_residency(sequence: list[str]):
             """stage の skill 列から先読みの管理を作る (Issue #141 束 1-12 / D7-2)。
 
@@ -3735,27 +4562,30 @@ def main() -> None:
                     policies[name] = policy
             if not policies:
                 return None
-            from inference.desktop.lower_policy.policies.residency import ModelResidency
+            if load_plan_active:
+                manager = _build_load_plan(sequence, policies)
+            else:
+                from inference.desktop.lower_policy.policies.residency import ModelResidency
 
-            # 既定は「今の skill + 次の 1 つ」。切替を隠すのにこれで足りる
-            # (読み込み 約 8 秒 < 各 skill の 21〜58 秒)。**全部載せる必要は無い。**
-            #
-            # 以前の既定は len(policies) = 全部だったが、residency の帳簿がずれて
-            # 実際には 1 つしか載っていなかったため表面化していなかった
-            # (VlaSkill._on_stop が residency を通さず解放していた、2026-09-21)。
-            # そのズレを直した今、既定を全部のままにすると 53D×4 + pick で
-            # 約 26 GiB を本当に載せに行く。機体によっては入らない。
-            # 増やしたいときは --gpu-models で明示する。
-            resident = DEFAULT_RESIDENT_MODELS if gpu_models is None else gpu_models
-            print(
-                f"[init] gpu models resident={resident} of {len(policies)} "
-                f"({', '.join(policies)})",
-                file=sys.stderr,
-            )
-            manager = ModelResidency(
-                sequence, policies, resident=resident,
-                preparation_loads_only_at_hold=args.action_sink == "boundary",
-            )
+                # 既定は「今の skill + 次の 1 つ」。切替を隠すのにこれで足りる
+                # (読み込み 約 8 秒 < 各 skill の 21〜58 秒)。**全部載せる必要は無い。**
+                #
+                # 以前の既定は len(policies) = 全部だったが、residency の帳簿がずれて
+                # 実際には 1 つしか載っていなかったため表面化していなかった
+                # (VlaSkill._on_stop が residency を通さず解放していた、2026-09-21)。
+                # そのズレを直した今、既定を全部のままにすると 53D×4 + pick で
+                # 約 26 GiB を本当に載せに行く。機体によっては入らない。
+                # 増やしたいときは --gpu-models で明示する。
+                resident = DEFAULT_RESIDENT_MODELS if gpu_models is None else gpu_models
+                print(
+                    f"[init] gpu models resident={resident} of {len(policies)} "
+                    f"({', '.join(policies)})",
+                    file=sys.stderr,
+                )
+                manager = ModelResidency(
+                    sequence, policies, resident=resident,
+                    preparation_loads_only_at_hold=args.action_sink == "boundary",
+                )
 
             # model の境界で起きる順序:
             #   前の model を保持したまま次の frame-zero へ腕・手を寄せる
@@ -3928,6 +4758,10 @@ def main() -> None:
                         if callable(validate):
                             validate()
                             validated.add(id(policy_resource))
+                if load_plan_active and single_stage_residency is not None:
+                    # plan は R で選ぶ候補と hybrid pick の VLM も読む。会場はオフラインなので、
+                    # 重みが事前取得から漏れていないかを動かさない確かめでも見る (Issue #188)
+                    single_stage_residency.check_each(skip_ids=validated)
                 print(
                     "[preflight] Phase 3 model/config/4-camera/"
                     "joint/Dex1 validation passed; NO command sent (--actuate absent)",
