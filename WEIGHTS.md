@@ -71,13 +71,23 @@ docker run --rm -e HF_HUB_OFFLINE=0 -e HF_TOKEN \
   ```bash
   cd <USB>/hf_cache && find ./hub -type f ! -path './hub/.locks/*' -print0 | sort -z | xargs -0 shasum -a 256 > ../SHA256SUMS
   ```
-- [ ] **Thor の image**（無圧縮。Thor に zstd が無くても `docker load` だけで入る）
-  `<IMAGE>` は manifest の digest で pull した image を指定する。load では registry digest が失われる場合があるため、image ID も保存する。
+- [ ] **Thor の image**（Thor に zstd が無くても `docker load` だけで入る）。**GHCR の層を展開せずに tar にまとめる**（2026-09-30）:
   ```bash
-  docker save -o <USB>/ikea-thor_<TAG>.tar <IMAGE>
-  docker image inspect <IMAGE> --format '{{.Id}}' > <USB>/IMAGE_ID.txt
-  cd <USB> && shasum -a 256 ikea-thor_<TAG>.tar > SHA256SUMS.image
+  GHCR_USER=<GitHub user> GHCR_PAT_FILE=<read:packages の PAT の file> tools/usb_image/fetch_blobs.sh <TAG> <作業 dir>  # blob を落とし sha256 を確かめる
+  python3 tools/usb_image/assemble_tar.py <作業 dir> <USB>/ikea-thor_<TAG>.tar     # docker save と同じ形。tar の sha256 を出す
+  python3 tools/usb_image/verify_tar.py <USB>/ikea-thor_<TAG>.tar                  # 読み直す: tar の sha256・blob ごとの digest・tag
+  cd <USB> && shasum -a 256 -c SHA256SUMS.image                                    # 上の sha256 の行を足してから
   ```
+  - `docker pull` → `docker save` を使わない理由: 環境の層（約 8.5 GB）は CI で作るたびに中身が変わる（`e1dff41`・`6fd6210`・
+    `1b34e82` で 3 つとも別）ので、前の image があっても毎回丸ごと落とす。そのうえ `docker pull` は Docker の中へ展開してから終わり、
+    Mac の Docker ではこれが約 30 分かかる。USB の tar に要るのは圧縮のままの層なので、展開は要らない。
+  - 形は Mac の `docker save`（containerd 方式）と同じ（`blobs/sha256/<digest>`・`index.json`・`manifest.json`・`oci-layout`）。
+    2026-09-29 に Thor で load できた `e1dff41` の tar と並び・header をそろえてある。同じ blob からは毎回同じ bytes になる
+    （`1b34e82` で確かめた: sha256 `d30ce5bf…`）。
+  - 時間の目安（2026-09-30、Mac の回線 毎秒 12〜20 MB）: blob 9.1 GB を落とすのに 8〜10 分、USB に書くのは 30 秒、読み直し 20 秒。
+    大きい層は Range で 16 区間に分けて同時に落とす（1 本だと遅い）。GHCR の blob の URL は約 7 分で切れるので、区間は続きから落とし直す。
+  - `IMAGE_ID.txt` には config digest（`manifest.json` の `Config`、通常の Docker の `{{.Id}}`）と manifest digest（containerd 方式の ID）の両方を書く。
+  - 手元の Docker に image が既にあるときは `docker save -o <USB>/ikea-thor_<TAG>.tar <IMAGE>` でもよい（中身は同じ形）。
 - [ ] （任意）運営 package（`iacevaltest/iros_g1_orin_package`、手順の根拠）
 
 ## 4. 会場での確認（**既にある物は入れない**）
