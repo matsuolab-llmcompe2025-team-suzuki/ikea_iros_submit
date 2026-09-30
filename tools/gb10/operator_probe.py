@@ -33,6 +33,9 @@ PHASE_LABELS = {"rotate_table_base": "テーブル回転", "pick_table_leg": "pi
                 "insert_table_leg": "insert", "rotate_leg_to_tighten": "tighten",
                 "flip_table": "flip"}
 
+#: 準備の経由点に遅れて届いたときの操作の行 (段取り表: ready は Enter で準備を続ける)
+PREPARATION_READY = "操作：Enter 到達確認・準備を続行"
+
 #: stage を指定して 1 stage の中を流す case
 STAGE_CASES = ("stage", "choose", "lift")
 
@@ -169,6 +172,7 @@ def main():
         nonlocal position
         deadline = time.monotonic() + timeout
         retry_position = position
+        ready_position = position
         retries = 0
         while time.monotonic() < deadline:
             text = log_path.read_text(errors="replace")
@@ -179,6 +183,12 @@ def main():
                 return
             if venue.poll() is not None:
                 raise RuntimeError(f"Venue exited {venue.returncode} before {marker!r}")
+            # 準備の経由点に遅れて届いた (`準備／<経由点>／ready`) ら、会場の操作者と同じく Enter で続ける
+            ready = text.find(PREPARATION_READY, ready_position)
+            if ready >= 0:
+                ready_position = ready + len(PREPARATION_READY)
+                events.append({"preparation_ready_enter": True, "at": time.monotonic()})
+                key(b"\n")
             if retry_enter:
                 if "安全停止／保持中・判断待ち" in text[position:]:
                     raise RuntimeError("Safety stop while awaiting policy start")
@@ -358,7 +368,7 @@ def main():
             key(b"n")
             wait_for("pick_table_leg／開始待ち")
             key(b"\x03")
-        elif args.case not in ("full", "stage"):
+        elif args.case not in ("full", *STAGE_CASES):
             if args.case == "worker":
                 worker_pid = owned_groot_worker(venue.pid)
                 os.kill(worker_pid, signal.SIGKILL)
