@@ -74,7 +74,7 @@ runtime:
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_rotate_all6@aaa73be26e795376ca9e2fcf2528e0b51b362c67 (ckpt_step_020000.pt)"
     - "robbyant/lingbot-vision-vit-base@main"
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_pick_all6@5384b7ed641af16edf10f6b1ecf67713146996af (ckpt_step_020000.pt)"
-    - "Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion@6c9911b8185ea185e6c929fbe9ede7d586c1bf09"
+    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_insert_all6@427d42dd29c0f8a8ff81a3c2319ab7710cdb1f8c (ckpt_step_020000.pt)"
     - "Team-RAMEN/IROS2026_RAMEN_takada_rotate_leg_to_tighten_optimal_gr00t_200k@51e306fd19dfbcba81932c6b6f073615fdb54b26"
     - "Team-RAMEN/IROS2026_RAMEN_suzuki_flip_table_groot_n17_2_baseline_checkpoints@1a408d87eda8d01f9b79113f1aed97a5d0811bff (checkpoints/020000/pretrained_model)"
     - "nvidia/GR00T-N1.7-3B@2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -84,7 +84,7 @@ runtime:
     # R-time candidates (alternatives_by_skill, chosen after R with --gpu-models plan); not defaults.
     - "Team-RAMEN/groot-n1.7-pick-legs-ver1@b63d9c49482cfc8998d1a3a0e3e0ac3ceb1d620a (checkpoint-40000 runtime files)"
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_141_c32_state_dropout@b19c7770e46cf6e1545f443a25624f5ec57cdb4b (ckpt_step_100000.pt)"
-    - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_insert_all6@427d42dd29c0f8a8ff81a3c2319ab7710cdb1f8c (ckpt_step_020000.pt)"
+    - "Team-RAMEN/IROS2026_RAMEN_takada_insert_leg_optimal_diffusion@6c9911b8185ea185e6c929fbe9ede7d586c1bf09"
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_flip_all6@2cbf2ce750d9cf711b63ac5d82ccca5cf17acfe7 (ckpt_step_020000.pt)"
     # Candidate only (variant set all6_400k, selected with --policy-variant-set); not a default.
     - "Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_all6_state_dropout@17b5658e33f98e264a6e05481fc9d069e9fde546 (ckpt_step_400000.pt)"
