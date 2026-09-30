@@ -65,7 +65,9 @@ default_variant_by_skill:
   # 会場の遅い腕に慣らした追加学習の RAMEN-Ori に pick 全部を任せる (hybrid なし、下の pick_leg_hybrid、
   # Issue #188、2026-09-30 ユーザー決定)。前の既定 (hybrid + groot_pick_legs_v1、#148) は R で選べる候補に残す。
   pick_table_leg: pick_table_leg_ramen_ori_venue_all6_20k
-  insert_table_leg: insert_table_leg_diffusion_optimal_100k
+  # 会場の遅い腕に慣らした追加学習の RAMEN-Ori (Issue #188、2026-09-30 ユーザー決定。会場の腕での手先の誤差 12.0 mm)。
+  # 前の既定 insert_table_leg_diffusion_optimal_100k は R で選べる候補に残す。
+  insert_table_leg: insert_table_leg_ramen_ori_venue_all6_20k
   rotate_leg_to_tighten: groot_rotate_leg_200k
   # v2 baseline step 20k with only the near-success wrist-tool FK definition.
   flip_table: groot_flip_table_n17_2_legacy_fk
@@ -76,13 +78,14 @@ default_variant_by_skill:
 # pick 全部を任せる。名前だけなら既定と同じやり方。hybrid の区間 1 に使えるのは pick_leg_hybrid.HYBRID_PHASE1_VARIANTS だけ。
 # 候補は既定と同じ開始姿勢であること (違えば起動時に止まる)。
 # ⚠️ 会場はオフライン: 提出物の事前取得 (tools/prefetch_weights.py) にこの list も足すこと。
-# 選んだ物 (2026-09-30、ユーザー決定): 会場の腕の追加学習 (*_venue_all6_20k) と、台を回すの前の既定 141。
+# 選んだ物 (2026-09-30、ユーザー決定): 既定を会場の腕の追加学習 (*_venue_all6_20k) に替えた skill は前の既定、
+# それ以外は会場の腕の追加学習。
 alternatives_by_skill:
   rotate_table_base: [rotate_table_base_ramen_ori_141_c32_state_dropout]
   pick_table_leg:
     - {variant: groot_pick_legs_v1, pick_leg_hybrid: true}  # 前の既定 (hybrid + GR00T、実機で確かめた)
     - {variant: pick_table_leg_ramen_ori_venue_all6_20k, pick_leg_hybrid: true}  # hybrid の区間 1 を RAMEN-Ori に
-  insert_table_leg: [insert_table_leg_ramen_ori_venue_all6_20k]
+  insert_table_leg: [insert_table_leg_diffusion_optimal_100k]  # 前の既定 (Diffusion 100k)
   rotate_leg_to_tighten: []
   flip_table: [flip_table_ramen_ori_venue_all6_20k]
 

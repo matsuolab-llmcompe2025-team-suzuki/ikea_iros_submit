@@ -1,5 +1,5 @@
 # tools/sync_ramen.sh が生成。手で編集しない。ramen/ の中も手で直さない (本体を直してコピーし直す)。
 repo: git@github.com:matsuolab-llmcompe2025-team-suzuki/iros_2026_ramen.git
-commit: a725e87c9fa1eb28fb2a23457d4cb2b09f3e837f
-subject: #188 fix:keep_a_learned_pick_run_going_without_the_hybrid
+commit: 6fd62101edabcbfd4a30a344a5db05fefaef6044
+subject: #188 docs:describe_the_venue_ramen_ori_insert_default
 state: published
