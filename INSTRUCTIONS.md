@@ -68,7 +68,7 @@ docker run --rm ghcr.io/matsuolab-llmcompe2025-team-suzuki/ikea-thor@sha256:19eb
   | sed 's/^  tolerance_rad: 0\.05 .*$/  tolerance_rad: 0.20  # venue: Dex1 air arrival, ~3.3 mm (INSTRUCTIONS.md sec. 4)/' \
   > $RAMEN_HOST_DIR/skill_config_venue.yaml
 sha256sum $RAMEN_HOST_DIR/skill_config_venue.yaml
-# → 9cc4496426c1b80deea6644aa6ab34c606595cf6875469bca6a843b3a5e30c22 と同じであること。違えば使わない
+# → 70bea36ba92c47add9f8bcd605224d4df346c1de857c4c75f82f6dbeb38e780e と同じであること。違えば使わない
 #   （手元の repo の venue/skill_config_venue.yaml を scp で $RAMEN_HOST_DIR に置いても同じ物になる）
 ```
 
