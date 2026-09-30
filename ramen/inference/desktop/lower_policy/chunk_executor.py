@@ -97,6 +97,9 @@ class ChunkExecutor:
         )
         self._pipeline: AsyncActionChunkPipeline | None = None
         self._current_step = 0
+        # この tick に ensembler から目標を取った step。先の予定 (preview_target) の起点。
+        # 保持した tick は None (Issue #188)。
+        self._preview_origin_step: int | None = None
         self._pending_submit_step: int | None = None
         self._last_emitted_target: np.ndarray | None = None
         self._async_hold_ticks = 0
@@ -176,10 +179,12 @@ class ChunkExecutor:
             target = self._ensembler.target(step=self._current_step)
             self._last_emitted_target = target.copy()
             self._consecutive_hold_ticks = 0
+            self._preview_origin_step = self._current_step
         elif self._last_emitted_target is not None:
             # 推論が chunk 境界に間に合わない / 止まった。制御 thread で同期推論はせず、
             # 直前の目標を正確に保持して arm_sdk への指令を途切れさせない。
             target = self._last_emitted_target.copy()
+            self._preview_origin_step = None
             self._async_hold_ticks += 1
             self._consecutive_hold_ticks += 1
             chunk_source = "async_hold"
@@ -215,10 +220,22 @@ class ChunkExecutor:
             "predict_latency_ms": self._last_predict_latency_ms,
         }
 
+    def preview_target(self, steps: int) -> tuple[np.ndarray, int] | None:
+        """この tick に返した目標から steps 先の予定 (Issue #188)。
+
+        会場の腕は指令から遅れるので、VlaSkill が腕だけをこの値に差し替えて送る。
+        目標を保持した tick (推論が間に合わない・止まった) は None。
+        返す組は (目標, 実際に先を見た step 数)。
+        """
+        if self._preview_origin_step is None or steps < 1:
+            return None
+        return self._ensembler.peek_ahead(self._preview_origin_step, steps)
+
     def reset(self) -> None:
         """skill 遷移 / episode 開始時に呼ぶ。前 skill の chunk を新 skill に混ぜない。"""
         self._ensembler.reset()
         self._current_step = 0
+        self._preview_origin_step = None
         if self._pipeline is not None:
             # bounded close。pending 推論が 0.5s で終わらなければ daemon thread の
             # まま残し (process 終了で消える)、その例外も新 skill には持ち込まない。

@@ -1391,6 +1391,9 @@ class Gr00tPolicy:
             decay_lambda=cfg.temporal_lambda,
         )
         self._current_step: int = 0
+        # この tick に ensembler から目標を取った step。先の予定 (preview_target) の起点。
+        # 直前の目標を保持した tick は None (Issue #188)。
+        self._preview_origin_step: int | None = None
         # Phase 4 (Issue #128): async_replanning pipeline。
         # cfg.replan_family=None なら pipeline=None、predict() は毎 tick sync 実行
         # (Phase 2 と同一動作、後方互換)。
@@ -1430,6 +1433,7 @@ class Gr00tPolicy:
         """
         self._ensembler.reset()
         self._current_step = 0
+        self._preview_origin_step = None
         if self._pipeline is not None:
             # bounded close: pending inference が終わるまで最大 0.5s 待つ、以降は
             # daemon thread として process 終了と共に消える
@@ -1959,6 +1963,17 @@ class Gr00tPolicy:
             "requires the N1.7 action decode pipeline"
         )
 
+    def preview_target(self, steps: int) -> tuple[np.ndarray, int] | None:
+        """この tick に返した目標から steps 先の予定 (Issue #188)。
+
+        会場の腕は指令から遅れるので、VlaSkill が腕だけをこの値に差し替えて送る。
+        予定が届いていない (直前の目標を保持している) tick は None。
+        返す組は (19D の目標, 実際に先を見た step 数)。
+        """
+        if self._preview_origin_step is None or steps < 1:
+            return None
+        return self._ensembler.peek_ahead(self._preview_origin_step, steps)
+
     def predict(self, obs: Observation) -> PolicyAction:
         """1 tick observation → GR00T action chunk。
 
@@ -2066,11 +2081,13 @@ class Gr00tPolicy:
         if candidate_count:
             blended_target = self._ensembler.target(step=self._current_step)
             self._last_emitted_target = blended_target.copy()
+            self._preview_origin_step = self._current_step
         elif self._last_emitted_target is not None:
             # Missing a deadline is not a reason to run inference synchronously
             # on the 30 Hz command thread.  Exact target hold is deterministic
             # and keeps arm_sdk ownership continuous until a fresh chunk lands.
             blended_target = self._last_emitted_target.copy()
+            self._preview_origin_step = None
             self._async_hold_ticks += 1
             chunk_source = "async_hold"
         else:

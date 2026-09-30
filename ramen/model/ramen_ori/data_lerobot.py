@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +78,19 @@ from model.ramen_ori.state_derive import (
     derive_state_71d,
     derive_state_73d,
 )
+from model.ramen_ori.episode_select import EpisodeSelectConfig, select_episodes
+from model.ramen_ori.state_noise import StateNoiseConfig, add_arm_offset
+from model.ramen_ori.venue_arm import (
+    ARM_DIM,
+    ARM_SLICE_Q36,
+    VenueArmConfig,
+    build_tables,
+    command19_from,
+    replace_arms,
+)
 from model.subtask_policy_training.gr00t.g1_full_body_mapping import (
     SOURCE_EEF_DIM,
+    SOURCE_ROOT_POSE_DIM,
     UPPER_BODY_SOURCE_INDEX_MAP,
 )
 
@@ -386,6 +398,24 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         # Issue #141 Phase 7: memory の入力 (memory_features.py)。true なら起動時に区間ごとの表を作り、item に
         # "memory" (51,) を入れる。head_left の OBB (obb_precomputed_root) と教師の指令から作る (obb_source とは別)
         memory: bool = False,
+        # Issue #183: state の手先の位置 (ee_pose) の出どころ。"dataset" = 記録された observation.state.ee_state
+        # (これまでの学習)、"fk" = 推論と同じ FK (inference/desktop/assembly.FkFactory.for_skill、skill ごとの
+        # wrist_tool_offset も推論と同じ) で今の関節角 (robot_q_current[7:36] = 29 関節。先頭 7 は胴体の位置・向き)
+        # から計算する。推論は FK で入れるので、
+        # flip では記録値と平均 13〜18 cm ずれていた (記録値の std は 5〜9 cm)。記録値は FK と定義 (座標・offset) が違い、
+        # 正しい 29 関節の FK でも rotate で平均 10〜13 cm 離れる (動きの向きは揃う、Issue #188 の実データ)
+        ee_state_source: str = "dataset",
+        # Issue #183: 区間の進み (frame_index / (区間の長さ − 1)) を item の "progress_target" に入れる
+        # (aux_progress.ProgressHead の正解)
+        progress_target: bool = False,
+        # Issue #188: 会場の運営 WBC の遅い腕 (venue_arm.py の VenueArmConfig)。dict なら起動時に教師の指令を会場の模擬に
+        # 通した腕の表を作り、学習の sample を確率 prob で置き換える (今と 1 frame 前の腕 14 関節。追従のずれ・速度・手先は
+        # 置き換えた腕から作り直す)。記録された手先は置き換えた腕に合わないので ee_state_source="fk" と組にする
+        venue_arm: dict | None = None,
+        # Issue #188 (flip): 教師の手順が揃った区間だけを train / val / test に残す (episode_select.py)
+        episode_select: dict | None = None,
+        # Issue #188 (flip): 学習の sample の一部で腕の状態を教師からずらす (state_noise.py、DART と同じ考え)
+        state_noise: dict | None = None,
     ) -> None:
         _valid_obb_sources = {"none", "precomputed_token", "overlay"}
         if obb_source not in _valid_obb_sources:
@@ -399,6 +429,12 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
             )
         if memory and obb_precomputed_root is None:
             raise ValueError("memory=True requires obb_precomputed_root (head_left の OBB から memory を作る)")
+        if ee_state_source not in {"dataset", "fk"}:
+            raise ValueError(f"ee_state_source={ee_state_source!r} not supported; choices=['dataset', 'fk']")
+        if venue_arm is not None and ee_state_source != "fk":
+            raise ValueError("venue_arm は ee_state_source='fk' と組にする (記録された手先は置き換えた腕に合わない)")
+        if state_noise is not None and ee_state_source != "fk":
+            raise ValueError("state_noise は ee_state_source='fk' と組にする (記録された手先はずらした腕に合わない)")
         # Issue #129 Phase I-0-3: frame_cache_mode validation + env set
         _valid_frame_cache_modes = {"online", "baked_token", "baked_overlay"}
         if frame_cache_mode not in _valid_frame_cache_modes:
@@ -474,6 +510,21 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         self._obb_cache = None  # type: ignore[assignment]
         self._overlay_renderer = None  # type: ignore[assignment]
         self.state_variant = state_variant
+        self.ee_state_source = ee_state_source
+        self._ee_fk_by_skill: dict | None = None   # "fk" のとき skill_id → FK (skill の表を作った後に作る)
+        self.progress_target = bool(progress_target)
+        # Issue #188: 会場の腕の設定 (multi の揃いの確認用に dict で持つ) と、起動時に作る腕の表 ((len(taus), N, 14))
+        self._venue_arm_cfg = None if venue_arm is None else VenueArmConfig.from_dict(dict(venue_arm))
+        self.venue_arm = None if self._venue_arm_cfg is None else asdict(self._venue_arm_cfg)
+        self._venue_arm_tables: np.ndarray | None = None
+        # Issue #188 (flip): 区間の選び方と、残す frame の印 ((N,) bool、起動時に作る)。腕の状態のずらし方
+        self._episode_select_cfg = (
+            None if episode_select is None else EpisodeSelectConfig.from_dict(dict(episode_select))
+        )
+        self.episode_select = None if self._episode_select_cfg is None else asdict(self._episode_select_cfg)
+        self._kept_rows: np.ndarray | None = None
+        self._state_noise_cfg = None if state_noise is None else StateNoiseConfig.from_dict(dict(state_noise))
+        self.state_noise = None if self._state_noise_cfg is None else asdict(self._state_noise_cfg)
         self.include_depth_target = include_depth_target
         self.depth_target_size = tuple(depth_target_size)
         self.depth_target_num_cams = depth_target_num_cams
@@ -610,11 +661,15 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         # skill_id の表 (episode_index → skill_id)。_transform_item が frame の episode_index で引く。
         # 表に無い番号・source_task_index の欠損はここで止める (学習を始めてからでは気づけない)
         self._skill_id_by_episode: dict[int, int] = {}
+        self._episode_length_by_episode: dict[int, int] = {}   # 区間の進み (progress_target) 用
         frames_by_skill: dict[int, int] = {}
         for row in _iter_episode_rows(self._base.meta.episodes):
             skill_id = _episode_skill_id(row)
             self._skill_id_by_episode[int(row["episode_index"])] = skill_id
+            self._episode_length_by_episode[int(row["episode_index"])] = _episode_length(row)
             frames_by_skill[skill_id] = frames_by_skill.get(skill_id, 0) + _episode_length(row)
+        if self.ee_state_source == "fk":
+            self._ee_fk_by_skill = _inference_ee_fk_by_skill(sorted(frames_by_skill))
         source = merged_source_root if merged_source_root is not None else "base_dataset (injected)"
         print(
             f"[data] {source}: "
@@ -623,6 +678,20 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
                 for sid, n in sorted(frames_by_skill.items())
             )
         )
+
+        if self._venue_arm_cfg is not None:
+            t0 = time.time()
+            self._venue_arm_tables = self._build_venue_arm_tables()
+            print(
+                f"[data] {source}: 会場の腕の表 {self._venue_arm_tables.shape} (tau {list(self._venue_arm_cfg.taus)}、"
+                f"送り方 {self._venue_arm_cfg.preset}、学習の置き換え {self._venue_arm_cfg.prob}、"
+                f"評価 {self._venue_arm_cfg.eval_tau}) を {time.time() - t0:.0f}s で作成"
+            )
+        if self._episode_select_cfg is not None:
+            self._kept_rows, kept, total = self._build_episode_selection()
+            print(
+                f"[data] {source}: 手順の揃った区間 {kept} / {total} ({self.episode_select}) を train / val / test に残す"
+            )
 
         # Issue #141 Phase 7: memory の表 (dataset の idx 順、(N, 51))。使った OBB の YOLO の重みは約束に書く
         self.memory = bool(memory)
@@ -681,6 +750,11 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
                 test_ratio=test_ratio,
                 seed=seed,
                 source_episode_names=meta.get("source_episode_names"),
+            )
+        if self._kept_rows is not None:
+            # Issue #188: 手順の揃った区間の frame だけを残す (分け方は同じ seed のまま、区間を落とすだけ)
+            train_idx, val_idx, test_idx = (
+                [i for i in idx if self._kept_rows[i]] for idx in (train_idx, val_idx, test_idx)
             )
         return (
             RamenOriSplitView(self, train_idx, is_train=True),
@@ -768,8 +842,63 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         """memory の表と frame ごとの skill_id (memory の切り詰めと正規化の統計用)。"""
         return self._memory_table, self.sample_skill_ids()
 
-    def _state_action(self, item: dict, idx: int) -> dict:
+    def _columns_in_episode_order(self, what: str):
+        """hf_dataset の列 (numpy) と区間の長さ。行が meta.episodes の順に連続して並ぶことを確かめる (Issue #188)。"""
+        self._base._ensure_hf_dataset_loaded()
+        columns = self._base.hf_dataset.with_format("numpy")
+        rows = list(_iter_episode_rows(self._base.meta.episodes))
+        episode_ids = [int(r["episode_index"]) for r in rows]
+        lengths = [_episode_length(r) for r in rows]
+        # 表の行 = hf_dataset の行 (memory の表と同じ確かめ方)
+        if not np.array_equal(
+            np.asarray(columns["episode_index"]).reshape(-1), np.repeat(episode_ids, lengths)
+        ):
+            raise ValueError(f"hf_dataset の行が meta.episodes の順に並んでいない ({what}の行が frame とずれる)")
+        return columns, lengths
+
+    def _build_episode_selection(self) -> tuple[np.ndarray, int, int]:
+        """手順の揃った区間の frame の印 ((N,) bool、dataset の idx 順) と、残す区間の数・全体の区間の数 (Issue #188)。"""
+        columns, lengths = self._columns_in_episode_order("区間の選別")
+        keep = select_episodes(
+            np.asarray(columns["observation.state.robot_q_current"]), lengths, self._episode_select_cfg
+        )
+        return np.repeat(keep, lengths), int(keep.sum()), len(lengths)
+
+    def _state_noise_offset(self, is_train: bool) -> np.ndarray | None:
+        """この sample の腕のずれ (14,)、ずらさないなら None。学習の sample だけ (Issue #188)。乱数は torch"""
+        cfg = self._state_noise_cfg
+        if cfg is None or not is_train or cfg.prob <= 0.0 or float(torch.rand(())) >= cfg.prob:
+            return None
+        return cfg.offset_from_normal(torch.randn(ARM_DIM).numpy())
+
+    def _build_venue_arm_tables(self) -> np.ndarray:
+        """教師の指令を区間ごとに会場の模擬に通した腕の表 ((len(taus), N, 14)、dataset の idx 順。Issue #188)。"""
+        columns, lengths = self._columns_in_episode_order("会場の腕の表")
+        command19 = command19_from(
+            np.asarray(columns["action.robot_q_desired"]), np.asarray(columns["action.hand_cmd"])
+        )
+        measured14 = np.asarray(columns["observation.state.robot_q_current"])[:, ARM_SLICE_Q36]
+        return build_tables(command19, measured14, lengths, self._venue_arm_cfg)
+
+    def _venue_arm_index(self, is_train: bool) -> int | None:
+        """この sample の腕を置き換える tau の番号 (置き換えないなら None)。Issue #188
+
+        学習は確率 prob で置き換え、tau は等確率。学習以外 (val / test / 正規化の統計) は eval_tau に固定
+        (None なら置き換えない)。乱数は torch (DataLoader が worker ごとに seed を振る)。
+        """
+        cfg = self._venue_arm_cfg
+        if cfg is None:
+            return None
+        if not is_train:
+            return cfg.eval_index
+        if cfg.prob <= 0.0 or float(torch.rand(())) >= cfg.prob:
+            return None
+        return int(torch.randint(len(cfg.taus), ()))
+
+    def _state_action(self, item: dict, idx: int, is_train: bool = False) -> dict:
         """LeRobot 生 dict → state / action / action_is_pad / action_waist_teacher / skill_id (numpy)。
+
+        `idx` は hf_dataset の行 (memory・会場の腕の表の行)。`is_train` は会場の腕の置き換えにだけ使う。
 
         `item` は LeRobotDataset が返す形 (画像以外):
             - observation.state.robot_q_current: (2, 36)
@@ -793,6 +922,16 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         # prev index = 0、prev が pad なら ep 先頭 → state_prev=None (velocity=0)
         prev_is_pad = bool(q_current_pad[0]) if q_current_pad is not None else False
 
+        # Issue #188: 今と 1 frame 前の腕を会場の遅い腕に置き換える (区間の先頭は 1 frame 前が区間の外なので今だけ)
+        venue_k = self._venue_arm_index(is_train)
+        if venue_k is not None:
+            table = self._venue_arm_tables[venue_k]
+            q_current = replace_arms(q_current, table[idx], None if prev_is_pad else table[idx - 1])
+        # Issue #188 (flip): 学習の sample の一部で、今と 1 frame 前の腕に同じずれを足す (正解の指令は教師のまま)
+        noise = self._state_noise_offset(is_train)
+        if noise is not None:
+            q_current = add_arm_offset(q_current, noise)
+
         state_current_38 = np.concatenate([q_current[1], hand_state[1]]).astype(np.float32)
         state_prev_38 = (
             None
@@ -809,7 +948,13 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         q_desired = q_desired_all[1:]
         hand_cmd = hand_cmd_all[1:]
         action_is_pad = action_pad_all[1:]
-        ee_state_12 = ee_state[0].astype(np.float32)
+        if self._ee_fk_by_skill is not None:
+            # Issue #183: 推論と同じ FK (その skill の offset) で今の関節角から計算する (記録された ee_state は使わない)
+            fk = self._ee_fk_by_skill[self._skill_id_by_episode[_scalar_from(item["episode_index"])]]
+            # 推論 (vla_skill) と同じ 29 関節 (SDK の順)。robot_q_current の先頭 7 は胴体の位置・向き (Issue #188)
+            ee_state_12 = fk.compute_ee_state(q_current[1][SOURCE_ROOT_POSE_DIM:])
+        else:
+            ee_state_12 = ee_state[0].astype(np.float32)
 
         if self.state_variant == "73d":
             depth_contact = self._fetch_depth_contact(item, idx)
@@ -887,7 +1032,7 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
         `item` は LeRobotDataset が返す形 (`_state_action` の key に加えて):
             - observation.images.cam_{i}: (2, 3, H, W) - image_transforms 適用済
         """
-        sa = self._state_action(item, idx)
+        sa = self._state_action(item, idx, is_train)
 
         # --- images (N_cams, 3, H, W) + prev ---
         # LeRobot は各 camera_key ごとに (2, 3, H, W) を返す (delta -dt, 0)。
@@ -996,6 +1141,12 @@ class RamenOriLerobotDataset(torch.utils.data.Dataset):
             H, W = self.depth_target_size
             sample["depth_target"] = torch.zeros(
                 self.depth_target_num_cams, 1, H, W, dtype=torch.float32
+            )
+        if self.progress_target:
+            # Issue #183: 区間の進み (0〜1)。aux_progress.ProgressHead の正解
+            length = self._episode_length_by_episode[_scalar_from(item["episode_index"])]
+            sample["progress_target"] = torch.tensor(
+                _scalar_from(item["frame_index"]) / max(1, length - 1), dtype=torch.float32
             )
         return sample
 
@@ -1250,6 +1401,35 @@ class RamenOriMultiSplitView(torch.utils.data.Dataset):
         return self.sub_views[k][local_i]
 
 
+# 推論の skill の設定。skill ごとの手先の tool offset (skills.<skill>.wrist_tool_offset、rotate_table_base など) を持つ
+_INFERENCE_SKILL_CONFIG = (
+    Path(__file__).resolve().parents[2] / "inference" / "desktop" / "lower_policy" / "configs" / "skill_config.yaml"
+)
+
+
+def _inference_ee_fk_by_skill(skill_ids) -> dict:
+    """推論 (`inference/desktop/assembly.FkFactory.for_skill`) と同じ手先の FK を skill ごとに作る (Issue #183)。
+
+    推論は `skill_config.yaml` の `skills.<skill>.wrist_tool_offset` があればその offset、無ければ既定の offset で
+    FK する (rotate_table_base は独自の offset)。学習の手先の入力 (`ee_state_source: fk`) も同じ関数で作る。
+    """
+    import yaml
+
+    from inference.desktop.assembly import FkFactory
+
+    skill_config = yaml.safe_load(_INFERENCE_SKILL_CONFIG.read_text(encoding="utf-8"))
+    factory = FkFactory()
+    out = {}
+    for skill_id in skill_ids:
+        fk = factory.for_skill(skill_config, skill_id_name(int(skill_id)))
+        if fk is None:
+            raise FileNotFoundError(
+                "G1 の URDF が無い (推論は手先の入力を 0 にする)。ee_state_source=fk は使えない"
+            )
+        out[int(skill_id)] = fk
+    return out
+
+
 # multi の sub ごとに書ける key (data の場所)。base_dataset は test の DI 用
 _SUB_DATASET_KEYS = frozenset(
     {
@@ -1277,6 +1457,11 @@ _SHARED_SUB_ATTRS = (
     "overlay_class_filter",
     "memory",
     "memory_yolo_ckpt",   # memory を作った OBB の YOLO の重み (sub で違えば止める)
+    "ee_state_source",    # Issue #183: 手先の位置の出どころ (ckpt の約束に書く)
+    "progress_target",
+    "venue_arm",          # Issue #188: 会場の腕の置き換え
+    "episode_select",     # Issue #188: 手順の揃った区間だけ
+    "state_noise",        # Issue #188: 腕の状態のずらし
 )
 
 
@@ -1347,6 +1532,11 @@ class RamenOriMultiDataset(torch.utils.data.Dataset):
         frame_cache_num_variants: int = 1,
         auto_precompute_frame_cache: bool = True,
         memory: bool = False,
+        ee_state_source: str = "dataset",   # Issue #183 (RamenOriLerobotDataset と同じ)
+        progress_target: bool = False,
+        venue_arm: dict | None = None,   # Issue #188 (RamenOriLerobotDataset と同じ)
+        episode_select: dict | None = None,   # Issue #188 (同上)
+        state_noise: dict | None = None,      # Issue #188 (同上)
     ) -> None:
         if not sub_datasets or len(sub_datasets) < 1:
             raise ValueError("RamenOriMultiDataset requires at least 1 sub_dataset config")
@@ -1374,6 +1564,11 @@ class RamenOriMultiDataset(torch.utils.data.Dataset):
             auto_precompute_frame_cache=auto_precompute_frame_cache,
             augmentation_cfg=augmentation_cfg,
             memory=memory,
+            ee_state_source=ee_state_source,
+            progress_target=progress_target,
+            venue_arm=venue_arm,
+            episode_select=episode_select,
+            state_noise=state_noise,
         )
 
         self.subs: list[RamenOriLerobotDataset] = []

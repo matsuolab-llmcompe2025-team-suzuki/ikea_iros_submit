@@ -42,10 +42,13 @@ LOWERED_WALK_TRACKING_MARGIN_RAD = 0.05
 #:                     作るので、範囲の検査だけで止まりうる (PR #167 のレビュー、接続テストで決める)
 WALK_LATCH_CHECKS = ("joint", "converged")
 # 歩行してよい腕の範囲 (関節群ごとの絶対値の上限 [rad])。
+# 肘は 1.25 (Issue #188): 会場の G1 (3) では運営 WBC の腕が重さで垂れ、歩行用の姿勢 (肘 0.9) へ
+# 送っても実測が 1.12〜1.13 で止まり、1.00 (+余裕 0.05) では Stage 0 が起動時に止まった (09-29)。
+# 肘が大きいほど腕は下へ伸びる向きなので、上げた腕で歩かないという意図は変わらない。
 _LOWERED_WALK_LIMITS = {
     "shoulder_pitch": (SHOULDER_PITCH_INDICES, 0.75),
     "shoulder_roll": (SHOULDER_ROLL_INDICES, 0.65),
-    "elbow": (ELBOW_INDICES, 1.00),
+    "elbow": (ELBOW_INDICES, 1.25),
 }
 ARM_JOINT_NAMES = (
     "left_shoulder_pitch",

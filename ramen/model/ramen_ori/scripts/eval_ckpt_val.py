@@ -20,6 +20,12 @@ usage (学習の env、repo root で):
     python -m model.ramen_ori.scripts.eval_ckpt_val \
         --ckpt-dir /nvme/train_outputs/ramen_ori_all6_state_dropout \
         --steps 100000 200000 --out /nvme/logs/eval_ckpt_val.json
+
+Issue #188 の option:
+- ``--weights model``: EMA ではなく raw の重みで測る (推論の `_from_contract_ckpt` は今 raw を読む、Issue #183)
+- ``--venue-arm-tau 0.15``: val の今と 1 frame 前の腕を会場の模擬の腕 (この tau) に置き換える (手先は FK で作り直す)
+- ``--data-from-config retrain/venue_rotate_141``: data と val の設定をその学習の config から取る。初期値の ckpt
+  (141 / all6) を、追加学習と同じ 1 skill の val・FK の手先で測るとき
 """
 
 from __future__ import annotations
@@ -47,11 +53,36 @@ EXECUTION_STEPS = 8
 SEED = 0
 
 
-def load_model(ckpt_path: Path, device: str):
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+
+
+def eval_cfg(cfg, data_from_config: str | None = None, venue_arm_tau: float | None = None):
+    """評価に使う data / val の設定 (Issue #188)。ckpt の cfg の copy を返す (model の設定は ckpt のまま)。"""
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    OmegaConf.set_struct(cfg, False)
+    if data_from_config:
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            other = compose(config_name=data_from_config)
+        cfg.data = OmegaConf.to_container(other.data, resolve=False)
+        cfg.val = OmegaConf.to_container(other.val, resolve=False)
+    if venue_arm_tau is not None:
+        # 表は評価の tau の 1 本だけ作る (学習の置き換えは使わないので prob 0)。手先は置き換えた腕から FK で作る
+        preset = (cfg.data.get("venue_arm") or {}).get("preset", "standard")
+        cfg.data.ee_state_source = "fk"
+        cfg.data.venue_arm = {"prob": 0.0, "taus": [venue_arm_tau], "preset": preset, "eval_tau": venue_arm_tau, "workers": 0}
+    return cfg
+
+
+def load_model(ckpt_path: Path, device: str, weights: str = "ema"):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = OmegaConf.create(ckpt["cfg"])
     model = build_model(cfg, device)
     model.load_state_dict(ckpt["model_state_dict"])
+    if weights == "model":   # raw の重み (推論と同じ)
+        model.eval()
+        return model, cfg
     shadow = ckpt["ema_state_dict"]
     learnable = {n: p for n, p in model.named_parameters() if p.requires_grad}
     missing = sorted(set(learnable) - set(shadow))
@@ -136,7 +167,14 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--weights", choices=["ema", "model"], default="ema",
+                    help="ema = EMA の重み (学習の val と同じ)、model = raw の重み (推論は今 raw を読む、Issue #183)")
+    ap.add_argument("--venue-arm-tau", type=float, default=None,
+                    help="val の腕を会場の模擬の腕 (この tau [s]) に置き換えて測る (Issue #188)。0.15 で 09-29 の遅れ")
+    ap.add_argument("--data-from-config", default=None,
+                    help="data と val の設定をこの学習の config (例 retrain/venue_rotate_141) から取る (Issue #188)")
     args = ap.parse_args()
+    print(f"[eval] weights={args.weights} venue_arm_tau={args.venue_arm_tau} data_from_config={args.data_from_config}")
 
     fk = G1WristFKTorch.from_default_urdf(dtype=torch.float32).to(args.device)
     results = json.loads(args.out.read_text()) if args.out.exists() else {}
@@ -145,9 +183,10 @@ def main() -> None:
         if str(step) in results:
             print(f"[eval] step {step}: 既にある、skip"); continue
         t0 = time.time()
-        model, cfg = load_model(args.ckpt_dir / f"ckpt_step_{step:06d}.pt", args.device)
+        model, cfg = load_model(args.ckpt_dir / f"ckpt_step_{step:06d}.pt", args.device, args.weights)
         if loader is None:   # data は ckpt 間で共通 (同じ run の cfg)
-            loader = build_val_loader(cfg, cfg.training.batch_size, args.num_workers)
+            data_cfg = eval_cfg(cfg, args.data_from_config, args.venue_arm_tau)
+            loader = build_val_loader(data_cfg, data_cfg.training.batch_size, args.num_workers)
         results[str(step)] = evaluate(model, loader, fk, args.device)
         args.out.write_text(json.dumps(results, indent=1, ensure_ascii=False))   # 1 ckpt ごとに保存
         del model; torch.cuda.empty_cache()

@@ -1,0 +1,46 @@
+# @package _global_
+# Issue #188: 会場の運営 WBC の「遅い・柔らかい腕」に慣れさせる追加学習の共通設定。
+# skill ごとの file (venue_<skill>_<初期値>.yaml) がこれを継承し、data・初期値の ckpt・置き場所だけを書く。
+#
+# 学習手法 (c32 + state group dropout、chunk 32、FK の loss、AdamW、vision 凍結、batch 32) は変えない。
+# 追加学習の設定 (LR 3e-5、EMA 0.999、2 万 step、val は 500 step ごと + 学習前) は flip_ft_fk (#183) と同じ。足すのは 2 つ:
+#   1. 手先の位置の入力を推論と同じ FK に (data.ee_state_source: fk)。置き換えた腕から手先を作り直すのにも要る
+#   2. 学習の sample の半分で、今と 1 frame 前の腕 14 関節を会場の模擬の腕に置き換える (data.venue_arm、
+#      model/ramen_ori/venue_arm.py)。残り半分は元の腕のまま (会場で先の予定を送る送り方になると遅れが自前並みに
+#      縮むので、どちらの送り方でも動くようにする)。正解の指令は変えない
+#
+# 正規化の統計は初期値の ckpt のまま (flip_ft_fk と同じ。学習と推論は同じ統計を使う)。
+# val (学習中) は元の腕のまま (eval_tau: null)。会場の腕での評価は scripts/eval_ckpt_val.py --venue-arm-tau 0.15。
+defaults:
+  - /retrain/c32_state_dropout
+  - _self_
+
+data:
+  ee_state_source: fk
+  venue_arm:
+    prob: 0.5
+    taus: [0.05, 0.1, 0.15, 0.2, 0.3]   # 0.15 で 09-29 の遅れ (pick 380〜390 ms・台を回す 270 ms) を再現
+    preset: standard                     # 会場の既定の送り方 (skill_config.yaml boundary_arm_tracking.default_preset)
+    eval_tau: null
+    workers: 0                           # 表を作る process 数 (0 = CPU 数)
+
+training:
+  init_from_weights: ema
+  max_steps: 20000
+  ckpt_every: 2500
+  hf_autopush:
+    every_n_ckpt: 2          # 5k ごと (2.5k の倍数で使うものは止める前に上げる)
+
+optim:
+  lr: 3.0e-5                 # 一から学習の 1e-4 の 0.3 倍 (学習済みの重みを大きく崩さない)
+
+lr_schedule:
+  warmup_steps: 500
+  cosine_end_lr: 1.0e-6
+
+ema:
+  decay: 0.999               # 0.9999 は約 1 万 step の平均で、2 万 step の追加学習では初期値に引っ張られすぎる
+
+val:
+  val_every: 500
+  at_start: true             # 初期値の ckpt そのまま (FK の入力) の値を、追加学習と比べる基準に取る

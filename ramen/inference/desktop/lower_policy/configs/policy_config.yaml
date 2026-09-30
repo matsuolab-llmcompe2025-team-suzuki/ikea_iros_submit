@@ -58,14 +58,51 @@
 #
 # 値は policies: の key でなければならない (無い名前を書くと起動時に落ちる)。
 default_variant_by_skill:
-  # RAMEN-Ori #141 再学習 7 本からの選択 (2026-09-21)。#144 の実機評価で比較中。
-  rotate_table_base: rotate_table_base_ramen_ori_141_c32_state_dropout
-  # #148 の VLM -> GR00T -> IK MP -> rule-based handover が Phase 1 expert に使う版。
-  pick_table_leg: groot_pick_legs_v1
+  # 会場の遅い腕に慣らした追加学習 (Issue #188、2026-09-30)。会場の腕での手先の誤差 24.4 mm
+  # (前の既定 141 は 38.1 mm)。前の既定 rotate_table_base_ramen_ori_141_c32_state_dropout は
+  # alternatives_by_skill の候補に残す (R で戻せる)。
+  rotate_table_base: rotate_table_base_ramen_ori_venue_all6_20k
+  # 会場の遅い腕に慣らした追加学習の RAMEN-Ori に pick 全部を任せる (hybrid なし、下の pick_leg_hybrid、
+  # Issue #188、2026-09-30 ユーザー決定)。前の既定 (hybrid + groot_pick_legs_v1、#148) は R で選べる候補に残す。
+  pick_table_leg: pick_table_leg_ramen_ori_venue_all6_20k
   insert_table_leg: insert_table_leg_diffusion_optimal_100k
   rotate_leg_to_tighten: groot_rotate_leg_200k
   # v2 baseline step 20k with only the near-success wrist-tool FK definition.
   flip_table: groot_flip_table_n17_2_legacy_fk
+
+# R のときに選べる候補 (Issue #188)。skill → policies: の key の list。`--gpu-models plan` の run で使う。
+# 既定 (default_variant_by_skill / --policy-variant-*) と同じ候補は起動時に除く。空なら今と同じ。
+# pick だけ、`{variant: <名前>, pick_leg_hybrid: true / false}` と書くと hybrid で使う / hybrid を使わず学習 policy に
+# pick 全部を任せる。名前だけなら既定と同じやり方。hybrid の区間 1 に使えるのは pick_leg_hybrid.HYBRID_PHASE1_VARIANTS だけ。
+# 候補は既定と同じ開始姿勢であること (違えば起動時に止まる)。
+# ⚠️ 会場はオフライン: 提出物の事前取得 (tools/prefetch_weights.py) にこの list も足すこと。
+# 選んだ物 (2026-09-30、ユーザー決定): 会場の腕の追加学習 (*_venue_all6_20k) と、台を回すの前の既定 141。
+alternatives_by_skill:
+  rotate_table_base: [rotate_table_base_ramen_ori_141_c32_state_dropout]
+  pick_table_leg:
+    - {variant: groot_pick_legs_v1, pick_leg_hybrid: true}  # 前の既定 (hybrid + GR00T、実機で確かめた)
+    - {variant: pick_table_leg_ramen_ori_venue_all6_20k, pick_leg_hybrid: true}  # hybrid の区間 1 を RAMEN-Ori に
+  insert_table_leg: [insert_table_leg_ramen_ori_venue_all6_20k]
+  rotate_leg_to_tighten: []
+  flip_table: [flip_table_ramen_ori_venue_all6_20k]
+
+# Stage 1〜4 の pick を hybrid (VLM → 学習 policy で掴む → IK で運ぶ → ルールで持ち替え) で動かすか
+# (Issue #188)。false = default_variant_by_skill.pick_table_leg の学習 policy に pick 全部を任せる。
+# --pick-leg-hybrid / --no-pick-leg-hybrid が優先。hybrid は alternatives_by_skill の
+# {pick_leg_hybrid: true} で R の候補に残せる (--gpu-models plan のとき)。
+pick_leg_hybrid: false
+
+# `--gpu-models plan` の読み方 (Issue #188)。1 Stage の run で、起動時は最初の skill の main
+# だけを待ち、残りは 1 本ずつ順に読む: 最初の skill の候補 → preload_through_skill までの
+# skill の main → 候補。それより後ろの skill は、その前の保持に入ったときに main → 候補
+# (保持が待つのは main だけ)。先へ進んだ skill の model は次の保持で解放する。
+# 読むのは腕が止まっている間 (開始待ち・保持・R の後の待ち) だけ。load_while_policy_runs に
+# 書いた種類 (groot / groot_pick_legs / groot_pick_legs_ee_rel / act_diffusion / ramen_ori /
+# vlm) だけは policy が動いている間にも読む。空 = 全部止まっている間だけ (制御ループと
+# 処理・GPU を取り合わない)。
+model_loading:
+  preload_through_skill: pick_table_leg
+  load_while_policy_runs: []
 
 # model の組み合わせを名前で切り替える (Issue #159)。会場で焼き直さずに、起動の引数
 #   ramen-venue --stage <N> --policy-variant-set <名前>     (自前経路も同じ引数)
@@ -92,6 +129,12 @@ variant_sets:
     insert_table_leg: insert_table_leg_ramen_ori_all6_400k
     rotate_leg_to_tighten: rotate_leg_to_tighten_ramen_ori_all6_400k
     flip_table: flip_table_ramen_ori_all6_400k
+  # 会場の腕に慣れさせた追加学習 (Issue #188)。台を回す・insert・flip を 20k に替える。pick は既定のまま
+  # (pick の slot は policies: の説明どおり --policy-variant-pick で hybrid の区間 1 か、--no-pick-leg-hybrid で単独)。
+  venue_arm:
+    rotate_table_base: rotate_table_base_ramen_ori_venue_all6_20k
+    insert_table_leg: insert_table_leg_ramen_ori_venue_all6_20k
+    flip_table: flip_table_ramen_ori_venue_all6_20k
 
 policies:
   # Issue #137: execution_steps は chunk_len (GR00T 16) より小さくすること。
@@ -1076,6 +1119,83 @@ policies:
     dtype: fp32
     action_space: abs
     skill_id: 5                          # move_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  # ---- 会場の腕に慣れさせた追加学習 (Issue #188) の slot ---- #
+  # all6 の重み (rotate・pick は 300k、flip は 150k、insert は 400k) から 1 skill ずつ 2 万 step 追加学習した 20k
+  # (推論と同じ生成の評価で 4 本とも 20k が最良。docs/handoff/issue_188_venue_arm_training.md、W&B venue_arm_eval_20260930)。
+  # 学習の手先の入力は推論と同じ FK (skill ごとの wrist_tool_offset も同じ) → skills.<skill>.wrist_tool_offset を変えないこと。
+  # 学習の半分で、今と 1 frame 前の腕を会場の模擬の遅い腕に置き換えている (model/ramen_ori/venue_arm.py)。
+  # 以前の flip の追加学習 (flip_ft_fk / flip_ft_fk_progress、Issue #183) は FK に渡す関節の位置がずれていたので slot を消した。
+  # pick の slot は 2 通りに使える: hybrid の区間 1 (掴むまで) に `--policy-variant-pick pick_table_leg_ramen_ori_venue_all6_20k`
+  # (VLM・IK MP・持ち替えは hybrid のまま。pick_leg_hybrid.HYBRID_PHASE1_VARIANTS)、hybrid を切って全部を任せるなら
+  # さらに `--no-pick-leg-hybrid`。variant_sets の venue_arm には入れない (会場で使うなら重みは USB の V2 から入れる)。
+  rotate_table_base_ramen_ori_venue_all6_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_rotate_all6@aaa73be26e795376ca9e2fcf2528e0b51b362c67
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 4                          # rotate_table_base (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  pick_table_leg_ramen_ori_venue_all6_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_pick_all6@5384b7ed641af16edf10f6b1ecf67713146996af
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 3                          # pick_table_leg (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  flip_table_ramen_ori_venue_all6_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_flip_all6@2cbf2ce750d9cf711b63ac5d82ccca5cf17acfe7
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 1                          # flip_table (skill_mapping.py)
+    replan_family: ramen_ori_flow_v1
+    execution_steps: 8                   # chunk 32 に対する重なり
+    temporal_lambda: -0.1
+    rtc:
+      enabled: false
+    cams: [head_left, wrist_left, wrist_right]
+
+  insert_table_leg_ramen_ori_venue_all6_20k:
+    policy_type: ramen_ori
+    mode: overlay
+    overlay_jpeg_subsampling: "4:4:4"   # Issue #139 の統合 cache で焼いた overlay
+    ckpt_ref: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_insert_all6@427d42dd29c0f8a8ff81a3c2319ab7710cdb1f8c
+    ckpt_filename: ckpt_step_020000.pt   # 固定 (会場はネット無し = HF API を呼ばない。#159 B3d-03)
+    device: cuda
+    dtype: fp32
+    action_space: abs
+    skill_id: 0                          # insert_table_leg (skill_mapping.py)
     replan_family: ramen_ori_flow_v1
     execution_steps: 8                   # chunk 32 に対する重なり
     temporal_lambda: -0.1

@@ -26,6 +26,14 @@ policy = policy_cls.from_ckpt(cfg)
 default_variant_by_skill:
   <skill_name>: <variant_name>   # 本番 run の既定 (Issue #148)
 
+alternatives_by_skill:
+  <skill_name>: [<variant_name>, ...]   # R のときに選べる候補 (Issue #188)
+  pick_table_leg: [<variant_name>, {variant: <variant_name>, pick_leg_hybrid: false}, ...]
+
+model_loading:                          # --gpu-models plan の読み方 (Issue #188)
+  preload_through_skill: <skill_name>
+  load_while_policy_runs: [<kind>, ...]
+
 policies:
   <variant_name>:
     policy_type: "groot" | "ramen_ori" | "groot_pick_legs" | "act_diffusion"
@@ -174,6 +182,166 @@ def load_default_variant_by_skill(
         defaults[str(skill_name)] = variant
     return defaults
 
+
+@dataclass(frozen=True)
+class PolicyAlternative:
+    """R のやり直しで既定の代わりに選べる候補 1 つ (Issue #188)。
+
+    Attributes:
+        variant: `policies:` の key。
+        pick_leg_hybrid: pick だけ。True = hybrid (VLM → この policy で掴む → IK で運ぶ・持ち替え)、
+            False = hybrid を使わず、学習 policy に pick 全部を任せる。None = 既定と同じやり方。
+    """
+
+    variant: str
+    pick_leg_hybrid: bool | None = None
+
+
+#: 候補を mapping で書くときの key (pick だけ、Issue #188)。
+_ALTERNATIVE_KEYS = frozenset({"variant", "pick_leg_hybrid"})
+
+
+def load_alternatives_by_skill(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+) -> dict[str, tuple[PolicyAlternative, ...]]:
+    """`alternatives_by_skill` section を読む (Issue #188)。
+
+    skill ごとに、R のやり直しで既定の代わりに選べる候補を並べたもの。候補は variant 名か、
+    pick だけ `{variant: <名前>, pick_leg_hybrid: true / false}` (hybrid で使う / 使わず学習 policy に全部任せる)。
+    section が無ければ空 (= 候補なし、今までと同じ動き)。既定と同じ候補を除くのは
+    呼出側 (既定は CLI や `--policy-variant-set` で変わるので、ここでは決まらない)。
+    誤った書き方は起動時に落とす (会場で「黙って候補なし」を避ける)。
+    """
+    data = _load_yaml(config_path)
+    section = data.get("alternatives_by_skill")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"{config_path}: 'alternatives_by_skill' must map skills to variant lists"
+        )
+    skills = data.get("default_variant_by_skill")
+    skills = skills if isinstance(skills, dict) else {}
+    policies = data.get("policies")
+    policies = policies if isinstance(policies, dict) else {}
+    alternatives: dict[str, tuple[PolicyAlternative, ...]] = {}
+    for skill_name, entries in section.items():
+        if skill_name not in skills:
+            raise ValueError(
+                f"{config_path}: alternatives_by_skill.{skill_name} is not a skill "
+                f"in default_variant_by_skill ({sorted(skills)})"
+            )
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"{config_path}: alternatives_by_skill.{skill_name} must be a list "
+                f"of variant names, got {entries!r}"
+            )
+        parsed = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                if skill_name != "pick_table_leg" or set(entry) != _ALTERNATIVE_KEYS:
+                    raise ValueError(
+                        f"{config_path}: alternatives_by_skill.{skill_name} has {entry!r}; "
+                        "a mapping is only for pick_table_leg, as "
+                        "{variant: <name>, pick_leg_hybrid: true / false}"
+                    )
+                if not isinstance(entry["pick_leg_hybrid"], bool):
+                    raise ValueError(
+                        f"{config_path}: alternatives_by_skill.pick_table_leg has {entry!r}; "
+                        "pick_leg_hybrid must be true or false"
+                    )
+                variant, hybrid = entry["variant"], entry["pick_leg_hybrid"]
+            else:
+                variant, hybrid = entry, None
+            if not isinstance(variant, str) or variant not in policies:
+                raise ValueError(
+                    f"{config_path}: alternatives_by_skill.{skill_name} has "
+                    f"{variant!r}, which is not registered under policies"
+                )
+            parsed.append(PolicyAlternative(variant, hybrid))
+        if len(set(parsed)) != len(parsed):
+            raise ValueError(
+                f"{config_path}: alternatives_by_skill.{skill_name} lists a "
+                f"variant twice: {entries}"
+            )
+        alternatives[str(skill_name)] = tuple(parsed)
+    return alternatives
+
+
+
+
+def load_pick_leg_hybrid_default(config_path: str | Path = DEFAULT_CONFIG_PATH) -> bool:
+    """`pick_leg_hybrid` を読む: Stage 1〜4 の pick を hybrid で動かすか (Issue #188)。
+
+    `--pick-leg-hybrid` / `--no-pick-leg-hybrid` を付けなかった run の既定。key が無ければ True
+    (Issue #148 からの既定、hybrid)。bool 以外は起動時に落とす。
+    """
+    data = _load_yaml(config_path)
+    value = data.get("pick_leg_hybrid", True)
+    if not isinstance(value, bool):
+        raise ValueError(f"{config_path}: pick_leg_hybrid must be true or false, got {value!r}")
+    return value
+
+@dataclass(frozen=True)
+class ModelLoading:
+    """`model_loading` section (Issue #188、`--gpu-models plan` の読み方)。
+
+    Attributes:
+        preload_through_skill: 起動の後に先に読んでおく最後の skill。
+        load_while_policy_runs: policy が動いている間にも読んでよい種類
+            (`load_plan.LOAD_KINDS`)。空 = 全部腕が止まっている間だけ。
+    """
+
+    preload_through_skill: str
+    load_while_policy_runs: tuple[str, ...]
+
+
+def load_model_loading(config_path: str | Path = DEFAULT_CONFIG_PATH) -> ModelLoading:
+    """`model_loading` section を読む (Issue #188)。
+
+    `--gpu-models plan` のときだけ呼ぶ。section が無い・key が違う・知らない skill や
+    種類は起動時に落とす (会場で「黙って別の読み方」を避ける)。
+    """
+    from inference.desktop.lower_policy.policies.load_plan import LOAD_KINDS
+
+    data = _load_yaml(config_path)
+    section = data.get("model_loading")
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"{config_path}: 'model_loading' section is required for --gpu-models plan"
+        )
+    expected = {"preload_through_skill", "load_while_policy_runs"}
+    if set(section) != expected:
+        raise ValueError(
+            f"{config_path}: model_loading must have exactly {sorted(expected)}, "
+            f"got {sorted(section)}"
+        )
+    skills = data.get("default_variant_by_skill")
+    skills = skills if isinstance(skills, dict) else {}
+    through = section["preload_through_skill"]
+    if through not in skills:
+        raise ValueError(
+            f"{config_path}: model_loading.preload_through_skill={through!r} is not a "
+            f"skill in default_variant_by_skill ({sorted(skills)})"
+        )
+    kinds = section["load_while_policy_runs"]
+    if not isinstance(kinds, list) or not all(isinstance(kind, str) for kind in kinds):
+        raise ValueError(
+            f"{config_path}: model_loading.load_while_policy_runs must be a list of "
+            f"kinds, got {kinds!r}"
+        )
+    unknown = sorted(set(kinds) - LOAD_KINDS)
+    if unknown:
+        raise ValueError(
+            f"{config_path}: model_loading.load_while_policy_runs has unknown kinds "
+            f"{unknown} (valid: {sorted(LOAD_KINDS)})"
+        )
+    if len(set(kinds)) != len(kinds):
+        raise ValueError(
+            f"{config_path}: model_loading.load_while_policy_runs lists a kind twice: "
+            f"{kinds}"
+        )
+    return ModelLoading(str(through), tuple(kinds))
 
 _RTC_KEYS = frozenset(
     {

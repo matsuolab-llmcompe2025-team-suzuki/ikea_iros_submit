@@ -1,0 +1,18 @@
+# @package _global_
+# Issue #188: rotate_table_base を会場の腕に慣れさせる追加学習 (中身は venue_ft_common.yaml)。
+# 初期値: all6 300k (#155 の推論と同じ生成の評価で rotate_table の手先の誤差が最小、6 skill の釣り合いも最良圏)。
+# 起動: pixi run train --config-name=retrain/venue_rotate_all6
+# 初期値の ckpt は HF から /nvme/init に落としておく (docs/handoff/issue_188_venue_arm_training.md)。
+defaults:
+  - /retrain/venue_ft_common
+  - override /data: unified_rotate
+  - _self_
+
+training:
+  init_from: /nvme/init/all6_state_dropout_17b5658/ckpt_step_300000.pt
+  ckpt_dir: /nvme/train_outputs/ramen_ori_venue_rotate_all6
+  hf_autopush:
+    repo_id: Team-RAMEN/IROS2026_RAMEN_hara_ramen_ori_venue_rotate_all6
+
+wandb:
+  run_name: ramen_ori_venue_rotate_all6

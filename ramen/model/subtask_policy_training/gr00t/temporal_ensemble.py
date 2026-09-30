@@ -118,6 +118,33 @@ class TargetTemporalEnsembler:
             (メモリ増加防止)。同 step の再問い合わせは可能。
         """
         step = int(step)
+        result = self._blend(step)
+        self._discard_before(step)
+        return result
+
+    def peek_ahead(self, step: int, steps: int) -> tuple[np.ndarray, int] | None:
+        """step から steps 先の blended target を、candidate を捨てずに返す (Issue #188)。
+
+        腕の遅れる機体で「少し先の予定」を今送るために使う。steps 先に candidate が
+        無ければ、step より後で candidate のある一番先を返す。
+
+        Args:
+            step: 今の step (この tick に `target()` で取った step)。
+            steps: 何 step 先を見るか (1 以上)。
+
+        Returns:
+            (blended target, 実際に先を見た step 数)。step より後に candidate が
+            1 つも無ければ None。`target()` と違い、どの candidate も破棄しない
+            (次の tick は step+1 を `target()` で読む)。
+        """
+        step = int(step)
+        for ahead in range(int(steps), 0, -1):
+            if self._candidates.get(step + ahead):
+                return self._blend(step + ahead), ahead
+        return None
+
+    def _blend(self, step: int) -> np.ndarray:
+        """step の candidate を blend する (破棄はしない)。"""
         candidates = self._candidates.get(step, [])
         if not candidates:
             raise KeyError(f"no candidate for step {step}")
@@ -139,7 +166,6 @@ class TargetTemporalEnsembler:
                 [candidate.target for candidate in candidates], axis=0
             )
             result = np.average(stacked, axis=0, weights=weights)
-        self._discard_before(step)
         return result
 
     def candidate_count(self, step: int) -> int:
